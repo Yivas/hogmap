@@ -13,7 +13,7 @@ HogMap is pre-implementation: there is no code, no build, no test suite and no r
 
 Issues are open and are the place to start. Open one before writing a pull request: with no code, there is no interface to change yet, and disagreeing in an issue is cheaper than disagreeing in a diff. Small documentation fixes need no prior issue.
 
-Bug reports only make sense once there is something to run. The bug template asks for the build, the Windows version, the filesystem and the reproduction steps, and it will stay unanswered until a prototype exists.
+Bug reports only make sense once there is something to run. The bug template asks for the build, the Windows version, the filesystem and the reproduction steps, and bug reports will not be answered until a prototype exists.
 
 ## Build and tests
 

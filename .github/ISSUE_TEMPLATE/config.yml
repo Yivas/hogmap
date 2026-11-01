@@ -2,4 +2,7 @@ blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability
     url: https://github.com/Yivas/hogmap/security/advisories/new
-    about: Report vulnerabilities privately. Do not include secrets, personal paths or disk inventories in a public issue.
+    about: Report vulnerabilities privately to the maintainer.
+  - name: Code of conduct report
+    url: https://github.com/Yivas/hogmap/security/advisories/new
+    about: Report harassment or abuse privately; say in the report that it is about conduct.

@@ -46,6 +46,13 @@ body:
     validations:
       required: true
   - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+  - type: checkboxes
     id: privacy
     attributes:
       label: Privacy

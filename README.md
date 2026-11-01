@@ -22,10 +22,10 @@ HogMap is aimed at that question. One scan of a folder or a whole volume, and a 
 
 - **Nested treemap.** Each folder is a rectangle that contains its files and subfolders, sized by the selected metric, with labels and borders that stay readable as depth increases. The layout targets the dense, classic look of SpaceSniffer rather than a dashboard of cards and charts; HogMap is not affiliated with that project, and none of its icons, text or assets are reused.
 - **Read-only analysis.** The first version is meant to only look: select, navigate, filter, copy a path, open the containing folder, read properties. No delete, move or clean action is planned for it.
-- **Portable ZIP.** One archive that runs without an installer, a service, a driver or an account.
+- **Portable ZIP.** One archive that will run without an installer, a service, a driver or an account.
 - **No network, no telemetry.** The application is meant to work fully offline and to collect nothing about the machine or the scan.
 - **Two scan engines.** A compatible engine that walks any chosen folder on any supported filesystem, and a fast NTFS engine that reads volume metadata for a whole drive. The NTFS engine needs administrator rights, so only an isolated worker process is meant to be elevated; the window keeps normal user rights.
-- **Sizes that mean what they say.** Logical size, on-disk size attributable to each entry, and the used and free space Windows reports are kept apart. Hardlinks are not counted twice, reparse points are not followed recursively, and cloud placeholders are never downloaded in order to measure them.
+- **Sizes that mean what they say.** Logical size, on-disk size attributable to each entry, and the used and free space Windows reports will be kept apart. Hardlinks will not be counted twice, reparse points will not be followed recursively, and cloud placeholders will never be downloaded in order to measure them.
 - **Navigation while scanning.** Folders appear as they are examined, cancel stops the visible work at once, and the map does not reshuffle itself on every update.
 
 ## Scope and limits
@@ -54,9 +54,9 @@ Security reports go through the private channel described in [SECURITY.md](SECUR
 
 ## Contributing and support
 
-The project is open source and collaborative, and issues are welcome now: ideas, requirements and objections to the plan are all useful while there is nothing to break. Bug reports need a build to be useful, so they will stay open until a prototype exists.
+The project is open source and collaborative, and issues are welcome now: ideas, requirements and objections to the plan are all useful while there is nothing to break. Bug reports need a build to be useful, so they will not be answered until a prototype exists.
 
-Pull requests are welcome too, with one condition. There is no code yet, so open an issue first and settle the change before writing it. Build, test and formatting commands will be documented here with the first code.
+Pull requests are welcome too, with one condition. There is no code yet, so open an issue first and settle the change before writing it. Build, test and formatting commands will be listed in [CONTRIBUTING.md](CONTRIBUTING.md) with the first code.
 
 [CONTRIBUTING.md](CONTRIBUTING.md) has the details, [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) covers how people are expected to behave, and [SECURITY.md](SECURITY.md) explains where a vulnerability report goes instead of a public issue.
 
@@ -64,4 +64,4 @@ Pull requests are welcome too, with one condition. There is no code yet, so open
 
 MIT, copyright Yivas. The full text is in [LICENSE](LICENSE).
 
-HogMap is an independent project. It is not affiliated with, endorsed by, or derived from any existing disk analyzer, and it ships none of their names, icons, text or assets.
+HogMap is an independent project and reuses no icons, text or assets from other disk analyzers.

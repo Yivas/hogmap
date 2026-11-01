@@ -4,7 +4,7 @@ title: "[Feature]: "
 body:
   - type: markdown
     attributes:
-      value: HogMap is pre-implementation, so a proposal shapes the design instead of changing existing behaviour. Remove credentials, personal paths and disk or file inventories before posting.
+      value: HogMap is pre-implementation, so a proposal shapes the design instead of changing existing behaviour. Remove credentials, personal paths and disk or file inventories before posting. Use private security reporting for vulnerabilities.
   - type: textarea
     id: problem
     attributes:
