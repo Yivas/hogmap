@@ -1,0 +1,35 @@
+name: Feature request
+description: Propose a change to what HogMap should do.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: HogMap is pre-implementation, so a proposal shapes the design instead of changing existing behaviour. Remove credentials, personal paths and disk or file inventories before posting.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What is difficult or impossible today, either with the plan in the README or with the way you analyze disk usage now?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: The smallest observable change that would solve it.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other ways to get the same result, including doing nothing.
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues for the same request.
+          required: true
+        - label: I read the README goals and limits that this proposal would change, if any.
+          required: true

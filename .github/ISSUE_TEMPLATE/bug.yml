@@ -1,0 +1,54 @@
+name: Bug report
+description: Report a reproducible problem once a build exists.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: There is no build or release yet, so nothing can be reproduced today. Remove credentials, personal paths and disk or file inventories before posting, and use private security reporting for vulnerabilities.
+  - type: input
+    id: build
+    attributes:
+      label: Version or commit
+      description: Release version, or the commit you built from.
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      description: Version and build, for example Windows 11 24H2 build 26100.
+    validations:
+      required: true
+  - type: input
+    id: filesystem
+    attributes:
+      label: Filesystem and drive type
+      description: For example NTFS on an internal NVMe drive, exFAT on a removable drive, or a network share.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest sequence that shows the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behaviour
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed credentials, personal paths, disk or file inventories, and screenshots that show folder or file names.
+          required: true

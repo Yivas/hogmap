@@ -1,0 +1,17 @@
+# Rust build output
+/target/
+
+# rustfmt backup files
+**/*.rs.bk
+
+# Debug symbols from MSVC builds
+*.pdb
+
+# Editors and operating system
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+.DS_Store
