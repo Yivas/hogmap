@@ -1,0 +1,15 @@
+[package]
+name = "hogmap"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.94.1"
+license = "MIT"
+description = "Core model and filters for a Windows disk-space treemap"
+repository = "https://github.com/Yivas/hogmap"
+publish = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
