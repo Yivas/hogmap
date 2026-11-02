@@ -1,0 +1,17 @@
+{
+  "name": "hogmap-docs",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0"
+  },
+  "scripts": {
+    "build": "vitepress build .",
+    "preview": "vite preview --outDir .vitepress/dist --base /hogmap/ --host 127.0.0.1 --port 4175 --strictPort"
+  },
+  "devDependencies": {
+    "vite": "8.3.3",
+    "vitepress": "2.0.0-alpha.20"
+  }
+}

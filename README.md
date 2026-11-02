@@ -4,7 +4,7 @@ A planned disk-space analyzer for Windows 11 that draws a scanned folder or volu
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[Status](#status) · [What it will do](#what-it-will-do) · [Roadmap](#roadmap) · [Contributing](#contributing-and-support) · [License](#license)
+[Documentation](https://yivas.github.io/hogmap/) · [Status](#status) · [What it will do](#what-it-will-do) · [Roadmap](#roadmap) · [Contributing](#contributing-and-support) · [License](#license)
 
 ## Status
 

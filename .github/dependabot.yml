@@ -8,6 +8,14 @@ updates:
       compatible-cargo:
         patterns: ['*']
         update-types: [minor, patch]
+  - package-ecosystem: npm
+    directory: /wiki
+    schedule:
+      interval: weekly
+    groups:
+      compatible-docs:
+        patterns: ['*']
+        update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:

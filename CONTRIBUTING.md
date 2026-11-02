@@ -27,6 +27,19 @@ cargo test --locked
 
 CI runs those checks on Windows with the exact toolchain. The current core has no third-party dependencies. Tests use synthetic metadata in memory, not files on your disks. Set build/cache/temporary locations in your own shell session if needed; no machine-specific paths are committed. There is no `cargo run` entry point yet.
 
+## Documentation site
+
+The wiki lives in `wiki/`, uses the default VitePress theme and is published at <https://yivas.github.io/hogmap/>. It describes implemented behavior separately from planned application features. Keep the [core contract](docs/core.md) as the primary technical reference instead of maintaining competing copies.
+
+The documentation tool versions are pinned in `wiki/package.json` and its lockfile. With the declared Node version and documentation dependencies available, run from the repository root:
+
+```text
+npm --prefix wiki run build
+npm --prefix wiki run preview
+```
+
+Preview binds only to `127.0.0.1:4175`; open <http://127.0.0.1:4175/hogmap/>. Building the site is separate from building the Rust core. The Pages runner restores the locked dependencies with lifecycle scripts disabled, audits them and builds the site; no application release or tag is created by publishing documentation.
+
 ## Keep private data out
 
 Issues and pull requests are public and permanent. Do not include:

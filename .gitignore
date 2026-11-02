@@ -1,6 +1,12 @@
 # Rust build output
 /target/
 
+# Documentation build output and dependencies
+/wiki/node_modules/
+/wiki/.vitepress/cache/
+/wiki/.vitepress/dist/
+/wiki/.vitepress/*.timestamp-*.mjs
+
 # rustfmt backup files
 **/*.rs.bk
 
