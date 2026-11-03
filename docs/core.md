@@ -1,6 +1,6 @@
 # Core contract
 
-The library has five modules: `index`, `filter`, `scan`, `synthetic` and `treemap`. None reads a file, starts a process, opens a network connection or writes a cache. The input is metadata supplied by the caller. There is no scanner or GUI yet.
+The library has five modules: `index`, `filter`, `scan`, `synthetic` and `treemap`. None reads a file, starts a process, opens a network connection or writes a cache. The input is metadata supplied by the caller. The separate desktop binary displays the synthetic producer in an egui/eframe 0.35.0 window; there is no filesystem scanner.
 
 ## Metadata index
 
@@ -44,7 +44,7 @@ Size conditions accept `<` or `>`, a non-negative decimal integer and `b`, `kb`,
 
 The parser accepts outer whitespace on each condition. It rejects empty conditions between separators, missing/unknown units, overflow, fractional/negative thresholds, paths, tag/attribute/date operators and unsupported syntax. An expression is limited to 4096 UTF-8 bytes and 64 conditions. It does not use regular expressions or expand filesystem paths. Literal name characters other than the reserved operators retain their literal meaning.
 
-The future GUI will use this same result for two distinct operations: highlighting while preserving full geometry, or constructing filtered geometry with separately labelled totals. Neither operation is part of the current library.
+The desktop binary uses this result to highlight matches, dim non-matches and distinguish unknown decisions without changing geometry or totals. Directories keep the strongest descendant result as context (Yes, then Unknown, then No). Invalid input keeps the last valid highlight. Filtered geometry with separately labelled totals is not implemented.
 
 ## Scanner contract
 
@@ -92,10 +92,26 @@ Both the children map and the subtree totals are rebuilt on every call, and hard
 
 Squarification accumulates in `f64` and converts to `f32` at the boundary. The order is deterministic: size descending, then native name, then entry ID. Layout descends iteratively, only into directories whose content area reaches `min_pixel_area`; a deep tree does not use call-stack recursion. Invalid geometry, invalid parameters, an unknown root and size overflow return typed errors instead of producing bogus rectangles.
 
+`layout_members` opens an aggregate's selected siblings using their original IDs and descendant trees, without unrelated siblings. Members must be nonempty, distinct and immediate children of the supplied parent; invalid selections return `UnknownRoot`. The root cell is the parent context, but its totals cover only the selected members. Further aggregates keep their members and remain navigable. The desktop lowers the grouping threshold in detail views so at least one member can expand on each visit.
+
 Volume composition is not implemented: free and unattributed space need volume capacity and accounting data that this unit does not receive. The layout only tiles the known scanned bytes.
+
+## Desktop consumer
+
+The default `desktop` Cargo feature enables optional eframe for `src/main.rs` and `src/ui/`; the library modules never import it. `cargo test --locked --no-default-features` tests the core without GUI dependencies. There is no separate crate or runtime dependency in the library.
+
+The window starts a fixed, explicitly labelled sample on one thread and drains one complete batch at most plus bounded control events per frame. It keeps the channel bounded and drops the receiver before joining a replaced or closing producer, so a terminal send cannot deadlock shutdown. Cancel sets its flag and visible lifecycle immediately while draining continues. Lifecycle (Scanning, Finished, Cancelled, Failed) is separate from metadata completeness; unknown sizes and inaccessible directories do not turn a finished producer into a partial lifecycle.
+
+Layout is cached by consumed-event version, navigation and viewport rectangle, at most four rebuilds per second while scanning. Hover and selection reuse geometry and fitted labels. Navigation stores native name components and aggregate member names in memory, not snapshot IDs, so it can resolve them against a new sample. If a path has not arrived yet during rescan, the root is shown temporarily without rewriting history.
+
+Only window geometry is persisted by eframe in its application-data directory. Egui memory persistence is disabled, the app saves no custom state, and names, filters and navigation are never serialized. AccessKit is enabled; map cells expose accessible labels, selection and focus. Backspace goes up, Alt+Left/Right moves through history and Escape cancels a scan; while the highlight field has focus, Escape leaves the field and the scan keeps running. Text editing retains its navigation keys. The status line shows the dataset root and the native path components, and appends the small-item count when the map shows an aggregate's members. In that member view the root cell keeps the parent directory's name and adds the same subset count, so its totals are not mistaken for the whole folder.
+
+An error returned by `eframe::run_native` prints a clear message to stderr and returns exit code 1. There is no native message box, graphics fallback or claim that upstream graphics panics are caught. Real-driver fallback, DPI coverage and full accessibility testing remain separate checks.
 
 ## Verification boundary
 
 Integration tests call the public index, filter, scan, synthetic and treemap API with synthetic metadata and fixed expected answers. They cover the filter grammar, unknown values, native Windows names, hierarchy, component length and overflow; scan generations, parent order, batching caps, cancellation under backpressure, a dropped receiver after cancellation, duplicate keys, invalid records, unknown directory outcomes, disconnect without terminal, inaccessible directories, hardlinks, unknown sizes, terminal handling and determinism; and layout containment, sibling disjointness, area conservation, proportionality, headers, aggregation, unknown sizes, determinism and a deep tree.
 
-Passing these tests does not prove scanner totals, no-cloud-recall behavior, UI responsiveness, physical attribution, volume composition or portable distribution.
+`tests/navigation.rs` also exercises history across new snapshots, aggregate locations, hit testing, measured-width label fitting, highlight decisions, invalid-filter retention and lifecycle states through the binary's pure logic module. `tests/aggregate_navigation.rs` checks aggregate member layouts through the public treemap API.
+
+Passing these tests does not prove scanner totals, no-cloud-recall behavior, UI responsiveness, graphical compatibility, physical attribution, volume composition or portable distribution.

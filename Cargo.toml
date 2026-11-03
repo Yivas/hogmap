@@ -8,6 +8,18 @@ description = "Core model and filters for a Windows disk-space treemap"
 repository = "https://github.com/Yivas/hogmap"
 publish = false
 
+[features]
+default = ["desktop"]
+desktop = ["dep:eframe"]
+
+[dependencies]
+eframe = { version = "=0.35.0", optional = true, default-features = false, features = ["glow", "default_fonts", "accesskit", "persistence"] }
+
+[[bin]]
+name = "hogmap"
+path = "src/main.rs"
+required-features = ["desktop"]
+
 [lints.rust]
 unsafe_code = "forbid"
 

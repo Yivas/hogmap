@@ -10,7 +10,7 @@ Nothing has been released, so no version line is supported. Reports about the cu
 
 ## Scope and planned model
 
-HogMap is the Windows 11 x64 disk-space analyzer described in the [README](README.md). The current core only processes metadata supplied in memory; it has no scanner, GUI, network or process-launching code. The requirements below also govern the future application. Core tests do not establish that the future scanner or privileged worker meets them.
+HogMap is the Windows 11 x64 disk-space analyzer described in the [README](README.md). The core only processes metadata supplied in memory; the desktop window displays a synthetic sample and has no filesystem scanner, network or process-launching feature. Window geometry is persisted by eframe, but scan names, paths, filters and navigation are not saved. The requirements below also govern the future application. Core tests do not establish that the future scanner or privileged worker meets them.
 
 - **Read-only toward the analyzed volume.** The first version has no delete, move or clean operation. A defect that would let a product feature remove or modify user data is in scope precisely because no such feature is supposed to exist.
 - **No network access, no telemetry.** The application is meant to work fully offline. An outbound connection, or anything that collects data about the machine or the scan, is a defect.

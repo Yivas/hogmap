@@ -1,6 +1,6 @@
 # Working with filters
 
-The core can evaluate a filter against one file's name and optional logical size. There is no filter bar or scanner yet, so these examples describe library behavior rather than instructions for an application you can launch.
+The core can evaluate a filter against one file's name and optional logical size. The desktop sample's Highlight field uses this evaluator: matches keep their colors, non-matches dim and unknown decisions stay distinct. Directory context is retained, totals and geometry do not change, and invalid expressions keep the previous valid highlight. There is no filesystem scanner or filtered-geometry mode yet.
 
 ## Start with a name
 

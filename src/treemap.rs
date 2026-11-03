@@ -99,6 +99,39 @@ pub fn layout(
     rect: Rect,
     params: LayoutParams,
 ) -> Result<Layout, LayoutError> {
+    layout_selection(index, root, None, rect, params)
+}
+
+/// Lays out selected siblings, keeping their original IDs and descendant trees.
+/// Use the members of a placed aggregate to open its contents without unrelated siblings.
+pub fn layout_members(
+    index: &Index,
+    parent: EntryId,
+    members: &[EntryId],
+    rect: Rect,
+    params: LayoutParams,
+) -> Result<Layout, LayoutError> {
+    let mut seen = HashSet::new();
+    if members.is_empty()
+        || members.iter().any(|id| {
+            !seen.insert(*id)
+                || index
+                    .get(*id)
+                    .is_none_or(|entry| entry.parent != Some(parent))
+        })
+    {
+        return Err(LayoutError::UnknownRoot);
+    }
+    layout_selection(index, parent, Some(members), rect, params)
+}
+
+fn layout_selection(
+    index: &Index,
+    root: EntryId,
+    members: Option<&[EntryId]>,
+    rect: Rect,
+    params: LayoutParams,
+) -> Result<Layout, LayoutError> {
     validate_rect(rect)?;
     if !params.min_pixel_area.is_finite() || params.min_pixel_area <= 0.0 {
         return Err(LayoutError::InvalidParams);
@@ -107,9 +140,23 @@ pub fn layout(
         return Err(LayoutError::InvalidParams);
     }
     let root_entry = index.get(root).ok_or(LayoutError::UnknownRoot)?;
-    let children = children_map(index);
+    let mut children = children_map(index);
     let totals = subtree_totals(index)?;
-    let root_totals = totals.get(&root).copied().unwrap_or_default();
+    let root_totals = if let Some(members) = members {
+        children.insert(root, members.to_vec());
+        let mut selected = Totals::default();
+        for id in members {
+            let value = totals.get(id).copied().unwrap_or_default();
+            selected.known_sum = selected
+                .known_sum
+                .checked_add(value.known_sum)
+                .ok_or(LayoutError::SizeOverflow)?;
+            selected.has_unknown |= value.has_unknown;
+        }
+        selected
+    } else {
+        totals.get(&root).copied().unwrap_or_default()
+    };
     let root_placed = place(
         NodeRef::Entry(root),
         root_entry,

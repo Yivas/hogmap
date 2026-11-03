@@ -1,12 +1,12 @@
 # Development and checks
 
-The current code is a library, not an application. It has no `cargo run` entry point and no window. Development checks exercise the public index, filter, scanner-contract, synthetic-producer and layout APIs with metadata in memory; they do not scan your files.
+The code contains a std-only library and a desktop window over a labelled synthetic sample. Development checks exercise the public index, filter, scanner-contract, synthetic-producer and layout APIs with metadata in memory; they do not scan your files.
 
 ## Requirements
 
 Use Rust 1.94.1 with rustfmt and clippy. Windows 11 x64 is the intended product platform, and the Windows CI job also exercises preservation of native file names that are not valid Unicode.
 
-The core currently has no third-party dependencies. The GUI stack has been selected as egui/eframe 0.35.0, but it has not been added or tested as an application yet. A reduced development profile keeps builds smaller by limiting debug information, disabling incremental caches and turning off dependency debug information; release builds are compiled separately.
+The library has no third-party dependencies. The default `desktop` feature adds optional egui/eframe 0.35.0 with glow, default fonts, AccessKit and window persistence for the binary. A reduced development profile keeps builds smaller by limiting debug information, disabling incremental caches and turning off dependency debug information; release builds are compiled separately.
 
 ## Run the checks
 
@@ -16,11 +16,31 @@ From the source repository root:
 cargo fmt -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo test --locked --no-default-features
+cargo build --locked
 ```
 
 Configure build/cache/temporary locations in your own shell session when needed. Do not change machine-wide settings or fill a disk to reproduce a test. Fixtures should be small and synthetic; a million-entry memory benchmark is not a reason to create a million real files.
 
 [GitHub Actions](https://github.com/Yivas/hogmap/actions) runs the checks on Windows. A successful core job is not evidence of a working scanner, faithful interface or portable ZIP.
+
+## Run the window
+
+Run `cargo run --locked` from the repository root on Windows. The window starts a generated sample, not a scan of your disks. File → New scan of synthetic sample starts it again; Cancel scan or Escape, when no text field has focus, stops the current producer. The leading status is the producer lifecycle (Scanning, Finished, Cancelled or Failed), with metadata completeness reported separately. A finished sample deliberately includes unknown sizes and inaccessible directories.
+
+Click to select, double-click a folder or small-item aggregate to open it, and use Back/Forward/Up/Home to navigate. Backspace goes up, Alt+Left/Right moves through history and Escape leaves the highlight field without cancelling. The status line shows the dataset root and the path to the current folder, plus the small-item count when the map is open inside an aggregate. The highlight field accepts [name and logical-size filters](./filters.md); it dims non-matches without changing map area or totals, and invalid input keeps the previous valid highlight.
+
+### Map legend
+
+- Tan: directories, with a name/size header when space permits.
+- Light blue: files with known logical bytes.
+- Lilac: small-item aggregates, distinct from error gray. Each has a count/size label when it fits and a hover tooltip such as “12 small items · 1.2 MiB”; double-click opens those members. Inside that member view the root header keeps the parent folder's name and adds the subset, such as “photos · 12 small items - 1.2 MiB”.
+- Gray: partial, inaccessible or stale entries. Unknown sizes are not zero and have no area of their own.
+- Dim gray: non-matching entries while highlighting; muted beige: an unknown filter decision.
+
+The map uses logical bytes charged once per file identity, not physical or recoverable space. Free-space green and unattributed-volume gray are absent because volume data does not exist yet.
+
+Only window geometry is saved in eframe's application-data directory. Names, paths, filter text and navigation are not saved. AccessKit is enabled, but a full screen-reader and DPI acceptance pass is still pending. If eframe returns a startup error, HogMap prints it to stderr and exits with code 1; there is no native message box or automatic graphics-backend fallback.
 
 ## Know the boundaries
 
@@ -29,10 +49,11 @@ Configure build/cache/temporary locations in your own shell session when needed.
 - `src/scan.rs` defines the generation-tagged scanner contract, bounded batches and the reducer that builds an index.
 - `src/synthetic.rs` streams a deterministic in-memory tree through that contract.
 - `src/treemap.rs` computes squarified rectangles, headers and navigable aggregates without drawing.
-- `tests/core.rs`, `tests/scan.rs` and `tests/treemap.rs` check their public behavior with fixed expected answers.
+- `src/main.rs` and `src/ui/` own the desktop consumer, cached rendering, navigation and UI strings.
+- `tests/core.rs`, `tests/scan.rs`, `tests/treemap.rs`, `tests/aggregate_navigation.rs` and `tests/navigation.rs` check public behavior and pure UI logic with fixed expected answers.
 - The [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md) is the technical reference for implemented behavior.
 
-Entry IDs belong to one index snapshot. The scanner contract checks the owning generation before applying records; the reducer never resolves an unknown parent later. IPC, privileged NTFS reading, a real filesystem scanner, a renderer and physical attribution are not implemented by this unit.
+Entry IDs belong to one index snapshot. The scanner contract checks the owning generation before applying records; the reducer never resolves an unknown parent later. IPC, privileged NTFS reading, a real filesystem scanner and physical attribution are not implemented. Layout rebuilds are limited to four per second while scanning and cached otherwise; hover does not rebuild the tree.
 
 ## Propose a change
 

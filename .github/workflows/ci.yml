@@ -22,10 +22,26 @@ jobs:
         with:
           persist-credentials: false
       - name: Prepare toolchain
-        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt
       - name: Check formatting
         run: cargo +1.94.1 fmt -- --check
+      - name: Test std-only core
+        run: cargo +1.94.1 test --locked --no-default-features
+  # The std-only job stays fast. The graphics dependency tree is compiled once here, so this job
+  # carries a budget for a cold eframe build; no cache action is used.
+  desktop:
+    name: Desktop window
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component clippy
       - name: Clippy
         run: cargo +1.94.1 clippy --locked --all-targets -- -D warnings
       - name: Test
         run: cargo +1.94.1 test --locked
+      - name: Build desktop window
+        run: cargo +1.94.1 build --locked

@@ -1,6 +1,6 @@
 # Contributing
 
-HogMap has an early in-memory core and tests, but no application window, scanner or release yet. Read the [README](README.md) and [core contract](docs/core.md) before proposing a change.
+HogMap has an in-memory core and a desktop window over a synthetic sample, but no filesystem scanner or release yet. Read the [README](README.md) and [core contract](docs/core.md) before proposing a change.
 
 ## What is useful now
 
@@ -13,7 +13,7 @@ HogMap has an early in-memory core and tests, but no application window, scanner
 
 Issues are open and are the place to start. Open one before writing a pull request so the scope can be agreed before the implementation. Small documentation fixes need no prior issue.
 
-For a core bug, include the commit, Rust version and a small synthetic test that demonstrates the problem. Scanner and GUI reports need an application build, which does not exist yet. Never attach a real disk inventory.
+For a core bug, include the commit, Rust version and a small synthetic test that demonstrates the problem. For a GUI bug, identify the commit and reproduce it in the synthetic sample. A filesystem scanner is not available yet. Never attach a real disk inventory.
 
 ## Build and tests
 
@@ -23,9 +23,15 @@ The development toolchain is Rust 1.94.1 with rustfmt and clippy. Run from the r
 cargo fmt -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
+cargo test --locked --no-default-features
+cargo build --locked
 ```
 
-CI runs those checks on Windows with the exact toolchain. The current core has no third-party dependencies. Tests use synthetic metadata in memory, not files on your disks. Set build/cache/temporary locations in your own shell session if needed; no machine-specific paths are committed. There is no `cargo run` entry point yet.
+CI runs those checks on Windows with the exact toolchain. The library stays std-only; optional eframe 0.35.0 belongs to the default `desktop` feature and the binary. Tests use synthetic metadata in memory, not files on your disks. Set build/cache/temporary locations in your own shell session if needed; no machine-specific paths are committed.
+
+To launch the window on Windows, run `cargo run --locked`. It starts a labelled synthetic sample, not a scan of your files. Select with a click, enter a directory or small-item aggregate with a double-click, and navigate with Back/Forward/Up/Home. Backspace goes up, Alt+Left/Right moves through history and Escape cancels a scan; in the highlight field, Escape only leaves the field. The highlight field accepts the [documented filter subset](docs/core.md#name-and-logical-size-filter); invalid input leaves the previous highlight active. It never changes totals or geometry.
+
+Only window geometry is saved in eframe's application-data directory; scanned names, paths, filter text and navigation are not persisted. Startup errors returned by eframe print to stderr and exit with code 1; no native message box is implemented. Real-filesystem scanning, free-space composition, driver fallback and full DPI/accessibility acceptance are still pending.
 
 ## Documentation site
 

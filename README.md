@@ -8,9 +8,9 @@ A planned disk-space analyzer for Windows 11 that draws a scanned folder or volu
 
 ## Status
 
-HogMap is in early development. The repository contains an in-memory metadata index, a name/logical-size filter, a scanner contract with a deterministic synthetic producer, and a pure treemap layout, with tests on Windows. There is no application window, filesystem scanner, installer or release yet. The `0.0.0` Cargo package is an unpublished development marker, not a downloadable version.
+HogMap is in early development. The repository contains an in-memory metadata index, a name/logical-size filter, a scanner contract with a deterministic synthetic producer, and a pure treemap layout, with tests on Windows. A desktop window now renders the synthetic sample with progressive updates, selection, directory/aggregate zoom, history and filter highlighting. There is no filesystem scanner, installer or release yet. The `0.0.0` Cargo package is an unpublished development marker, not a downloadable version.
 
-The core performs no filesystem or network operations. Its [contract](docs/core.md) describes the implemented subset and its limits; [CONTRIBUTING.md](CONTRIBUTING.md#build-and-tests) lists the development checks. The analyzer capabilities below are still goals, not features you can use today. No scan-speed, memory-use or GUI-compatibility claim has been established.
+The core performs no filesystem or network operations. Its [contract](docs/core.md) describes the implemented subset and its limits; [CONTRIBUTING.md](CONTRIBUTING.md#build-and-tests) lists the development checks. The disk-analysis capabilities below remain goals; the window uses generated metadata only. Build and launch the sample with `cargo run --locked` on Windows using the toolchain described in CONTRIBUTING. No scan-speed, memory-use or GUI-compatibility claim has been established.
 
 ## The problem
 
@@ -30,7 +30,7 @@ HogMap is aimed at that question. One scan of a folder or a whole volume, and a 
 
 ## Scope and limits
 
-The target is Windows 11 x64 on the desktop and nothing else: no other operating system, no server, no plugin system, no database, no recovery of deleted files. It is meant to read metadata only and never open file contents, and it will not delete, move or clean anything, which also means it will not free space for you. Until a runnable prototype exists, the analyzer capabilities above stay goals.
+The target is Windows 11 x64 on the desktop and nothing else: no other operating system, no server, no plugin system, no database, no recovery of deleted files. It is meant to read metadata only and never open file contents, and it will not delete, move or clean anything, which also means it will not free space for you. The runnable sample does not analyze a real disk; those analyzer capabilities stay goals.
 
 ## Roadmap
 
@@ -44,7 +44,7 @@ Incremental rescans and advanced options come after those steps, and only if rea
 
 ## Platform and stack
 
-Windows 11 x64, as a desktop application. The selected stack is Rust 1.94.1 with egui/eframe 0.35.0 and custom drawing of rectangles and text. The first core unit uses only the standard library; GUI dependencies will be added with the window, not before they have a consumer.
+Windows 11 x64, as a desktop application. The selected stack is Rust 1.94.1 with egui/eframe 0.35.0 and custom drawing of rectangles and text. The library uses only the standard library. The default `desktop` feature adds egui/eframe 0.35.0 with glow, default fonts, AccessKit and window persistence. `cargo test --locked --no-default-features` keeps core checks free of GUI dependencies.
 
 ## Privacy and security
 
@@ -54,7 +54,7 @@ Security reports go through the private channel described in [SECURITY.md](SECUR
 
 ## Contributing and support
 
-The project is open source and collaborative, and issues are welcome now: ideas, requirements, objections to the plan and reproducible core bugs. Scanner or GUI reports need an application build, which does not exist yet.
+The project is open source and collaborative, and issues are welcome now: ideas, requirements, objections to the plan and reproducible core bugs. GUI reports should identify the source commit and use the synthetic sample; real-scanner reports must wait for that implementation.
 
 Pull requests are welcome too, with one condition. Open an issue first and settle the change before writing it. Build, test and formatting commands are listed in [CONTRIBUTING.md](CONTRIBUTING.md).
 
