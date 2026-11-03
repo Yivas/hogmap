@@ -31,7 +31,7 @@ CI runs those checks on Windows with the exact toolchain. The library stays std-
 
 To launch the window on Windows, run `cargo run --locked`. It starts a labelled synthetic sample, not a scan of your files. Select with a click, enter a directory or small-item aggregate with a double-click, and navigate with Back/Forward/Up/Home. Backspace goes up, Alt+Left/Right moves through history and Escape cancels a scan; in the highlight field, Escape only leaves the field. The highlight field accepts the [documented filter subset](docs/core.md#name-and-logical-size-filter); invalid input leaves the previous highlight active. It never changes totals or geometry.
 
-Only window geometry is saved in eframe's application-data directory; scanned names, paths, filter text and navigation are not persisted. Startup errors returned by eframe print to stderr and exit with code 1; no native message box is implemented. Real-filesystem scanning, free-space composition, driver fallback and full DPI/accessibility acceptance are still pending.
+Only the window geometry and the chosen theme are saved in eframe's application-data directory; scanned names, paths, filter text and navigation are not persisted. Startup errors returned by eframe print to stderr and exit with code 1; no native message box is implemented. Real-filesystem scanning, free-space composition, driver fallback and full DPI/accessibility acceptance are still pending.
 
 ## Documentation site
 

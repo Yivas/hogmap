@@ -1,6 +1,7 @@
 mod logic;
 mod paint;
 pub mod text;
+mod theme;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,13 +10,14 @@ use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, Key, Modifiers};
+use eframe::egui::{self, Key, Modifiers};
 use hogmap::filter::Match;
 use hogmap::index::{EntryId, Index};
 use hogmap::scan::{DEFAULT_CHANNEL_CAPACITY, ScanEvent, ScanGeneration, ScanReducer};
 use hogmap::synthetic::{SyntheticSpec, run_synthetic};
 use hogmap::treemap::{self, Layout, LayoutParams, NodeRef, Rect};
 use logic::{HighlightFilter, History, Location};
+use theme::Theme;
 
 const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -38,6 +40,11 @@ fn entry_name(index: &Index, id: EntryId) -> String {
 }
 
 pub struct HogMap {
+    /// Kept so `save` can read the theme from egui itself instead of holding a second copy.
+    context: egui::Context,
+    /// A choice from the View menu, applied at the start of the next frame so every panel of that
+    /// frame uses the same palette.
+    pending_theme: Option<Theme>,
     reducer: ScanReducer,
     receiver: Option<Receiver<ScanEvent>>,
     producer: Option<JoinHandle<()>>,
@@ -58,8 +65,14 @@ pub struct HogMap {
 
 impl HogMap {
     pub fn new(context: &eframe::CreationContext<'_>) -> std::io::Result<Self> {
-        context.egui_ctx.set_visuals(egui::Visuals::light());
+        // The native window stays hidden until the first frame is painted, so restoring the
+        // stored choice here is enough to start in the saved theme. A missing, corrupt or future
+        // value leaves the dark default.
+        let theme = context.storage.and_then(Theme::load).unwrap_or_default();
+        theme::apply(&context.egui_ctx, theme);
         let mut app = Self {
+            context: context.egui_ctx.clone(),
+            pending_theme: None,
             reducer: ScanReducer::new(ScanGeneration::new(0)),
             receiver: None,
             producer: None,
@@ -276,6 +289,18 @@ impl HogMap {
                         self.navigate(Location::default());
                         ui.close();
                     }
+                    ui.separator();
+                    // Both items are drawn every frame so the checkmark and the accessible state
+                    // always match egui's theme; choosing one is applied on the next frame,
+                    // without invalidating the cached layout or cells.
+                    let current = Theme::current(ui.ctx());
+                    let mut chosen = current;
+                    ui.selectable_value(&mut chosen, Theme::Dark, text::THEME_DARK);
+                    ui.selectable_value(&mut chosen, Theme::Light, text::THEME_LIGHT);
+                    if chosen != current {
+                        self.pending_theme = Some(chosen);
+                        ui.close();
+                    }
                 });
                 ui.menu_button(text::HELP, |ui| {
                     if ui.button(text::ABOUT).clicked() {
@@ -335,11 +360,12 @@ impl HogMap {
                     self.filter_changed = true;
                 }
             });
+            let error_color = ui.visuals().error_fg_color;
             if let Some(error) = self.filter.error {
-                ui.colored_label(Color32::from_rgb(150, 25, 25), text::filter_error(error));
+                ui.colored_label(error_color, text::filter_error(error));
             }
             if let Some(error) = &self.error {
-                ui.colored_label(Color32::from_rgb(150, 25, 25), error);
+                ui.colored_label(error_color, error);
             }
         });
     }
@@ -377,13 +403,14 @@ impl HogMap {
     fn map(&mut self, ui: &mut egui::Ui) {
         let (area, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
         let rect = Rect::new(area.min.x, area.min.y, area.width(), area.height());
+        let palette = Theme::current(ui.ctx()).palette();
         let Some(index) = self.reducer.index() else {
             ui.painter().text(
                 area.center(),
                 egui::Align2::CENTER_CENTER,
                 text::WAITING,
                 egui::FontId::proportional(13.0),
-                Color32::BLACK,
+                palette.message,
             );
             return;
         };
@@ -446,12 +473,21 @@ impl HogMap {
             self.filter_changed = false;
         }
         let Some(cache) = &self.cache else { return };
+        // The cell controls below cover the map, so its own response is not hovered; ask whether
+        // the pointer is over the map layer instead.
+        let pointed = ui
+            .ctx()
+            .pointer_hover_pos()
+            .filter(|_| ui.rect_contains_pointer(area))
+            .and_then(|position| logic::hit_test(&cache.layout, position.x, position.y));
         paint::draw(
             ui,
+            palette,
             &cache.layout,
             &cache.cells,
             &cache.matches,
             self.selected,
+            pointed,
         );
         if cache.layout.known_sum == 0 {
             ui.painter().text(
@@ -459,7 +495,7 @@ impl HogMap {
                 egui::Align2::CENTER_CENTER,
                 text::EMPTY,
                 egui::FontId::proportional(13.0),
-                Color32::BLACK,
+                palette.message,
             );
         }
         let hovered = response
@@ -490,12 +526,7 @@ impl HogMap {
                 )
             });
             if control.has_focus() {
-                ui.painter().rect_stroke(
-                    interactive,
-                    0,
-                    egui::Stroke::new(2.0, Color32::DARK_BLUE),
-                    egui::StrokeKind::Inside,
-                );
+                paint::focus_ring(ui.painter(), interactive, palette);
             }
             if control.clicked() {
                 self.selected = Some(cell.node);
@@ -525,11 +556,21 @@ impl eframe::App for HogMap {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        // Applying a menu choice here keeps the whole frame on one palette; applying it inside
+        // `controls` would leave the menu and the top panel on the previous one.
+        if let Some(theme) = self.pending_theme.take() {
+            theme::apply(&context, theme);
+        }
         self.shortcuts(&context);
         self.controls(ui);
         self.status(ui);
+        let map_background = Theme::current(&context).palette().map_background;
         egui::CentralPanel::default()
-            .frame(egui::Frame::central_panel(ui.style()).inner_margin(2.0))
+            .frame(
+                egui::Frame::central_panel(ui.style())
+                    .fill(map_background)
+                    .inner_margin(2.0),
+            )
             .show(ui, |ui| self.map(ui));
         if self.about {
             egui::Window::new(text::ABOUT)
@@ -542,7 +583,18 @@ impl eframe::App for HogMap {
     }
 
     fn persist_egui_memory(&self) -> bool {
+        // Egui memory also holds widget and window state, which is more than the theme this app
+        // stores; keeping it off leaves the file with the window geometry and the theme only.
         false
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // The stored choice is read back from egui, the same source the menu and the painter use;
+        // a choice made in the current frame is saved before its deferred application.
+        let theme = self
+            .pending_theme
+            .unwrap_or_else(|| Theme::current(&self.context));
+        theme.store(storage);
     }
 }
 
