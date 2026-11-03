@@ -99,14 +99,14 @@ fn scan_code_text(code: u32) -> Option<&'static str> {
             Some("Not followed: symbolic link, junction or other reparse point")
         }
         scan_win::SKIP_CLOUD_CODE => Some("Not opened: cloud tag or recall attributes"),
-        scan_win::LOCAL_STACK_LIMIT_CODE => {
-            Some("Subtree not scanned: directory queue and local stack limits reached")
-        }
         scan_win::UNSUPPORTED_PLATFORM_CODE => {
             Some("Windows scanning is unavailable on this platform")
         }
         scan_win::WORKER_FAILED_CODE => {
             Some("A directory worker could not start or stopped unexpectedly")
+        }
+        scan_win::PENDING_MEMORY_LIMIT_CODE => {
+            Some("Scan incomplete: pending-directory memory budget reached")
         }
         _ => None,
     }
@@ -142,12 +142,12 @@ pub fn scan_report(report: &ScanReport) -> String {
         .last_fallback_code
         .map_or_else(String::new, |code| format!(" (last: {})", scan_code(code)));
     format!(
-        "Fallback directories: {}{fallback} | Reparse skips: {} | Cloud/recall skips: {} | Invalid names: {} | Stack-limit hits: {} | Max queue depth: {} | Max local stack depth: {} | Cancellation wakeups: {}",
+        "Fallback directories: {}{fallback} | Reparse skips: {} | Cloud/recall skips: {} | Invalid names: {} | Pending-memory limit hits: {} | Max queue depth: {} | Max local stack depth: {} | Cancellation wakeups: {}",
         report.fallback_directories,
         report.reparse_skips,
         report.cloud_skips,
         report.invalid_names,
-        report.local_stack_limit_hits,
+        report.pending_memory_limit_hits,
         report.max_queue_depth,
         report.max_local_stack_depth,
         report.cancellation_wakeups
@@ -317,10 +317,6 @@ mod tests {
         assert_eq!(
             scan_code(scan_win::SKIP_CLOUD_CODE),
             "Not opened: cloud tag or recall attributes"
-        );
-        assert_eq!(
-            scan_code(scan_win::LOCAL_STACK_LIMIT_CODE),
-            "Subtree not scanned: directory queue and local stack limits reached"
         );
         assert_eq!(
             scan_code(scan_win::UNSUPPORTED_PLATFORM_CODE),

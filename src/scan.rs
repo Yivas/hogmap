@@ -12,9 +12,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
-use std::thread;
+use std::sync::mpsc::TryRecvError;
+
+mod channel;
+pub(crate) use channel::ScanWake;
+pub use channel::{ScanCancellation, ScanReceiver, ScanSender, event_channel};
 use std::time::{Duration, Instant};
 
 use crate::index::{EntryId, FileIdentity, Index, Kind, Sizes, State};
@@ -24,9 +26,7 @@ pub const MAX_BATCH_RECORDS: usize = 4096;
 /// Maximum estimated payload bytes in one [`Batch`].
 pub const MAX_BATCH_BYTES: usize = 1 << 20;
 /// Starting queue depth for a bounded producer/consumer channel.
-pub const DEFAULT_CHANNEL_CAPACITY: usize = 8;
-
-const SEND_RETRY_DELAY: Duration = Duration::from_millis(1);
+pub const DEFAULT_CHANNEL_CAPACITY: usize = 16;
 
 /// Identifies one scan session. A consumer rejects events from another generation.
 /// This is not authentication: it cannot tell who produced an event, so it is not a
@@ -78,10 +78,18 @@ impl ScanRecord {
     }
 }
 
-/// A bounded group of records, capped by record count and estimated bytes.
+/// An outcome follows all immediate child records of this directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DirectoryOutcome {
+    pub key: NodeKey,
+    pub code: Option<u32>,
+}
+
+/// A bounded group of records and directory outcomes, capped by combined items and bytes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Batch {
     records: Vec<ScanRecord>,
+    outcomes: Vec<DirectoryOutcome>,
     estimated_bytes: usize,
 }
 
@@ -95,7 +103,23 @@ impl Batch {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.records.is_empty()
+        self.records.is_empty() && self.outcomes.is_empty()
+    }
+
+    pub fn outcomes(&self) -> &[DirectoryOutcome] {
+        &self.outcomes
+    }
+
+    pub fn push_outcome(&mut self, outcome: DirectoryOutcome) -> bool {
+        let extra = std::mem::size_of::<DirectoryOutcome>();
+        if self.records.len() + self.outcomes.len() >= MAX_BATCH_RECORDS
+            || (!self.is_empty() && self.estimated_bytes.saturating_add(extra) > MAX_BATCH_BYTES)
+        {
+            return false;
+        }
+        self.outcomes.push(outcome);
+        self.estimated_bytes += extra;
+        true
     }
 
     pub fn estimated_bytes(&self) -> usize {
@@ -110,9 +134,9 @@ impl Batch {
     /// oversized record rather than losing it.
     pub fn push(&mut self, record: ScanRecord) -> bool {
         let extra = record.estimated_bytes();
-        let exceeds_records = self.records.len() >= MAX_BATCH_RECORDS;
-        let exceeds_bytes = !self.records.is_empty()
-            && self.estimated_bytes.saturating_add(extra) > MAX_BATCH_BYTES;
+        let exceeds_records = self.records.len() + self.outcomes.len() >= MAX_BATCH_RECORDS;
+        let exceeds_bytes =
+            !self.is_empty() && self.estimated_bytes.saturating_add(extra) > MAX_BATCH_BYTES;
         if exceeds_records || exceeds_bytes {
             return false;
         }
@@ -175,51 +199,27 @@ pub enum SendOutcome {
 /// Sends an essential event, waiting for queue space while checking cancellation.
 /// Progress events are coalescable and should use a single `try_send` instead.
 pub fn send_event(
-    sender: &SyncSender<ScanEvent>,
-    mut event: ScanEvent,
-    cancellation: &AtomicBool,
+    sender: &ScanSender,
+    event: ScanEvent,
+    cancellation: &ScanCancellation,
 ) -> SendOutcome {
-    loop {
-        if cancellation.load(Ordering::Relaxed) {
-            return SendOutcome::Cancelled;
-        }
-        match sender.try_send(event) {
-            Ok(()) => return SendOutcome::Sent,
-            Err(TrySendError::Full(returned)) => {
-                event = returned;
-                thread::sleep(SEND_RETRY_DELAY);
-            }
-            Err(TrySendError::Disconnected(_)) => return SendOutcome::Disconnected,
-        }
-    }
+    sender.send_cancellable(event, Some(cancellation))
 }
 
 /// Sends the single terminal event. It ignores the cancellation flag so the
 /// consumer can still observe the ending, and blocks while the queue is full.
 ///
 /// A consumer that requests cancellation must keep draining until it sees this
-/// terminal or a disconnect, or drop the [`Receiver`]. Because this send ignores
+/// terminal or a disconnect, or drop the [`ScanReceiver`]. Because this send ignores
 /// cancellation, a consumer that stops draining without dropping the receiver
 /// leaves the producer blocked here forever.
-pub fn send_terminal(
-    sender: &SyncSender<ScanEvent>,
-    generation: ScanGeneration,
-    terminal: Terminal,
-) -> bool {
-    let mut event = ScanEvent {
-        generation,
-        event: ScanEventKind::Terminal(terminal),
-    };
-    loop {
-        match sender.try_send(event) {
-            Ok(()) => return true,
-            Err(TrySendError::Full(returned)) => {
-                event = returned;
-                thread::sleep(SEND_RETRY_DELAY);
-            }
-            Err(TrySendError::Disconnected(_)) => return false,
-        }
-    }
+pub fn send_terminal(sender: &ScanSender, generation: ScanGeneration, terminal: Terminal) -> bool {
+    sender
+        .send(ScanEvent {
+            generation,
+            event: ScanEventKind::Terminal(terminal),
+        })
+        .is_ok()
 }
 
 /// Protocol problems and expected cancellations. Nothing is silently discarded:
@@ -243,9 +243,12 @@ pub struct ScanDiagnostics {
 pub struct DrainReport {
     pub events: usize,
     pub records: usize,
+    pub directories: usize,
     /// The reducer's terminal, if one has been accepted.
     pub terminal: Option<Terminal>,
     pub disconnected: bool,
+    /// Time applying events, excluding receive and idle wait.
+    pub apply_time: Duration,
 }
 
 /// Owns the fresh index for one generation and applies bounded event batches.
@@ -295,7 +298,7 @@ impl ScanReducer {
     }
 
     /// Applies whole batches and control events, stopping near `max_records`.
-    pub fn drain(&mut self, receiver: &Receiver<ScanEvent>, max_records: usize) -> DrainReport {
+    pub fn drain(&mut self, receiver: &ScanReceiver, max_records: usize) -> DrainReport {
         let record_budget = max_records.max(1);
         let event_budget = record_budget.saturating_mul(4).max(64);
         self.drain_limited(receiver, record_budget, event_budget, None)
@@ -306,7 +309,7 @@ impl ScanReducer {
     /// makes progress, even with a zero budget.
     pub fn drain_budgeted(
         &mut self,
-        receiver: &Receiver<ScanEvent>,
+        receiver: &ScanReceiver,
         max_events: usize,
         time_budget: Duration,
     ) -> DrainReport {
@@ -315,7 +318,7 @@ impl ScanReducer {
 
     fn drain_limited(
         &mut self,
-        receiver: &Receiver<ScanEvent>,
+        receiver: &ScanReceiver,
         record_budget: usize,
         event_budget: usize,
         time_budget: Option<Duration>,
@@ -330,11 +333,22 @@ impl ScanReducer {
                 Ok(event) => {
                     let belongs = event.generation == self.generation;
                     let records = match &event.event {
-                        ScanEventKind::Batch(batch) => batch.len(),
+                        ScanEventKind::Batch(batch) => {
+                            if belongs {
+                                report.directories += batch
+                                    .records()
+                                    .iter()
+                                    .filter(|record| record.kind == Kind::Directory)
+                                    .count();
+                            }
+                            batch.len()
+                        }
                         _ => 0,
                     };
                     let terminal = belongs && event.is_terminal();
+                    let apply_started = Instant::now();
                     self.apply(event);
+                    report.apply_time += apply_started.elapsed();
                     report.events += 1;
                     if belongs {
                         report.records += records;
@@ -372,6 +386,9 @@ impl ScanReducer {
             ScanEventKind::Batch(batch) => {
                 for record in batch.records() {
                     self.apply_record(record);
+                }
+                for outcome in batch.outcomes() {
+                    self.finish_directory(outcome.key, outcome.code);
                 }
             }
             ScanEventKind::DirectoryDone(key) => self.finish_directory(key, None),

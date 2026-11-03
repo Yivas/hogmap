@@ -37,6 +37,22 @@ Select with a click, enter a directory or small-item aggregate with a double-cli
 
 Only the window geometry and the chosen theme are saved in eframe's application-data directory; scanned names, paths, filter text and navigation are not persisted. Startup errors returned by eframe print to stderr and exit with code 1; no native message box is implemented. Free/not-yet-scanned map blocks, snapshots, export and alternate view modes are not implemented. Real-provider cloud behavior, graphics-driver fallback and full DPI/accessibility acceptance are still pending; see the engine's [unverified limits](docs/core.md#windows-metadata-engine).
 
+## Measuring the scanner
+
+On Windows, run the headless example against an authorized local directory:
+
+```text
+cargo run --release --locked --example scan_bench -- "C:\scan-fixture" --workers 2
+```
+
+It reads metadata only and prints counts and timings, never scanned paths or names. Workers may be 1–8; zero or omitting the option uses the provisional storage policy (one for seek-penalty/unknown storage, up to four otherwise). The reported `workers` and `seek_penalty` show the effective choice. The headless consumer blocks for events and drains continuously without layout or painting. `--unthrottled-drain` (also `--unthrottled`) explicitly selects this default. `--ui-cadence` instead uses a 33 ms cadence and approximately 4 ms drain budget for a diagnostic comparison, not a GUI responsiveness test.
+
+Use `--time-limit-seconds 90` for a fixed observation window (1–590 seconds). It requests cancellation at the limit, keeps draining to the single terminal and labels the result `run_partial=1`; it cannot interrupt synchronous Windows I/O. Keep an external hard timeout and memory limit as a safety net. Every five seconds, progress includes cumulative counts and window entries/s and directories/s, so a killed run still has a labelled lower-bound observation. Partial rates count received directory records, including discovered but unenumerated directories; they are not completed-directory rates. Producer wall time includes backpressure. Per-worker accumulated API/wait times overlap; do not add them to infer elapsed scan time. The first received batch includes the root-only publication, not necessarily a populated subtree.
+
+The inline index-memory estimate excludes names, spare capacity, hash tables and other allocations; measure process memory externally. Pending-path charges and peak node counts are separate estimates, not peak working set. Report resource-limit hits, inaccessible/partial directories, protocol diagnostics and cache state with all timing results. `--hold-for-sample` adds a 1500 ms pause after `scan_done=1` for external memory sampling; that pause is excluded from scan timings.
+
+Use one warm-up and one measured run, recording hardware, permissions and cache state; a warm-up does not prove every metadata page stayed cached. Start with a small fixture, use an external timeout and memory limit for larger roots, and never publish a real disk inventory. These measurements do not establish GUI responsiveness, physical attribution or equality with Windows volume-used bytes.
+
 ## Documentation site
 
 The wiki lives in `wiki/`, uses the default VitePress theme and is published at <https://yivas.github.io/hogmap/>. It describes implemented behavior separately from planned application features. Keep the [core contract](docs/core.md) as the primary technical reference instead of maintaining competing copies.

@@ -7,16 +7,16 @@ mod theme;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, Modifiers};
 use hogmap::filter::Match;
 use hogmap::index::{EntryId, Index};
-use hogmap::scan::{DEFAULT_CHANNEL_CAPACITY, ScanEvent, ScanGeneration, ScanReducer, Terminal};
+use hogmap::scan::{
+    DEFAULT_CHANNEL_CAPACITY, ScanCancellation, ScanGeneration, ScanReceiver, ScanReducer,
+    Terminal, event_channel,
+};
 use hogmap::scan_win::{ScanOptions, ScanReport, run_win_scan_with_options};
 use hogmap::synthetic::{SyntheticSpec, run_synthetic};
 use hogmap::treemap::{self, Layout, LayoutParams, NodeRef, Rect};
@@ -26,7 +26,7 @@ use theme::Theme;
 
 const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
-const DRAIN_BUDGET: Duration = Duration::from_millis(2);
+const DRAIN_BUDGET: Duration = Duration::from_millis(4);
 // Hold a close request this long so returning threads can finish; then detach the rest.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
@@ -62,7 +62,7 @@ pub struct HogMap {
     /// frame uses the same palette.
     pending_theme: Option<Theme>,
     reducer: ScanReducer,
-    receiver: Option<Receiver<ScanEvent>>,
+    receiver: Option<ScanReceiver>,
     producer: Option<JoinHandle<Option<ScanReport>>>,
     // At most one retired producer: a replacement cannot start until it has returned.
     pending_producers: Vec<JoinHandle<Option<ScanReport>>>,
@@ -72,7 +72,7 @@ pub struct HogMap {
     close_hold: Option<Instant>,
     scan_report: Option<ScanReport>,
     scan_root: Option<PathBuf>,
-    cancellation: Arc<AtomicBool>,
+    cancellation: ScanCancellation,
     cancelled: bool,
     version: u64,
     history: History,
@@ -116,7 +116,7 @@ impl HogMap {
             close_hold: None,
             scan_report: None,
             scan_root: None,
-            cancellation: Arc::new(AtomicBool::new(false)),
+            cancellation: ScanCancellation::new(),
             cancelled: false,
             version: 0,
             history: History::default(),
@@ -138,7 +138,7 @@ impl HogMap {
     }
 
     fn stop_producer(&mut self) {
-        self.cancellation.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
         // A terminal send ignores cancellation, so disconnect before retiring the producer.
         self.receiver.take();
         if let Some(producer) = self.producer.take() {
@@ -190,7 +190,7 @@ impl HogMap {
         {
             let result = self.preparation.take().unwrap().join();
             self.chooser.preparing = false;
-            if !self.cancellation.load(Ordering::Relaxed) && !self.closing {
+            if !self.cancellation.is_cancelled() && !self.closing {
                 match result {
                     Ok(Ok((root, volume))) => self.launch_real_scan(root, volume),
                     Ok(Err(error)) => {
@@ -208,7 +208,7 @@ impl HogMap {
         }
         match self.pending_scan.take() {
             Some(ScanRequest::Real(root)) => {
-                self.cancellation = Arc::new(AtomicBool::new(false));
+                self.cancellation = ScanCancellation::new();
                 match thread::Builder::new()
                     .name("prepare-scan".into())
                     .spawn(move || {
@@ -259,8 +259,10 @@ impl HogMap {
     fn launch_real_scan(&mut self, root: PathBuf, volume: dialog::DriveChoice) {
         let previous_failed = self.error.as_deref() == Some(text::PRODUCER_PANIC);
         let generation = ScanGeneration::new(self.reducer.generation().value().wrapping_add(1));
-        let (sender, receiver) = sync_channel(DEFAULT_CHANNEL_CAPACITY);
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = event_channel(DEFAULT_CHANNEL_CAPACITY);
+        let context = self.context.clone();
+        sender.set_waker(move || context.request_repaint());
+        let cancellation = ScanCancellation::new();
         let flag = cancellation.clone();
         let scan_root = root.clone();
         let producer = thread::Builder::new()
@@ -306,8 +308,10 @@ impl HogMap {
     fn launch_sample(&mut self) -> std::io::Result<()> {
         let previous_failed = self.error.as_deref() == Some(text::PRODUCER_PANIC);
         let generation = ScanGeneration::new(self.reducer.generation().value().wrapping_add(1));
-        let (sender, receiver) = sync_channel(DEFAULT_CHANNEL_CAPACITY);
-        let cancellation = Arc::new(AtomicBool::new(false));
+        let (sender, receiver) = event_channel(DEFAULT_CHANNEL_CAPACITY);
+        let context = self.context.clone();
+        sender.set_waker(move || context.request_repaint());
+        let cancellation = ScanCancellation::new();
         let flag = cancellation.clone();
         let producer = thread::Builder::new()
             .name("synthetic-scan".into())
@@ -344,9 +348,9 @@ impl HogMap {
     fn reset_scan(
         &mut self,
         generation: ScanGeneration,
-        receiver: Receiver<ScanEvent>,
+        receiver: ScanReceiver,
         producer: JoinHandle<Option<ScanReport>>,
-        cancellation: Arc<AtomicBool>,
+        cancellation: ScanCancellation,
         previous_failed: bool,
     ) {
         self.reducer = ScanReducer::new(generation);
@@ -374,7 +378,7 @@ impl HogMap {
         if !(self.receiver.is_some() || self.preparation.is_some() || self.pending_scan.is_some()) {
             return;
         }
-        self.cancellation.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
         self.cancelled = true;
         if self.preparation.is_some() || self.pending_scan.is_some() {
             self.pending_scan = None;
@@ -384,7 +388,12 @@ impl HogMap {
 
     fn drain(&mut self, context: &egui::Context) {
         if let Some(receiver) = &self.receiver {
-            let report = self.reducer.drain_budgeted(receiver, 64, DRAIN_BUDGET);
+            let report = self
+                .reducer
+                .drain_budgeted(receiver, usize::MAX, DRAIN_BUDGET);
+            if receiver.has_pending() {
+                context.request_repaint();
+            }
             if report.events > 0 || report.disconnected {
                 self.version += 1;
             }
@@ -739,7 +748,7 @@ impl HogMap {
                 let stopping = !self.pending_producers.is_empty()
                     || self.closing
                     || (self.cancelled && self.producer.is_some())
-                    || (self.preparation.is_some() && self.cancellation.load(Ordering::Relaxed));
+                    || (self.preparation.is_some() && self.cancellation.is_cancelled());
                 let lifecycle = if stopping {
                     text::STOPPING
                 } else if self.preparation.is_some() {
@@ -1147,6 +1156,7 @@ impl Drop for HogMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hogmap::scan::ScanEvent;
     use std::sync::mpsc::channel;
 
     #[test]
@@ -1161,12 +1171,12 @@ mod tests {
             None
         }));
         let flag = app.cancellation.clone();
-        let (sender, receiver) = sync_channel(1);
+        let (sender, receiver) = event_channel(1);
         app.receiver = Some(receiver);
         app.request_scan(ScanRequest::Sample);
         app.request_scan(ScanRequest::Real(PathBuf::from("replacement")));
         app.advance_scan();
-        assert!(flag.load(Ordering::Relaxed));
+        assert!(flag.is_cancelled());
         assert!(
             sender
                 .send(ScanEvent {

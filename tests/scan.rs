@@ -1,8 +1,8 @@
+use hogmap::scan::{ScanCancellation, ScanReceiver, event_channel as sync_channel};
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, channel, sync_channel};
+use std::sync::mpsc::channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -48,7 +48,7 @@ fn event(generation: ScanGeneration, event: ScanEventKind) -> ScanEvent {
     ScanEvent { generation, event }
 }
 
-fn drain_until_end(reducer: &mut ScanReducer, receiver: &Receiver<ScanEvent>) -> DrainReport {
+fn drain_until_end(reducer: &mut ScanReducer, receiver: &ScanReceiver) -> DrainReport {
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let report = reducer.drain(receiver, 4096);
@@ -69,7 +69,7 @@ fn run_to_end(
 ) -> (ScanReducer, ProducerOutcome) {
     let (sender, receiver) = sync_channel(capacity);
     let producer = thread::spawn(move || {
-        let cancel = AtomicBool::new(false);
+        let cancel = ScanCancellation::new();
         run_synthetic(producer_generation, seed, spec, sender, &cancel)
     });
     let mut reducer = ScanReducer::new(reducer_generation);
@@ -189,7 +189,7 @@ fn a_child_that_arrives_before_its_parent_is_reported_not_buffered() {
 fn cancellation_stops_a_producer_while_the_queue_is_full() {
     let generation = ScanGeneration::new(3);
     let (sender, receiver) = sync_channel(1);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(ScanCancellation::new());
     let producer_cancel = Arc::clone(&cancel);
     let heavy = SyntheticSpec {
         root_name: "Synthetic volume".into(),
@@ -217,7 +217,7 @@ fn cancellation_stops_a_producer_while_the_queue_is_full() {
                 applied_batch = true;
                 // Stop draining so the producer fills the bounded queue.
                 thread::sleep(Duration::from_millis(50));
-                consumer_cancel.store(true, Ordering::Relaxed);
+                consumer_cancel.cancel();
             } else {
                 thread::sleep(Duration::from_millis(1));
             }
@@ -638,7 +638,7 @@ fn a_disconnect_without_terminal_partializes_the_index_it_created() {
 fn a_producer_terminates_when_the_receiver_is_dropped_after_cancellation() {
     let generation = ScanGeneration::new(25);
     let (sender, receiver) = sync_channel(1);
-    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel = Arc::new(ScanCancellation::new());
     let producer_cancel = Arc::clone(&cancel);
     let heavy = SyntheticSpec {
         root_name: "Synthetic volume".into(),
@@ -658,7 +658,7 @@ fn a_producer_terminates_when_the_receiver_is_dropped_after_cancellation() {
         assert!(Instant::now() < deadline, "the producer sent no records");
         thread::sleep(Duration::from_millis(1));
     }
-    cancel.store(true, Ordering::Relaxed);
+    cancel.cancel();
     drop(receiver);
 
     let (outcome_sender, outcome_receiver) = channel();

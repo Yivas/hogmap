@@ -7,13 +7,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
+use std::sync::mpsc::TrySendError;
 
 use crate::index::{FileIdentity, Kind, Sizes};
 use crate::scan::{
-    Batch, NodeKey, Progress, ScanEvent, ScanEventKind, ScanGeneration, ScanRecord, SendOutcome,
-    Terminal, send_event, send_terminal,
+    Batch, DirectoryOutcome, NodeKey, Progress, ScanCancellation, ScanEvent, ScanEventKind,
+    ScanGeneration, ScanRecord, ScanSender, SendOutcome, Terminal, send_event, send_terminal,
 };
 
 /// Synthetic failure code for an inaccessible directory. It is not a Win32 error.
@@ -49,17 +48,17 @@ pub fn run_synthetic(
     generation: ScanGeneration,
     seed: u64,
     spec: SyntheticSpec,
-    sender: SyncSender<ScanEvent>,
-    cancellation: &AtomicBool,
+    sender: ScanSender,
+    cancellation: &ScanCancellation,
 ) -> ProducerOutcome {
-    if cancellation.load(Ordering::Relaxed) {
+    if cancellation.is_cancelled() {
         return abort(&sender, generation, SendFailure::Cancelled);
     }
     let plan = build_plan(seed, &spec);
     let mut batch = Batch::new();
     let mut progress = Progress::default();
     for (index, record) in plan.records.iter().enumerate() {
-        if cancellation.load(Ordering::Relaxed) {
+        if cancellation.is_cancelled() {
             return abort(&sender, generation, SendFailure::Cancelled);
         }
         if !batch.push(record.clone()) {
@@ -71,9 +70,6 @@ pub fn run_synthetic(
         progress.records += 1;
 
         for key in &plan.finish_after[index] {
-            if let Err(failure) = flush(&sender, generation, &mut batch, cancellation) {
-                return abort(&sender, generation, failure);
-            }
             let failed = plan.inaccessible.contains(key);
             if failed {
                 progress.directories_failed += 1;
@@ -81,7 +77,7 @@ pub fn run_synthetic(
                 progress.directories_done += 1;
             }
             if let Err(failure) =
-                send_directory_outcome(&sender, generation, *key, failed, cancellation)
+                send_directory_outcome(&sender, generation, &mut batch, *key, failed, cancellation)
             {
                 return abort(&sender, generation, failure);
             }
@@ -95,9 +91,6 @@ pub fn run_synthetic(
         }
     }
 
-    if let Err(failure) = flush(&sender, generation, &mut batch, cancellation) {
-        return abort(&sender, generation, failure);
-    }
     for key in &plan.finish_after[plan.records.len()] {
         let failed = plan.inaccessible.contains(key);
         if failed {
@@ -106,10 +99,13 @@ pub fn run_synthetic(
             progress.directories_done += 1;
         }
         if let Err(failure) =
-            send_directory_outcome(&sender, generation, *key, failed, cancellation)
+            send_directory_outcome(&sender, generation, &mut batch, *key, failed, cancellation)
         {
             return abort(&sender, generation, failure);
         }
+    }
+    if let Err(failure) = flush(&sender, generation, &mut batch, cancellation) {
+        return abort(&sender, generation, failure);
     }
     if !send_progress(&sender, generation, progress) {
         return ProducerOutcome::Disconnected;
@@ -127,11 +123,7 @@ enum SendFailure {
     Disconnected,
 }
 
-fn abort(
-    sender: &SyncSender<ScanEvent>,
-    generation: ScanGeneration,
-    failure: SendFailure,
-) -> ProducerOutcome {
+fn abort(sender: &ScanSender, generation: ScanGeneration, failure: SendFailure) -> ProducerOutcome {
     match failure {
         SendFailure::Cancelled => {
             if send_terminal(sender, generation, Terminal::Cancelled) {
@@ -145,10 +137,10 @@ fn abort(
 }
 
 fn flush(
-    sender: &SyncSender<ScanEvent>,
+    sender: &ScanSender,
     generation: ScanGeneration,
     batch: &mut Batch,
-    cancellation: &AtomicBool,
+    cancellation: &ScanCancellation,
 ) -> Result<(), SendFailure> {
     if batch.is_empty() {
         return Ok(());
@@ -164,11 +156,7 @@ fn flush(
     }
 }
 
-fn send_progress(
-    sender: &SyncSender<ScanEvent>,
-    generation: ScanGeneration,
-    progress: Progress,
-) -> bool {
+fn send_progress(sender: &ScanSender, generation: ScanGeneration, progress: Progress) -> bool {
     let event = ScanEvent {
         generation,
         event: ScanEventKind::Progress(progress),
@@ -180,28 +168,22 @@ fn send_progress(
 }
 
 fn send_directory_outcome(
-    sender: &SyncSender<ScanEvent>,
+    sender: &ScanSender,
     generation: ScanGeneration,
+    batch: &mut Batch,
     key: NodeKey,
     failed: bool,
-    cancellation: &AtomicBool,
+    cancellation: &ScanCancellation,
 ) -> Result<(), SendFailure> {
-    let event = ScanEvent {
-        generation,
-        event: if failed {
-            ScanEventKind::DirectoryFailed {
-                key,
-                code: SYNTHETIC_ACCESS_DENIED,
-            }
-        } else {
-            ScanEventKind::DirectoryDone(key)
-        },
+    let outcome = DirectoryOutcome {
+        key,
+        code: failed.then_some(SYNTHETIC_ACCESS_DENIED),
     };
-    match send_event(sender, event, cancellation) {
-        SendOutcome::Sent => Ok(()),
-        SendOutcome::Cancelled => Err(SendFailure::Cancelled),
-        SendOutcome::Disconnected => Err(SendFailure::Disconnected),
+    if !batch.push_outcome(outcome) {
+        flush(sender, generation, batch, cancellation)?;
+        assert!(batch.push_outcome(outcome));
     }
+    Ok(())
 }
 
 struct Plan {

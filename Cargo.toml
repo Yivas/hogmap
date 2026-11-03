@@ -16,7 +16,7 @@ desktop = ["dep:eframe"]
 eframe = { version = "=0.35.0", optional = true, default-features = false, features = ["glow", "default_fonts", "accesskit", "persistence"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Diagnostics_Debug"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 [[bin]]
 name = "hogmap"

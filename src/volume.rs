@@ -27,8 +27,14 @@ pub fn volume_root_for(_path: &Path) -> Option<String> {
     None
 }
 
+/// Unknown includes unsupported paths, devices, descriptors and query failures.
+#[cfg(not(windows))]
+pub fn seek_penalty_for(_path: &Path) -> Option<bool> {
+    None
+}
+
 #[cfg(windows)]
-pub use platform::{list_drives, volume_root_for};
+pub use platform::{list_drives, seek_penalty_for, volume_root_for};
 
 /// Suppresses removable-device dialogs on this thread only, preserving other mode bits.
 #[cfg(windows)]
@@ -84,6 +90,82 @@ mod platform {
     use windows_sys::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW, GetVolumePathNameW,
     };
+
+    pub fn seek_penalty_for(path: &Path) -> Option<bool> {
+        use std::mem::{offset_of, size_of};
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+        use windows_sys::Win32::System::Ioctl::{
+            DEVICE_SEEK_PENALTY_DESCRIPTOR, IOCTL_STORAGE_QUERY_PROPERTY, PropertyStandardQuery,
+            STORAGE_PROPERTY_QUERY, StorageDeviceSeekPenaltyProperty,
+        };
+        let _mode = ErrorModeGuard::new().ok()?;
+        let root = volume_root_for(path)?;
+        let bytes = root.as_bytes();
+        if bytes.len() != 3 || !bytes[0].is_ascii_alphabetic() || bytes[1..] != *b":\\" {
+            return None;
+        }
+        let device: Vec<u16> = format!(r"\\.\{}:", bytes[0] as char)
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: terminated local volume path; zero desired access, all share modes, no security/template.
+        let handle = unsafe {
+            CreateFileW(
+                device.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                0,
+                null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let query = STORAGE_PROPERTY_QUERY {
+            PropertyId: StorageDeviceSeekPenaltyProperty,
+            QueryType: PropertyStandardQuery,
+            ..Default::default()
+        };
+        // Read bytes, not a Rust bool: an unexpected driver value must be rejected before conversion.
+        let mut descriptor = [0_u8; size_of::<DEVICE_SEEK_PENALTY_DESCRIPTOR>()];
+        let mut returned = 0;
+        // SAFETY: synchronous owned handle; exact input/output buffers and writable byte-count pointer.
+        let success = unsafe {
+            DeviceIoControl(
+                handle,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                (&query as *const STORAGE_PROPERTY_QUERY).cast(),
+                size_of::<STORAGE_PROPERTY_QUERY>() as u32,
+                descriptor.as_mut_ptr().cast(),
+                descriptor.len() as u32,
+                &mut returned,
+                null_mut(),
+            )
+        } != 0;
+        // SAFETY: the handle is owned here and is closed exactly once, including query failure.
+        unsafe {
+            CloseHandle(handle);
+        }
+        let size = descriptor.len() as u32;
+        if !success
+            || returned != size
+            || u32::from_le_bytes(descriptor[..4].try_into().ok()?) != size
+            || u32::from_le_bytes(descriptor[4..8].try_into().ok()?) != size
+        {
+            return None;
+        }
+        match descriptor[offset_of!(DEVICE_SEEK_PENALTY_DESCRIPTOR, IncursSeekPenalty)] {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
 
     fn text(buffer: &[u16]) -> String {
         let end = buffer

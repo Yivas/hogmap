@@ -1,8 +1,8 @@
 #![cfg(windows)]
 
+use hogmap::scan::{ScanCancellation, event_channel as sync_channel};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::sync_channel;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use hogmap::index::{Kind, State};
@@ -35,7 +35,7 @@ fn scan(path: PathBuf, options: ScanOptions) -> (ScanReducer, hogmap::scan_win::
     let generation = ScanGeneration::new(710);
     let (sender, receiver) = sync_channel(2);
     let worker = thread::spawn(move || {
-        run_win_scan_with_options(generation, path, sender, &AtomicBool::new(false), options)
+        run_win_scan_with_options(generation, path, sender, &ScanCancellation::new(), options)
     });
     let mut reducer = ScanReducer::new(generation);
     let mut terminals = 0;
@@ -133,7 +133,7 @@ fn directory_batches_publish_every_parent_before_descendants() {
                 generation,
                 path,
                 sender,
-                &AtomicBool::new(false),
+                &ScanCancellation::new(),
                 ScanOptions {
                     workers,
                     ..ScanOptions::default()
@@ -165,6 +165,13 @@ fn directory_batches_publish_every_parent_before_descendants() {
                             *children.entry(parent).or_insert(0) += 1;
                         }
                         assert!(seen.insert(record.key));
+                    }
+                    for outcome in batch.outcomes() {
+                        assert!(
+                            seen.contains(&outcome.key),
+                            "outcome preceded its own record"
+                        );
+                        assert!(outcomes.insert(outcome.key), "duplicate directory outcome");
                     }
                 }
                 ScanEventKind::DirectoryDone(key) | ScanEventKind::DirectoryFailed { key, .. } => {
@@ -209,6 +216,7 @@ fn real_hardlinks_charge_once_and_local_overflow_does_not_truncate() {
             workers: 1,
             queue_capacity: 1,
             local_stack_capacity: 16,
+            ..ScanOptions::default()
         },
     );
     let summary = reducer.index().unwrap().summary().unwrap();
@@ -223,10 +231,10 @@ fn real_hardlinks_charge_once_and_local_overflow_does_not_truncate() {
 }
 
 #[test]
-fn exhausting_both_work_bounds_is_reported_without_losing_directory_records() {
+fn global_pending_memory_budget_fails_explicitly_without_losing_records() {
     let fixture = Fixture::new();
-    for name in ["a", "b", "c"] {
-        std::fs::create_dir(fixture.0.join(name)).unwrap();
+    for number in 0..64 {
+        std::fs::create_dir(fixture.0.join(format!("directory-{number:04}"))).unwrap();
     }
     let (reducer, report) = scan(
         fixture.0.clone(),
@@ -234,16 +242,40 @@ fn exhausting_both_work_bounds_is_reported_without_losing_directory_records() {
             workers: 1,
             queue_capacity: 1,
             local_stack_capacity: 1,
+            max_pending_bytes: 1024,
         },
     );
-    assert_eq!(reducer.index().unwrap().entries().count(), 4);
-    assert_eq!(report.local_stack_limit_hits, 1);
-    assert_eq!(report.max_local_stack_depth, 1);
+    assert_eq!(reducer.index().unwrap().entries().count(), 65);
+    assert_eq!(report.local_stack_limit_hits, 0);
+    assert!(report.pending_memory_limit_hits > 0);
+    assert!(report.peak_pending_bytes <= 1024);
     assert_eq!(
-        reducer.diagnostics().last_directory_failure_code,
-        Some(hogmap::scan_win::LOCAL_STACK_LIMIT_CODE)
+        reducer.terminal(),
+        Some(Terminal::Failed(
+            hogmap::scan_win::PENDING_MEMORY_LIMIT_CODE
+        ))
     );
     assert!(!reducer.index().unwrap().summary().unwrap().complete);
+}
+
+#[test]
+fn wide_tree_exceeds_ten_thousand_siblings_without_traversal_truncation() {
+    let fixture = Fixture::new();
+    for number in 0..10_001 {
+        std::fs::create_dir(fixture.0.join(format!("directory-{number:05}"))).unwrap();
+    }
+    let (reducer, report) = scan(
+        fixture.0.clone(),
+        ScanOptions {
+            workers: 2,
+            ..ScanOptions::default()
+        },
+    );
+    assert_eq!(reducer.index().unwrap().entries().count(), 10_002);
+    assert!(reducer.index().unwrap().summary().unwrap().complete);
+    assert_eq!(report.local_stack_limit_hits, 0);
+    assert_eq!(report.pending_memory_limit_hits, 0);
+    assert_eq!(reducer.diagnostics().unknown_parent_records, 0);
 }
 
 #[test]
@@ -252,7 +284,7 @@ fn cancellation_after_root_publication_emits_one_terminal() {
     for name in ["a", "b", "c"] {
         std::fs::create_dir(fixture.0.join(name)).unwrap();
     }
-    let cancel = AtomicBool::new(false);
+    let cancel = ScanCancellation::new();
     let generation = ScanGeneration::new(712);
     let (sender, receiver) = sync_channel(1);
     thread::scope(|scope| {
@@ -262,7 +294,7 @@ fn cancellation_after_root_publication_emits_one_terminal() {
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
         assert!(matches!(root.event, ScanEventKind::Batch(_)));
-        cancel.store(true, Ordering::Relaxed);
+        cancel.cancel();
         let mut terminals = Vec::new();
         while let Ok(event) = receiver.recv_timeout(std::time::Duration::from_secs(5)) {
             assert_eq!(event.generation, generation);
@@ -301,13 +333,10 @@ fn cancellation_and_disconnect_finish_without_gui() {
     let fixture = Fixture::new();
     let generation = ScanGeneration::new(711);
     let (sender, receiver) = sync_channel(1);
+    let cancelled = ScanCancellation::new();
+    cancelled.cancel();
     assert_eq!(
-        run_win_scan(
-            generation,
-            fixture.0.clone(),
-            sender,
-            &AtomicBool::new(true)
-        ),
+        run_win_scan(generation, fixture.0.clone(), sender, &cancelled),
         ProducerOutcome::Cancelled
     );
     assert!(matches!(
@@ -322,7 +351,7 @@ fn cancellation_and_disconnect_finish_without_gui() {
             generation,
             fixture.0.clone(),
             sender,
-            &AtomicBool::new(false)
+            &ScanCancellation::new()
         ),
         ProducerOutcome::Disconnected
     );
