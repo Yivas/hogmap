@@ -6,18 +6,18 @@
 |-|-|
 | No release yet | Not applicable |
 
-Nothing has been released, so no version line is supported. Reports about the current core can identify a commit and a synthetic reproduction. The first application release will define its own supported line here.
+Nothing has been released, so no version line is supported. Reports about the current source can identify a commit and a synthetic or small sanitized filesystem reproduction. The first application release will define its own supported line here.
 
 ## Scope and planned model
 
-HogMap is the Windows 11 x64 disk-space analyzer described in the [README](README.md). The core only processes metadata supplied in memory; the desktop window displays a synthetic sample and has no filesystem scanner, network or process-launching feature. Window geometry and the chosen theme are persisted by eframe, but scan names, paths, filters and navigation are not saved. The requirements below also govern the future application. Core tests do not establish that the future scanner or privileged worker meets them.
+HogMap is the Windows 11 x64 disk-space analyzer described in the [README](README.md). The desktop window can start the read-only Windows metadata scanner for a selected directory or drive root, or display a separate synthetic sample. It has no network-discovery, telemetry or process-launching feature; Windows can still perform remote filesystem I/O for selected network paths or mapped drives. Local application storage is limited to window geometry and the chosen theme, persisted by eframe in its application-data directory. Scan names, paths, reports, filters and navigation stay in memory and are not saved. The requirements below also govern future work; a privileged NTFS worker and its IPC are not implemented.
 
 - **Read-only toward the analyzed volume.** The first version has no delete, move or clean operation. A defect that would let a product feature remove or modify user data is in scope precisely because no such feature is supposed to exist.
-- **No network access, no telemetry.** The application is meant to work fully offline. An outbound connection, or anything that collects data about the machine or the scan, is a defect.
+- **No telemetry or application network client.** There is no account or server requirement. Unexpected collection or transmission of scan data is a defect. User-selected remote filesystem paths are distinct from telemetry.
 - **No service, no driver, no background process left behind.** Closing the application is meant to end everything it started.
 - **Elevation limited to one worker.** The NTFS engine needs administrator rights, so a separate worker process is meant to be elevated while the window stays at normal user rights. A path that gives the window those rights, or that widens what the worker accepts over its channel, is in scope.
 - **Filesystem metadata as untrusted input.** Malformed volume records, truncated reads, unusual name encodings and volumes changing during a scan have to end in a visible partial result, not in a crash or an out-of-bounds read.
-- **Metadata only.** File contents are never read, reparse points are not followed recursively, and cloud placeholders are never downloaded.
+- **Metadata only.** The scanner opens directories for metadata enumeration, never file contents. The chooser rejects observed reparse ancestors without canonicalizing through them, and the engine skips reparse/cloud/recall entries. Ancestor checks and handle rechecks do not eliminate concurrent path-replacement races. Real cloud providers and virtualization modes remain unverified: metadata-only flags are not a guarantee against provider fetch. See the [engine contract and unverified limits](docs/core.md#windows-metadata-engine).
 
 ## Reporting a vulnerability
 

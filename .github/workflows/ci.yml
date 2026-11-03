@@ -25,6 +25,13 @@ jobs:
         run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt
       - name: Check formatting
         run: cargo +1.94.1 fmt -- --check
+      - name: Limit unsafe-code exceptions to the FFI modules
+        shell: bash
+        run: |
+          if grep -rn "allow(unsafe_code)" src --exclude=scan_win.rs --exclude=volume.rs; then
+            echo "::error::Unsafe code is allowed only in src/scan_win.rs and src/volume.rs"
+            exit 1
+          fi
       - name: Test std-only core
         run: cargo +1.94.1 test --locked --no-default-features
   # The std-only job stays fast. The graphics dependency tree is compiled once here, so this job

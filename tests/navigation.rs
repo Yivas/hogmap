@@ -148,6 +148,16 @@ fn labels_reserve_ellipsis_and_never_split_a_character() {
 }
 
 #[test]
+fn match_counter_is_hidden_without_filter_text() {
+    assert!(!logic::show_match_count(""));
+    // The parser treats whitespace-only input as the default (inactive) filter.
+    assert!(!logic::show_match_count(" \t "));
+    assert!(logic::show_match_count("*.bin"));
+    assert!(logic::show_match_count(" >1mb "));
+    assert!(logic::show_match_count(">")); // Invalid input retains the previous highlight.
+}
+
+#[test]
 fn highlighting_keeps_context_totals_and_previous_valid_filter() {
     let (index, directory, file) = fixture();
     let summary = index.summary().unwrap();

@@ -1,6 +1,6 @@
 # Contributing
 
-HogMap has an in-memory core and a desktop window over a synthetic sample, but no filesystem scanner or release yet. Read the [README](README.md) and [core contract](docs/core.md) before proposing a change.
+HogMap has an in-memory core, a read-only Windows metadata scanner and a desktop window that can scan folders or drive roots. No release is available yet. Read the [README](README.md) and [core contract](docs/core.md) before proposing a change.
 
 ## What is useful now
 
@@ -13,7 +13,7 @@ HogMap has an in-memory core and a desktop window over a synthetic sample, but n
 
 Issues are open and are the place to start. Open one before writing a pull request so the scope can be agreed before the implementation. Small documentation fixes need no prior issue.
 
-For a core bug, include the commit, Rust version and a small synthetic test that demonstrates the problem. For a GUI bug, identify the commit and reproduce it in the synthetic sample. A filesystem scanner is not available yet. Never attach a real disk inventory.
+For a core bug, include the commit, Rust version and a small synthetic test that demonstrates the problem. For a GUI bug, reproduce it in the synthetic sample when possible. For a scanner bug, describe a small, sanitized fixture, filesystem, Windows build and visible status/error code. Never attach a real disk inventory.
 
 ## Build and tests
 
@@ -27,11 +27,15 @@ cargo test --locked --no-default-features
 cargo build --locked
 ```
 
-CI runs those checks on Windows with the exact toolchain. The library stays std-only; optional eframe 0.35.0 belongs to the default `desktop` feature and the binary. Tests use synthetic metadata in memory, not files on your disks. Set build/cache/temporary locations in your own shell session if needed; no machine-specific paths are committed.
+CI runs those checks on Windows with the exact toolchain. The in-memory modules use std only; the Windows engine uses windows-sys 0.61.2, and optional eframe 0.35.0 belongs to the default `desktop` feature and the binary. Most tests use metadata in memory. Windows scanner tests create and remove small temporary fixtures, including known-length files and hardlinks, and query drive metadata; they do not scan whole volumes. Set build/cache/temporary locations in your own shell session if needed; no machine-specific paths are committed.
 
-To launch the window on Windows, run `cargo run --locked`. It starts a labelled synthetic sample, not a scan of your files. Select with a click, enter a directory or small-item aggregate with a double-click, and navigate with Back/Forward/Up/Home. Backspace goes up, Alt+Left/Right moves through history and Escape cancels a scan; in the highlight field, Escape only leaves the field. The highlight field accepts the [documented filter subset](docs/core.md#name-and-logical-size-filter); invalid input leaves the previous highlight active. It never changes totals or geometry.
+To launch the window on Windows, run `cargo run --locked`. It opens the drive/path chooser; it does not automatically scan a disk. Select a listed drive or enter an existing directory such as `C:\` or `C:\scan-fixture`, then choose Start. Drive listing runs in the background with a “Listing drives…” state; reopening uses the session cache, and Refresh drives explicitly updates it. Path and volume checks also run off the UI thread before scanning starts. The path must exist and be a directory; observed symlinks, junctions and reparse ancestors are rejected, and the engine also checks before traversal. It reads directory metadata only and never opens file contents or modifies the selected tree. Use a small local fixture first. Mapped drives and network paths can cause filesystem I/O to a server.
 
-Only the window geometry and the chosen theme are saved in eframe's application-data directory; scanned names, paths, filter text and navigation are not persisted. Startup errors returned by eframe print to stderr and exit with code 1; no native message box is implemented. Real-filesystem scanning, free-space composition, driver fallback and full DPI/accessibility acceptance are still pending.
+File → Explore synthetic sample is separate and touches no analyzed files. New scan (Ctrl+N) reopens the chooser; Rescan (F5) repeats the selected scan root or sample with fresh navigation, not the zoomed folder. Stop scan requests cancellation immediately while queued events continue to drain; synchronous Windows I/O has no cancellation deadline. Replacement and normal close show “Stopping…” and poll for completion without joining an unfinished thread on the UI thread. Repeated replacements coalesce; a new producer waits for the old one to return rather than accumulating threads. The volume header shows actual queried free/total bytes, or unknown, separately from the logical-byte map. The full status detail is available on hover and in the status area's AccessKit label: completeness, the latest directory failure and the counts-only engine report once it returns. Ordinary inaccessible directories do not leave a red fatal-error message. A known zero-free capacity is displayed as zero, not unknown.
+
+Select with a click, enter a directory or small-item aggregate with a double-click, and navigate with Back/Forward/Up/Home. Backspace goes up, Alt+Left/Right moves through history and Escape cancels a scan; in the highlight field, Escape only leaves the field. The highlight field accepts the [documented filter subset](docs/core.md#name-and-logical-size-filter); invalid input leaves the previous highlight active. It never changes totals or geometry.
+
+Only the window geometry and the chosen theme are saved in eframe's application-data directory; scanned names, paths, filter text and navigation are not persisted. Startup errors returned by eframe print to stderr and exit with code 1; no native message box is implemented. Free/not-yet-scanned map blocks, snapshots, export and alternate view modes are not implemented. Real-provider cloud behavior, graphics-driver fallback and full DPI/accessibility acceptance are still pending; see the engine's [unverified limits](docs/core.md#windows-metadata-engine).
 
 ## Documentation site
 

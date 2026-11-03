@@ -34,6 +34,17 @@ pub struct Tone {
 pub const DEPTH_TONES: usize = 4;
 
 pub struct Palette {
+    pub chrome: Color32,
+    pub secondary_text: Color32,
+    pub separator: Color32,
+    pub icon: Color32,
+    pub disabled_icon: Color32,
+    pub accent: Color32,
+    pub tool_hover: Color32,
+    pub tool_pressed: Color32,
+    pub tool_selected: Color32,
+    pub volume_header: Color32,
+    pub volume_text: Color32,
     /// Shows between top-level cells and around the map.
     pub map_background: Color32,
     /// The waiting and empty messages drawn on `map_background`.
@@ -85,6 +96,17 @@ const DARK_TEXT: Color32 = rgb(0xDADDE2);
 const DARK_STATE_MARK: Color32 = rgb(0xE9D8B4);
 
 const DARK: Palette = Palette {
+    chrome: DARK_CHROME,
+    secondary_text: rgb(0xA9B0B9),
+    separator: rgb(0x3C454F),
+    icon: rgb(0xE6E8EB),
+    disabled_icon: rgb(0x626B77),
+    accent: rgb(0x7CC4FF),
+    tool_hover: rgb(0x353A42),
+    tool_pressed: rgb(0x414852),
+    tool_selected: rgb(0x28445C),
+    volume_header: rgb(0x23445B),
+    volume_text: rgb(0xECF5FC),
     map_background: rgb(0x0F1114),
     message: DARK_TEXT,
     directories: [
@@ -129,6 +151,17 @@ const LIGHT_STATE_MARK: Color32 = rgb(0x2E2418);
 
 /// The light palette keeps the earlier fills and black labels as the regression baseline.
 const LIGHT: Palette = Palette {
+    chrome: rgb(0xF0F2F5),
+    secondary_text: rgb(0x535D68),
+    separator: rgb(0xB6BFC8),
+    icon: rgb(0x263645),
+    disabled_icon: rgb(0x8A929D),
+    accent: rgb(0x245F88),
+    tool_hover: rgb(0xDEE6ED),
+    tool_pressed: rgb(0xC4D4E2),
+    tool_selected: rgb(0xD3E5F4),
+    volume_header: rgb(0xDCEBF6),
+    volume_text: rgb(0x153A55),
     map_background: Color32::from_gray(248),
     message: Color32::BLACK,
     directories: [
@@ -238,6 +271,23 @@ pub fn apply(context: &egui::Context, theme: Theme) {
         Theme::Dark => egui::Theme::Dark,
         Theme::Light => egui::Theme::Light,
     });
+    context.all_styles_mut(|style| {
+        style.animation_time = 0.1;
+        style.spacing.item_spacing = egui::vec2(8.0, 4.0);
+        style.spacing.button_padding = egui::vec2(8.0, 4.0);
+        style
+            .text_styles
+            .insert(egui::TextStyle::Body, egui::FontId::proportional(13.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));
+    });
 }
 
 fn dark_visuals() -> egui::Visuals {
@@ -297,6 +347,9 @@ fn dark_visuals() -> egui::Visuals {
 
 fn light_visuals() -> egui::Visuals {
     let mut visuals = egui::Visuals::light();
+    visuals.panel_fill = LIGHT.chrome;
+    visuals.window_corner_radius = CornerRadius::same(3);
+    visuals.menu_corner_radius = CornerRadius::same(3);
     // egui derives hint text from translucent body text, about 3:1 on white; set an AA colour.
     visuals.weak_text_color = Some(rgb(0x5F6368));
     visuals.error_fg_color = rgb(0x961919);
@@ -527,6 +580,57 @@ mod tests {
             for (name, text, background) in pairs {
                 let ratio = contrast_ratio(text, background);
                 assert!(ratio >= TEXT_MINIMUM, "{theme:?} {name}: {ratio:.2}");
+            }
+        }
+    }
+
+    #[test]
+    fn desktop_chrome_tokens_keep_text_and_controls_legible() {
+        for theme in THEMES {
+            let palette = theme.palette();
+            for (name, foreground, background, minimum) in [
+                (
+                    "secondary",
+                    palette.secondary_text,
+                    palette.chrome,
+                    TEXT_MINIMUM,
+                ),
+                (
+                    "volume",
+                    palette.volume_text,
+                    palette.volume_header,
+                    TEXT_MINIMUM,
+                ),
+                (
+                    "header accent",
+                    palette.accent,
+                    palette.volume_header,
+                    GRAPHIC_MINIMUM,
+                ),
+                ("focus", palette.focus, palette.chrome, GRAPHIC_MINIMUM),
+            ] {
+                let ratio = contrast_ratio(foreground, background);
+                println!("{theme:?} {name}: {ratio:.2}:1");
+                assert!(ratio >= minimum, "{theme:?} {name}: {ratio:.2}");
+            }
+            for (name, fill) in [
+                ("drive idle", palette.chrome),
+                ("drive hover", palette.tool_hover),
+                ("drive selected", palette.tool_selected),
+            ] {
+                let ratio = contrast_ratio(palette.secondary_text, fill);
+                println!("{theme:?} {name}: {ratio:.2}:1");
+                assert!(ratio >= TEXT_MINIMUM, "{theme:?} {name}: {ratio:.2}");
+            }
+            for (name, fill) in [
+                ("idle", palette.chrome),
+                ("hover", palette.tool_hover),
+                ("pressed", palette.tool_pressed),
+                ("selected", palette.tool_selected),
+            ] {
+                let ratio = contrast_ratio(palette.icon, fill);
+                println!("{theme:?} icon {name}: {ratio:.2}:1");
+                assert!(ratio >= TEXT_MINIMUM, "{theme:?} icon {name}: {ratio:.2}");
             }
         }
     }

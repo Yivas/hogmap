@@ -3,10 +3,58 @@ use std::ffi::OsString;
 use hogmap::filter::FilterError;
 use hogmap::index::{State, Summary};
 use hogmap::scan::ScanDiagnostics;
+use hogmap::scan_win::{self, ScanReport};
 
 pub const TITLE: &str = "HogMap";
 pub const FILE: &str = "File";
-pub const NEW_SCAN: &str = "New scan of synthetic sample";
+pub const NEW_SCAN: &str = "New scan";
+pub const SAMPLE_ACTION: &str = "Explore synthetic sample";
+pub const CHOOSE_SPACE: &str = "Choose your Space";
+pub const DRIVES_TAB: &str = "Drives or paths";
+pub const SNAPSHOTS_TAB: &str = "Snapshots";
+pub const NO_SNAPSHOTS: &str = "No saved snapshots yet";
+pub const SNAPSHOTS_UNAVAILABLE: &str = "Saving and opening snapshots is not implemented yet.";
+pub const DRIVES_UNAVAILABLE: &str = "No drives found. Enter an existing folder or drive root.";
+pub const LISTING_DRIVES: &str = "Listing drives…";
+pub const REFRESH_DRIVES: &str = "Refresh drives";
+pub const DRIVE_THREAD_ERROR: &str =
+    "The drive-listing thread could not start or stopped unexpectedly";
+pub const PREPARING_SCAN: &str = "Checking path and volume…";
+pub const STOPPING: &str = "Stopping…";
+pub const NOT_DIRECTORY: &str = "This path is not a directory. Choose a folder or drive root.";
+pub const PARENT_PATH: &str = "Use a path without parent (..) components.";
+pub const PATH: &str = "Path";
+pub const PATH_HINT: &str = "Enter a folder or drive root";
+pub const START: &str = "Start";
+pub const CLOSE: &str = "Close";
+pub const DRIVE: &str = "Drive";
+pub const RESCAN: &str = "Rescan";
+pub const EXPORT: &str = "Save / Export";
+pub const VIEW_MODE: &str = "View mode: nested / flat";
+pub const GROUP_BY: &str = "Group by";
+pub const GHOSTS: &str = "Show ghosts";
+pub const OPTIONS: &str = "Options";
+pub const READY: &str = "Ready";
+pub const NO_SPACE: &str = "No space selected";
+pub const CHOOSE_HINT: &str = "Choose a drive or folder to begin, or explore the synthetic sample.";
+pub const UNKNOWN_CAPACITY: &str = "Total: unknown  ·  Free: unknown";
+pub const MAP_METRIC: &str = "Known unique logical bytes";
+pub const NO_SCAN: &str = "No scan started";
+pub const COMPLETE_METADATA: &str = "Complete metadata";
+pub const INCOMPLETE_METADATA: &str = "Incomplete metadata";
+pub const NEW_SCAN_TIP: &str = "New scan · Ctrl+N";
+pub const BACK_TIP: &str = "Back · Alt+Left";
+pub const FORWARD_TIP: &str = "Forward · Alt+Right";
+pub const UP_TIP: &str = "Up · Backspace";
+pub const HOME_TIP: &str = "Home · Alt+Home";
+pub const RESCAN_TIP: &str = "Rescan selected scan root or sample · F5";
+pub const STOP_TIP: &str = "Stop scan · Esc";
+pub const EXPORT_TIP: &str = "Save / Export — not implemented yet";
+pub const VIEW_MODE_TIP: &str = "Nested / flat view — not implemented yet; current map is nested";
+pub const GROUP_BY_TIP: &str = "Group by — not implemented yet";
+pub const HIGHLIGHT_TIP: &str = "Focus highlight filter · Ctrl+F";
+pub const GHOSTS_TIP: &str = "Ghosts — not implemented yet";
+pub const OPTIONS_TIP: &str = "Options — not implemented yet";
 pub const EXIT: &str = "Exit";
 pub const VIEW: &str = "View";
 pub const ZOOM_IN: &str = "Zoom into selection";
@@ -15,16 +63,16 @@ pub const THEME_DARK: &str = "Dark";
 pub const THEME_LIGHT: &str = "Light";
 pub const HELP: &str = "Help";
 pub const ABOUT: &str = "About HogMap";
-pub const ABOUT_BODY: &str = "Synthetic sample only. No filesystem scanner or release yet.\nMap area: known logical bytes, charged once per file identity.\nZero-size and unknown-size items have no map area.\nNo volume free-space or physical attribution data is available.\nOnly window geometry and the chosen theme are saved; names, filters and navigation are not saved.";
+pub const ABOUT_BODY: &str = "Read-only Windows folder and drive scanning. No release yet.\nMap area: known logical bytes, charged once per available file identity.\nZero-size and unknown-size items have no map area.\nVolume free/total capacity is separate from map bytes; physical attribution is not implemented.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters and navigation are not saved.";
 pub const BACK: &str = "Back";
 pub const FORWARD: &str = "Forward";
 pub const UP: &str = "Up";
 pub const HOME: &str = "Home";
-pub const CANCEL: &str = "Cancel scan";
+pub const CANCEL: &str = "Stop scan";
 pub const FILTER: &str = "Highlight";
 pub const FILTER_HINT: &str = "Name or logical size: *.bin;>1mb";
 pub const SAMPLE: &str = "Synthetic sample";
-pub const WAITING: &str = "Waiting for synthetic metadata…";
+pub const WAITING: &str = "Waiting for metadata…";
 pub const EMPTY: &str = "No known logical bytes to draw. Unknown sizes are not zero.";
 pub const PARTIAL: &str = "Partial";
 
@@ -36,11 +84,75 @@ pub fn scan_state(state: super::logic::ScanState) -> &'static str {
         super::logic::ScanState::Failed => "Failed",
     }
 }
-pub const LAYOUT_ERROR: &str = "Cannot lay out this sample";
+pub const LAYOUT_ERROR: &str = "Cannot lay out this scan";
 pub const START_ERROR: &str = "HogMap could not open its window";
-pub const PRODUCER_ERROR: &str = "Could not start the synthetic producer";
-pub const PRODUCER_PANIC: &str = "The previous synthetic producer stopped unexpectedly";
+pub const PRODUCER_ERROR: &str = "Could not start the scan thread";
+pub const PRODUCER_PANIC: &str = "The scan thread stopped unexpectedly";
+pub const MISSING_TERMINAL: &str =
+    "The scan stopped without a final status; results are incomplete";
 pub const ELLIPSIS: &str = "…";
+
+/// The documented meaning of a producer-defined code; Win32 errors have none here.
+fn scan_code_text(code: u32) -> Option<&'static str> {
+    match code {
+        scan_win::SKIP_REPARSE_CODE => {
+            Some("Not followed: symbolic link, junction or other reparse point")
+        }
+        scan_win::SKIP_CLOUD_CODE => Some("Not opened: cloud tag or recall attributes"),
+        scan_win::LOCAL_STACK_LIMIT_CODE => {
+            Some("Subtree not scanned: directory queue and local stack limits reached")
+        }
+        scan_win::UNSUPPORTED_PLATFORM_CODE => {
+            Some("Windows scanning is unavailable on this platform")
+        }
+        scan_win::WORKER_FAILED_CODE => {
+            Some("A directory worker could not start or stopped unexpectedly")
+        }
+        _ => None,
+    }
+}
+
+pub fn scan_code(code: u32) -> String {
+    scan_code_text(code).map_or_else(|| format!("error {code}"), str::to_owned)
+}
+
+pub fn drive_error(code: u32) -> String {
+    // A producer code reads as its meaning; a Win32 error is printed once, as `code N`.
+    let detail = scan_code_text(code).map_or_else(|| format!("code {code}"), str::to_owned);
+    format!("Cannot list drives: {detail}. Enter an existing folder or drive root.")
+}
+
+pub fn path_error(error: &std::io::Error) -> String {
+    let detail = error
+        .raw_os_error()
+        .map_or_else(|| error.kind().to_string(), |code| scan_code(code as u32));
+    format!("Cannot access this path: {detail}. Choose an existing directory.")
+}
+
+pub fn scan_failure(code: u32) -> String {
+    format!("Scan failed: {}", scan_code(code))
+}
+
+pub fn directory_failure(code: u32) -> String {
+    format!("Incomplete metadata: {}", scan_code(code))
+}
+
+pub fn scan_report(report: &ScanReport) -> String {
+    let fallback = report
+        .last_fallback_code
+        .map_or_else(String::new, |code| format!(" (last: {})", scan_code(code)));
+    format!(
+        "Fallback directories: {}{fallback} | Reparse skips: {} | Cloud/recall skips: {} | Invalid names: {} | Stack-limit hits: {} | Max queue depth: {} | Max local stack depth: {} | Cancellation wakeups: {}",
+        report.fallback_directories,
+        report.reparse_skips,
+        report.cloud_skips,
+        report.invalid_names,
+        report.local_stack_limit_hits,
+        report.max_queue_depth,
+        report.max_local_stack_depth,
+        report.cancellation_wakeups
+    )
+}
 
 pub fn state(state: State) -> &'static str {
     match state {
@@ -120,8 +232,13 @@ pub fn status(
     } else {
         "Incomplete"
     };
+    let failure = diagnostics
+        .last_directory_failure_code
+        .map_or_else(String::new, |code| {
+            format!(" | {}", directory_failure(code))
+        });
     format!(
-        "{state} | {location} | {} | {} visible logical | {} unique map | {completeness}: {} unknown, {} inaccessible, {} partial | {protocol} protocol diagnostics",
+        "{state} | {location} | {} | {} visible logical | {} unique map | {completeness}: {} unknown, {} inaccessible, {} partial | {protocol} protocol diagnostics{failure}",
         files(summary.files),
         size(summary.known_logical_bytes, false),
         size(summary.unique_logical_bytes, false),
@@ -129,6 +246,31 @@ pub fn status(
         diagnostics.directory_failures,
         diagnostics.partial_directories
     )
+}
+
+pub fn master_status(
+    state: &str,
+    entries: usize,
+    bytes: u64,
+    elapsed: std::time::Duration,
+) -> String {
+    let seconds = elapsed.as_secs();
+    format!(
+        "{state}  ·  {entries} entries seen  ·  {} known logical  ·  {}:{:02} elapsed",
+        size(bytes, false),
+        seconds / 60,
+        seconds % 60
+    )
+}
+
+pub fn match_count(matches: usize, unknown: usize) -> String {
+    format!("{matches} matches · {unknown} unknown")
+}
+
+pub fn drive_capacity(free: Option<u64>, total: Option<u64>) -> String {
+    let known =
+        |value: Option<u64>| value.map_or_else(|| "unknown".into(), |bytes| size(bytes, false));
+    format!("{} free / {} total", known(free), known(total))
 }
 
 pub fn files(count: usize) -> String {
@@ -165,6 +307,68 @@ pub fn tooltip(name: &str, size: &str, state: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scan_codes_distinguish_safety_skips_from_windows_errors() {
+        assert_eq!(
+            scan_code(scan_win::SKIP_REPARSE_CODE),
+            "Not followed: symbolic link, junction or other reparse point"
+        );
+        assert_eq!(
+            scan_code(scan_win::SKIP_CLOUD_CODE),
+            "Not opened: cloud tag or recall attributes"
+        );
+        assert_eq!(
+            scan_code(scan_win::LOCAL_STACK_LIMIT_CODE),
+            "Subtree not scanned: directory queue and local stack limits reached"
+        );
+        assert_eq!(
+            scan_code(scan_win::UNSUPPORTED_PLATFORM_CODE),
+            "Windows scanning is unavailable on this platform"
+        );
+        assert_eq!(
+            scan_code(scan_win::WORKER_FAILED_CODE),
+            "A directory worker could not start or stopped unexpectedly"
+        );
+        assert_eq!(scan_code(5), "error 5");
+    }
+
+    #[test]
+    fn error_messages_keep_code_meanings_at_the_ui_boundary() {
+        assert_eq!(
+            scan_failure(scan_win::WORKER_FAILED_CODE),
+            "Scan failed: A directory worker could not start or stopped unexpectedly"
+        );
+        assert_eq!(directory_failure(5), "Incomplete metadata: error 5");
+        assert_eq!(scan_code(9876), "error 9876");
+        assert_eq!(
+            drive_error(5),
+            "Cannot list drives: code 5. Enter an existing folder or drive root."
+        );
+        assert_eq!(
+            drive_error(scan_win::UNSUPPORTED_PLATFORM_CODE),
+            "Cannot list drives: Windows scanning is unavailable on this platform. Enter an existing folder or drive root."
+        );
+        let message = path_error(&std::io::Error::from_raw_os_error(5));
+        assert_eq!(
+            message,
+            "Cannot access this path: error 5. Choose an existing directory."
+        );
+        let detail = status(
+            "Finished",
+            "Fixture",
+            hogmap::index::Index::new("Fixture".into())
+                .unwrap()
+                .summary()
+                .unwrap(),
+            &ScanDiagnostics {
+                last_directory_failure_code: Some(scan_win::SKIP_CLOUD_CODE),
+                directory_failures: 1,
+                ..Default::default()
+            },
+        );
+        assert!(detail.contains("Not opened: cloud tag or recall attributes"));
+    }
 
     #[test]
     fn location_text_joins_root_path_and_resolved_members() {

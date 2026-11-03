@@ -15,7 +15,7 @@ use std::ffi::OsString;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::index::{EntryId, FileIdentity, Index, Kind, Sizes, State};
 
@@ -294,13 +294,38 @@ impl ScanReducer {
         self.terminal
     }
 
-    /// Applies at most one whole batch plus control events, stopping near
-    /// `max_records` so a UI can drain once per frame.
+    /// Applies whole batches and control events, stopping near `max_records`.
     pub fn drain(&mut self, receiver: &Receiver<ScanEvent>, max_records: usize) -> DrainReport {
         let record_budget = max_records.max(1);
         let event_budget = record_budget.saturating_mul(4).max(64);
+        self.drain_limited(receiver, record_budget, event_budget, None)
+    }
+
+    /// Drains at most `max_events` events, checking elapsed time between whole events.
+    /// One batch is indivisible and can exceed the time budget; a nonempty queue always
+    /// makes progress, even with a zero budget.
+    pub fn drain_budgeted(
+        &mut self,
+        receiver: &Receiver<ScanEvent>,
+        max_events: usize,
+        time_budget: Duration,
+    ) -> DrainReport {
+        self.drain_limited(receiver, usize::MAX, max_events.max(1), Some(time_budget))
+    }
+
+    fn drain_limited(
+        &mut self,
+        receiver: &Receiver<ScanEvent>,
+        record_budget: usize,
+        event_budget: usize,
+        time_budget: Option<Duration>,
+    ) -> DrainReport {
+        let started = Instant::now();
         let mut report = DrainReport::default();
         while report.events < event_budget && report.records < record_budget {
+            if report.events > 0 && time_budget.is_some_and(|budget| started.elapsed() >= budget) {
+                break;
+            }
             match receiver.try_recv() {
                 Ok(event) => {
                     let belongs = event.generation == self.generation;

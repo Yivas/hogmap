@@ -8,14 +8,9 @@ updates:
       compatible-cargo:
         patterns: ['*']
         update-types: [minor, patch]
-  - package-ecosystem: npm
-    directory: /wiki
-    schedule:
-      interval: weekly
-    groups:
-      compatible-docs:
-        patterns: ['*']
-        update-types: [minor, patch]
+  # The documentation toolchain is pinned to the VitePress build that already exists on the
+  # maintainer's machine (no new installs), so npm updates are not proposed automatically.
+  # Change it only with an explicit decision and a matching local toolchain.
   - package-ecosystem: github-actions
     directory: /
     schedule:

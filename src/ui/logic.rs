@@ -203,6 +203,23 @@ impl HighlightFilter {
     }
 }
 
+/// Follows the parser's blank-expression rule, so a whitespace-only filter hides the counter.
+pub fn show_match_count(expression: &str) -> bool {
+    !expression.trim().is_empty()
+}
+
+/// Counts files only: directory matches provide context, not additional matching results.
+pub fn match_counts(index: &Index, matches: &HashMap<EntryId, Match>) -> (usize, usize) {
+    index
+        .entries()
+        .filter(|(_, entry)| entry.kind == Kind::File)
+        .fold((0, 0), |(yes, unknown), (id, _)| match matches.get(&id) {
+            Some(Match::Yes) => (yes + 1, unknown),
+            Some(Match::Unknown) | None => (yes, unknown + 1),
+            Some(Match::No) => (yes, unknown),
+        })
+}
+
 fn combine(left: Match, right: Match) -> Match {
     match (left, right) {
         (Match::Yes, _) | (_, Match::Yes) => Match::Yes,
@@ -217,5 +234,42 @@ pub fn highlight(node: NodeRef, members: &[EntryId], matches: &HashMap<EntryId, 
         NodeRef::Aggregate { .. } => members.iter().fold(Match::No, |found, id| {
             combine(found, matches.get(id).copied().unwrap_or(Match::Unknown))
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hogmap::index::{Sizes, State};
+
+    #[test]
+    fn highlight_count_excludes_directory_context_and_keeps_unknown_files_separate() {
+        let mut index = Index::new("sample".into()).unwrap();
+        index
+            .insert(
+                index.root(),
+                "known.bin".into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(2048),
+                    allocated: None,
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap();
+        index
+            .insert(
+                index.root(),
+                "unknown.bin".into(),
+                Kind::File,
+                Sizes::default(),
+                None,
+                State::Complete,
+            )
+            .unwrap();
+        let mut filter = HighlightFilter::default();
+        assert!(filter.set(">1kb"));
+        assert_eq!(match_counts(&index, &filter.matches(&index)), (1, 1));
     }
 }

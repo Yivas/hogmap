@@ -1,6 +1,6 @@
 # HogMap
 
-A planned disk-space analyzer for Windows 11 that draws a scanned folder or volume as a nested treemap, so the folders and files holding the space are visible at a glance.
+A disk-space analyzer in development for Windows 11 that draws a scanned folder or drive as a nested treemap of known logical bytes.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -8,9 +8,9 @@ A planned disk-space analyzer for Windows 11 that draws a scanned folder or volu
 
 ## Status
 
-HogMap is in early development. The repository contains an in-memory metadata index, a name/logical-size filter, a scanner contract with a deterministic synthetic producer, and a pure treemap layout, with tests on Windows. A desktop window now renders the synthetic sample with progressive updates, selection, directory/aggregate zoom, history and filter highlighting. There is no filesystem scanner, installer or release yet. The `0.0.0` Cargo package is an unpublished development marker, not a downloadable version.
+HogMap is in early development. The desktop window can scan real Windows folders and drive roots read-only, with progressive updates, selection, directory/aggregate zoom, history, cancellation and filter highlighting. The chooser lists real drives and also offers a separate, labelled synthetic sample. There is no installer or release yet. The `0.0.0` Cargo package is an unpublished development marker, not a downloadable version.
 
-The core performs no filesystem or network operations. Its [contract](docs/core.md) describes the implemented subset and its limits; [CONTRIBUTING.md](CONTRIBUTING.md#build-and-tests) lists the development checks. The disk-analysis capabilities below remain goals; the window uses generated metadata only. Build and launch the sample with `cargo run --locked` on Windows using the toolchain described in CONTRIBUTING. No scan-speed, memory-use or GUI-compatibility claim has been established.
+The Windows engine reads directory metadata, not file contents. The volume header shows queried free/total capacity separately from map bytes; unavailable capacity stays unknown. The status tooltip and its accessible label include fallback and skip counts after scanning. Drive listing and path/volume checks run in background tasks; reopening the chooser uses the session drive cache, with an explicit Refresh drives action. The [core contract](docs/core.md) describes the implemented subset and its limits; [CONTRIBUTING.md](CONTRIBUTING.md#build-and-tests) lists development checks and usage. Build and launch with `cargo run --locked` on Windows using the toolchain described there. No scan-speed, memory-use or GUI-compatibility claim has been established.
 
 ## The problem
 
@@ -30,7 +30,7 @@ HogMap is aimed at that question. One scan of a folder or a whole volume, and a 
 
 ## Scope and limits
 
-The target is Windows 11 x64 on the desktop and nothing else: no other operating system, no server, no plugin system, no database, no recovery of deleted files. It is meant to read metadata only and never open file contents, and it will not delete, move or clean anything, which also means it will not free space for you. The runnable sample does not analyze a real disk; those analyzer capabilities stay goals.
+The target is Windows 11 x64 on the desktop and nothing else: no other operating system, no server, no plugin system, no database, no recovery of deleted files. It is meant to read metadata only and never open file contents, and it will not delete, move or clean anything, which also means it will not free space for you. The current map shows known unique logical bytes, not physical or recoverable space. Free/not-yet-scanned blocks, snapshots, export and alternate view modes are not implemented.
 
 ## Roadmap
 
@@ -44,17 +44,17 @@ Incremental rescans and advanced options come after those steps, and only if rea
 
 ## Platform and stack
 
-Windows 11 x64, as a desktop application. The selected stack is Rust 1.94.1 with egui/eframe 0.35.0 and custom drawing of rectangles and text. The library uses only the standard library. The default `desktop` feature adds egui/eframe 0.35.0 with glow, default fonts, AccessKit and window persistence. `cargo test --locked --no-default-features` keeps core checks free of GUI dependencies.
+Windows 11 x64, as a desktop application. The selected stack is Rust 1.94.1 with egui/eframe 0.35.0 and custom drawing of rectangles and text. The in-memory modules use only the standard library; the Windows metadata engine uses windows-sys 0.61.2. The default `desktop` feature adds egui/eframe 0.35.0 with glow, default fonts, AccessKit and window persistence. `cargo test --locked --no-default-features` keeps core checks free of GUI dependencies.
 
 ## Privacy and security
 
-The application is planned to run with no network access, no telemetry and no account. It reads file metadata only, never file contents, does not follow reparse points recursively and does not download cloud placeholders. Elevation is confined to a separate worker process with a restricted channel, while the window keeps normal user rights.
+The application has no telemetry, account or network-discovery feature. Selecting a mapped drive or network path can still cause Windows filesystem I/O to its server. The scanner reads directory metadata only, never file contents, and skips reparse points and cloud/recall entries rather than traversing them. Real provider behavior and concurrent path-replacement races remain unverified; this is not a guarantee of no cloud fetch. Only window geometry and theme are saved locally. The window runs without elevation; a separate privileged NTFS engine and restricted IPC remain planned, not implemented.
 
 Security reports go through the private channel described in [SECURITY.md](SECURITY.md).
 
 ## Contributing and support
 
-The project is open source and collaborative, and issues are welcome now: ideas, requirements, objections to the plan and reproducible core bugs. GUI reports should identify the source commit and use the synthetic sample; real-scanner reports must wait for that implementation.
+The project is open source and collaborative, and issues are welcome now: ideas, requirements, objections to the plan and reproducible core bugs. Reports should identify the source commit and use the synthetic sample or a small, sanitized filesystem fixture, never a real disk inventory.
 
 Pull requests are welcome too, with one condition. Open an issue first and settle the change before writing it. Build, test and formatting commands are listed in [CONTRIBUTING.md](CONTRIBUTING.md).
 

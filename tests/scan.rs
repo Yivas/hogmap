@@ -330,6 +330,36 @@ fn synthetic_scan_is_deterministic_for_a_seed() {
 }
 
 #[test]
+fn budgeted_drain_consumes_multiple_batches_but_bounds_events_and_time() {
+    let generation = ScanGeneration::new(32);
+    let (sender, receiver) = sync_channel(80);
+    for key in 0..70 {
+        sender
+            .send(event(
+                generation,
+                ScanEventKind::Batch(batch_of([record(
+                    key,
+                    (key != 0).then_some(0),
+                    &format!("directory-{key}"),
+                    Kind::Directory,
+                )])),
+            ))
+            .unwrap();
+    }
+    let mut reducer = ScanReducer::new(generation);
+    let first = reducer.drain_budgeted(&receiver, 64, Duration::ZERO);
+    assert_eq!((first.events, first.records), (1, 1));
+    assert_eq!(reducer.index().unwrap().entries().count(), 1);
+    // A generous duration isolates the deterministic event-count bound, not machine speed.
+    let next = reducer.drain_budgeted(&receiver, 64, Duration::from_secs(60));
+    assert_eq!((next.events, next.records), (64, 64));
+    assert_eq!(reducer.index().unwrap().entries().count(), 65);
+    let last = reducer.drain_budgeted(&receiver, 64, Duration::from_secs(60));
+    assert_eq!((last.events, last.records), (5, 5));
+    assert_eq!(reducer.diagnostics().unknown_parent_records, 0);
+}
+
+#[test]
 fn batches_stop_at_the_record_and_byte_caps() {
     let mut narrow = Batch::new();
     let mut count = 0_usize;
