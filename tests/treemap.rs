@@ -1,0 +1,494 @@
+use std::collections::HashMap;
+use std::f32::consts::PI;
+
+use hogmap::index::{EntryId, FileIdentity, Index, Kind, Sizes, State};
+use hogmap::treemap::{Layout, LayoutError, LayoutParams, NodeRef, Placed, Rect, layout};
+
+fn params(min_pixel_area: f32, header_height: f32) -> LayoutParams {
+    LayoutParams {
+        min_pixel_area,
+        header_height,
+    }
+}
+
+fn insert_dir(index: &mut Index, parent: EntryId, name: &str) -> EntryId {
+    index
+        .insert(
+            parent,
+            name.into(),
+            Kind::Directory,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap()
+}
+
+fn insert_file(index: &mut Index, parent: EntryId, name: &str, bytes: Option<u64>) -> EntryId {
+    index
+        .insert(
+            parent,
+            name.into(),
+            Kind::File,
+            Sizes {
+                logical: bytes,
+                allocated: bytes,
+            },
+            None,
+            State::Complete,
+        )
+        .unwrap()
+}
+
+fn insert_linked_file(
+    index: &mut Index,
+    parent: EntryId,
+    name: &str,
+    bytes: u64,
+    identity: FileIdentity,
+) -> EntryId {
+    index
+        .insert(
+            parent,
+            name.into(),
+            Kind::File,
+            Sizes {
+                logical: Some(bytes),
+                allocated: Some(bytes),
+            },
+            Some(identity),
+            State::Complete,
+        )
+        .unwrap()
+}
+
+struct Basic {
+    index: Index,
+    root: EntryId,
+    docs: EntryId,
+    media: EntryId,
+    doc_a: EntryId,
+    doc_b: EntryId,
+    media_file: EntryId,
+    empty: EntryId,
+    unknown: EntryId,
+}
+
+fn basic() -> Basic {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let root = index.root();
+    let docs = insert_dir(&mut index, root, "Docs");
+    let media = insert_dir(&mut index, root, "Media");
+    let doc_a = insert_file(&mut index, docs, "a.bin", Some(60));
+    let doc_b = insert_file(&mut index, docs, "b.bin", Some(30));
+    let media_file = insert_file(&mut index, media, "c.bin", Some(10));
+    let empty = insert_file(&mut index, root, "empty.bin", Some(0));
+    let unknown = index
+        .insert(
+            docs,
+            "mystery.bin".into(),
+            Kind::File,
+            Sizes::default(),
+            None,
+            State::Inaccessible,
+        )
+        .unwrap();
+    index.set_state(root, State::Complete).unwrap();
+    Basic {
+        index,
+        root,
+        docs,
+        media,
+        doc_a,
+        doc_b,
+        media_file,
+        empty,
+        unknown,
+    }
+}
+
+fn find(layout: &Layout, node: NodeRef) -> &Placed {
+    layout
+        .placed
+        .iter()
+        .find(|placed| placed.node == node)
+        .unwrap_or_else(|| panic!("missing {node:?}"))
+}
+
+fn parent_of(index: &Index, placed: &Placed) -> Option<EntryId> {
+    match placed.node {
+        NodeRef::Entry(id) => index.get(id).and_then(|entry| entry.parent),
+        NodeRef::Aggregate { parent } => Some(parent),
+    }
+}
+
+fn contains(outer: Rect, inner: Rect, epsilon: f32) -> bool {
+    inner.x >= outer.x - epsilon
+        && inner.y >= outer.y - epsilon
+        && inner.right() <= outer.right() + epsilon
+        && inner.bottom() <= outer.bottom() + epsilon
+}
+
+fn assert_proportional(rect: Rect, content_area: f32, weight: u64, total: u64) {
+    let expected = content_area * weight as f32 / total as f32;
+    let tolerance = content_area.max(1.0) * 0.01;
+    assert!(
+        (rect.area() - expected).abs() <= tolerance,
+        "{:?} should be near {expected}, got {}",
+        rect,
+        rect.area()
+    );
+}
+
+#[test]
+fn layout_contains_every_child_inside_its_parent_content() {
+    let basic = basic();
+    let result = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(0.0, 0.0, 800.0, 600.0),
+        params(16.0, 20.0),
+    )
+    .unwrap();
+    for placed in &result.placed {
+        if let Some(parent) = parent_of(&basic.index, placed) {
+            let parent_content = find(&result, NodeRef::Entry(parent)).content;
+            assert!(
+                contains(parent_content, placed.rect, 0.1),
+                "{:?} escapes {:?}",
+                placed.node,
+                parent_content
+            );
+        }
+    }
+}
+
+#[test]
+fn layout_keeps_siblings_disjoint() {
+    let basic = basic();
+    let result = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(0.0, 0.0, 800.0, 600.0),
+        params(16.0, 20.0),
+    )
+    .unwrap();
+    let mut groups: HashMap<Option<EntryId>, Vec<&Placed>> = HashMap::new();
+    for placed in &result.placed {
+        if let Some(parent) = parent_of(&basic.index, placed) {
+            groups.entry(Some(parent)).or_default().push(placed);
+        }
+    }
+    for siblings in groups.values() {
+        for (index, a) in siblings.iter().enumerate() {
+            for b in &siblings[index + 1..] {
+                let separated = a.rect.right() <= b.rect.x + 0.1
+                    || b.rect.right() <= a.rect.x + 0.1
+                    || a.rect.bottom() <= b.rect.y + 0.1
+                    || b.rect.bottom() <= a.rect.y + 0.1;
+                assert!(separated, "{:?} overlaps {:?}", a.rect, b.rect);
+            }
+        }
+    }
+}
+
+#[test]
+fn layout_conserves_each_expanded_content_area() {
+    let basic = basic();
+    let result = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(0.0, 0.0, 800.0, 600.0),
+        params(16.0, 20.0),
+    )
+    .unwrap();
+    let mut child_areas: HashMap<EntryId, f32> = HashMap::new();
+    for placed in &result.placed {
+        if let Some(parent) = parent_of(&basic.index, placed) {
+            *child_areas.entry(parent).or_default() += placed.rect.area();
+        }
+    }
+    for (parent, sum) in child_areas {
+        let content = find(&result, NodeRef::Entry(parent)).content;
+        let tolerance = content.area().max(1.0) * 0.01;
+        assert!(
+            (sum - content.area()).abs() <= tolerance,
+            "children of {parent:?} sum {sum}, content is {}",
+            content.area()
+        );
+    }
+}
+
+#[test]
+fn layout_makes_cells_proportional_to_known_bytes() {
+    let basic = basic();
+    let result = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(0.0, 0.0, 1000.0, 1000.0),
+        params(1.0, 0.0),
+    )
+    .unwrap();
+    let root_content = find(&result, NodeRef::Entry(basic.root)).content;
+    assert_proportional(
+        find(&result, NodeRef::Entry(basic.docs)).rect,
+        root_content.area(),
+        90,
+        100,
+    );
+    assert_proportional(
+        find(&result, NodeRef::Entry(basic.media)).rect,
+        root_content.area(),
+        10,
+        100,
+    );
+    assert_eq!(
+        find(&result, NodeRef::Entry(basic.media_file)).known_sum,
+        10
+    );
+    let docs_content = find(&result, NodeRef::Entry(basic.docs)).content;
+    assert_proportional(
+        find(&result, NodeRef::Entry(basic.doc_a)).rect,
+        docs_content.area(),
+        60,
+        90,
+    );
+    assert_proportional(
+        find(&result, NodeRef::Entry(basic.doc_b)).rect,
+        docs_content.area(),
+        30,
+        90,
+    );
+}
+
+#[test]
+fn layout_is_deterministic() {
+    let basic = basic();
+    let first = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(10.0, 20.0, 640.0, 480.0),
+        params(24.0, 18.0),
+    )
+    .unwrap();
+    let second = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(10.0, 20.0, 640.0, 480.0),
+        params(24.0, 18.0),
+    )
+    .unwrap();
+    assert_eq!(first, second);
+}
+
+#[test]
+fn layout_aggregates_small_siblings_and_preserves_totals() {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let root = index.root();
+    insert_file(&mut index, root, "big.bin", Some(1_000_000));
+    for number in 0..100 {
+        insert_file(
+            &mut index,
+            root,
+            &format!("small_{number:03}.bin"),
+            Some(100),
+        );
+    }
+    index.set_state(root, State::Complete).unwrap();
+    let result = layout(
+        &index,
+        root,
+        Rect::new(0.0, 0.0, 1000.0, 1000.0),
+        params(5000.0, 0.0),
+    )
+    .unwrap();
+    assert_eq!(result.known_sum, 1_010_000);
+    let aggregate = find(&result, NodeRef::Aggregate { parent: root });
+    assert_eq!(aggregate.known_sum, 10_000);
+    assert_eq!(aggregate.members.len(), 100);
+    assert!(aggregate.members.iter().all(|id| {
+        index
+            .get(*id)
+            .is_some_and(|entry| entry.name.to_string_lossy().starts_with("small_"))
+    }));
+    let root_content = find(&result, NodeRef::Entry(root)).content;
+    let mut child_area = 0.0;
+    let mut child_weight = 0;
+    for placed in &result.placed {
+        if parent_of(&index, placed) == Some(root) {
+            child_area += placed.rect.area();
+            child_weight += placed.known_sum;
+        }
+    }
+    assert!((child_area - root_content.area()).abs() <= root_content.area() * 0.01);
+    assert_eq!(child_weight, result.known_sum);
+    assert_eq!(result.placed.len(), 3);
+}
+
+#[test]
+fn layout_reports_unknown_sizes_without_giving_them_area() {
+    let basic = basic();
+    let result = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(0.0, 0.0, 800.0, 600.0),
+        params(16.0, 20.0),
+    )
+    .unwrap();
+    assert!(result.has_unknown);
+    assert!(find(&result, NodeRef::Entry(basic.root)).has_unknown);
+    assert!(find(&result, NodeRef::Entry(basic.docs)).has_unknown);
+    assert!(!find(&result, NodeRef::Entry(basic.media)).has_unknown);
+    assert!(result.placed.iter().all(|placed| {
+        placed.node != NodeRef::Entry(basic.unknown) && placed.node != NodeRef::Entry(basic.empty)
+    }));
+    let mut placed_weight = 0;
+    for placed in &result.placed {
+        if let NodeRef::Entry(id) = placed.node
+            && basic
+                .index
+                .get(id)
+                .is_some_and(|entry| entry.kind == Kind::File)
+        {
+            placed_weight += placed.known_sum;
+        }
+    }
+    assert_eq!(placed_weight, result.known_sum);
+}
+
+#[test]
+fn layout_reserves_a_header_and_collapses_it_when_it_does_not_fit() {
+    let basic = basic();
+    let roomy = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(0.0, 0.0, 100.0, 100.0),
+        params(1.0, 20.0),
+    )
+    .unwrap();
+    let root = find(&roomy, NodeRef::Entry(basic.root));
+    let header = root.header.expect("root header fits");
+    assert_eq!(header.height, 20.0);
+    assert_eq!(root.content.height, 80.0);
+    assert_eq!(root.content.y, 20.0);
+    let docs = find(&roomy, NodeRef::Entry(basic.docs));
+    assert!(docs.header.is_some());
+
+    let tight = layout(
+        &basic.index,
+        basic.root,
+        Rect::new(0.0, 0.0, 100.0, 30.0),
+        params(1.0, 20.0),
+    )
+    .unwrap();
+    let root = find(&tight, NodeRef::Entry(basic.root));
+    assert!(root.header.is_none());
+    assert_eq!(root.content, root.rect);
+    let docs = find(&tight, NodeRef::Entry(basic.docs));
+    assert!(docs.header.is_none());
+    assert_eq!(docs.content, docs.rect);
+}
+
+#[test]
+fn layout_handles_a_deep_tree_without_recursion() {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let mut parent = index.root();
+    for number in 0..10_000 {
+        parent = insert_dir(&mut index, parent, &format!("d{number}"));
+    }
+    insert_file(&mut index, parent, "leaf.bin", Some(1));
+    index.set_state(index.root(), State::Complete).unwrap();
+    let result = layout(
+        &index,
+        index.root(),
+        Rect::new(0.0, 0.0, 1000.0, 1000.0),
+        params(1.0, 0.0),
+    )
+    .unwrap();
+    assert_eq!(result.known_sum, 1);
+    assert_eq!(result.placed.len(), 10_002);
+}
+
+#[test]
+fn layout_rejects_invalid_geometry_and_foreign_roots() {
+    let basic = basic();
+    let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+    assert_eq!(
+        layout(
+            &basic.index,
+            basic.root,
+            Rect::new(0.0, 0.0, -1.0, 100.0),
+            params(1.0, 0.0)
+        ),
+        Err(LayoutError::InvalidRect)
+    );
+    assert_eq!(
+        layout(
+            &basic.index,
+            basic.root,
+            Rect::new(0.0, 0.0, PI, f32::NAN),
+            params(1.0, 0.0)
+        ),
+        Err(LayoutError::InvalidRect)
+    );
+    assert_eq!(
+        layout(
+            &basic.index,
+            basic.root,
+            Rect::new(0.0, 0.0, f32::MAX, f32::MAX),
+            params(1.0, 0.0)
+        ),
+        Err(LayoutError::InvalidRect)
+    );
+    assert_eq!(
+        layout(&basic.index, basic.root, rect, params(0.0, 0.0)),
+        Err(LayoutError::InvalidParams)
+    );
+    let fresh = Index::new("Other".into()).unwrap();
+    assert_eq!(
+        layout(&fresh, basic.doc_a, rect, params(1.0, 0.0)),
+        Err(LayoutError::UnknownRoot)
+    );
+}
+
+#[test]
+fn layout_charges_a_hardlink_once_at_its_first_entry() {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let root = index.root();
+    let first = insert_dir(&mut index, root, "First");
+    let second = insert_dir(&mut index, root, "Second");
+    let identity = FileIdentity {
+        volume: 1,
+        file: 42,
+    };
+    let original = insert_linked_file(&mut index, first, "one.bin", 100, identity);
+    let link = insert_linked_file(&mut index, second, "two.bin", 100, identity);
+    index.set_state(root, State::Complete).unwrap();
+    let summary = index.summary().unwrap();
+    assert_eq!(summary.known_logical_bytes, 200);
+    assert_eq!(summary.unique_logical_bytes, 100);
+    assert_eq!(summary.shared_logical_bytes, 100);
+
+    let result = layout(
+        &index,
+        root,
+        Rect::new(0.0, 0.0, 100.0, 100.0),
+        params(1.0, 0.0),
+    )
+    .unwrap();
+    assert_eq!(result.known_sum, 100);
+    assert_eq!(find(&result, NodeRef::Entry(first)).known_sum, 100);
+    assert_eq!(find(&result, NodeRef::Entry(original)).known_sum, 100);
+    assert!(
+        result
+            .placed
+            .iter()
+            .all(|placed| placed.node != NodeRef::Entry(link))
+    );
+    assert!(
+        result
+            .placed
+            .iter()
+            .all(|placed| placed.node != NodeRef::Entry(second))
+    );
+}

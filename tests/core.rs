@@ -80,7 +80,7 @@ fn invalid_or_excessive_filters_are_rejected_before_use() {
 }
 
 #[test]
-fn index_keeps_unknowns_and_logical_hardlinks_without_mutating_totals_when_filtering() {
+fn index_keeps_unknowns_and_charges_hardlinks_once_without_mutating_totals_when_filtering() {
     let mut index = Index::new("Synthetic volume".into()).unwrap();
     let root = index.root();
     let folder = index
@@ -139,6 +139,8 @@ fn index_keeps_unknowns_and_logical_hardlinks_without_mutating_totals_when_filte
     let before = index.summary().unwrap();
     assert_eq!(before.files, 4);
     assert_eq!(before.known_logical_bytes, 24);
+    assert_eq!(before.unique_logical_bytes, 12);
+    assert_eq!(before.shared_logical_bytes, 12);
     assert_eq!(before.unknown_size_files, 1);
     assert!(!before.complete);
     let filter = Filter::parse("*.jpg").unwrap();
@@ -152,6 +154,32 @@ fn index_keeps_unknowns_and_logical_hardlinks_without_mutating_totals_when_filte
     assert_eq!(matched.len(), 2);
     assert_eq!(index.summary().unwrap(), before);
     assert_eq!(index.get(folder).unwrap().parent, Some(root));
+}
+
+#[test]
+fn summary_does_not_deduplicate_files_without_identity() {
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    for name in ["a.bin", "b.bin"] {
+        index
+            .insert(
+                root,
+                name.into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(7),
+                    allocated: None,
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap();
+    }
+    index.set_state(root, State::Complete).unwrap();
+    let summary = index.summary().unwrap();
+    assert_eq!(summary.known_logical_bytes, 14);
+    assert_eq!(summary.unique_logical_bytes, 14);
+    assert_eq!(summary.shared_logical_bytes, 0);
 }
 
 #[test]
@@ -210,6 +238,182 @@ fn index_rejects_invalid_hierarchy_and_overflow_without_hiding_errors() {
         )
         .unwrap();
     assert_eq!(index.summary(), Err(IndexError::SizeOverflow));
+}
+
+#[test]
+fn summary_totals_follow_inserts_and_state_changes() {
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    let folder = index
+        .insert(
+            root,
+            "Folder".into(),
+            Kind::Directory,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    let identity = Some(FileIdentity { volume: 1, file: 7 });
+    for name in ["first.bin", "link.bin"] {
+        index
+            .insert(
+                folder,
+                name.into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(100),
+                    allocated: None,
+                },
+                identity,
+                State::Complete,
+            )
+            .unwrap();
+    }
+    index
+        .insert(
+            root,
+            "unknown.bin".into(),
+            Kind::File,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    index
+        .insert(
+            root,
+            "empty.bin".into(),
+            Kind::File,
+            Sizes {
+                logical: Some(0),
+                allocated: Some(0),
+            },
+            None,
+            State::Complete,
+        )
+        .unwrap();
+
+    let summary = index.summary().unwrap();
+    assert_eq!(summary.files, 4);
+    assert_eq!(summary.known_logical_bytes, 200);
+    assert_eq!(summary.unique_logical_bytes, 100);
+    assert_eq!(summary.shared_logical_bytes, 100);
+    assert_eq!(summary.unknown_size_files, 1);
+    assert!(!summary.complete);
+    assert_eq!(
+        summary.known_logical_bytes,
+        summary.unique_logical_bytes + summary.shared_logical_bytes
+    );
+
+    index.set_state(root, State::Complete).unwrap();
+    assert!(
+        !index.summary().unwrap().complete,
+        "an unknown size also clears completeness"
+    );
+
+    let mut complete_index = Index::new("Synthetic".into()).unwrap();
+    let root = complete_index.root();
+    complete_index
+        .insert(
+            root,
+            "only.bin".into(),
+            Kind::File,
+            Sizes {
+                logical: Some(1),
+                allocated: None,
+            },
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    assert!(!complete_index.summary().unwrap().complete);
+    complete_index.set_state(root, State::Complete).unwrap();
+    assert!(complete_index.summary().unwrap().complete);
+    complete_index.set_state(root, State::Partial).unwrap();
+    assert!(!complete_index.summary().unwrap().complete);
+    complete_index.set_state(root, State::Complete).unwrap();
+    assert!(complete_index.summary().unwrap().complete);
+}
+
+#[test]
+fn a_later_link_is_charged_when_the_first_link_size_is_unknown() {
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    let identity = Some(FileIdentity { volume: 1, file: 9 });
+    index
+        .insert(
+            root,
+            "first.bin".into(),
+            Kind::File,
+            Sizes::default(),
+            identity,
+            State::Complete,
+        )
+        .unwrap();
+    index
+        .insert(
+            root,
+            "second.bin".into(),
+            Kind::File,
+            Sizes {
+                logical: Some(40),
+                allocated: None,
+            },
+            identity,
+            State::Complete,
+        )
+        .unwrap();
+    index.set_state(root, State::Complete).unwrap();
+
+    let summary = index.summary().unwrap();
+    assert_eq!(summary.files, 2);
+    assert_eq!(summary.known_logical_bytes, 40);
+    assert_eq!(summary.unique_logical_bytes, 40);
+    assert_eq!(summary.shared_logical_bytes, 0);
+    assert_eq!(summary.unknown_size_files, 1);
+    assert!(!summary.complete);
+}
+
+#[test]
+fn names_are_limited_to_255_utf16_units() {
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    let ascii_at_limit = index
+        .insert(
+            root,
+            "a".repeat(255).into(),
+            Kind::File,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .is_ok();
+    assert!(ascii_at_limit);
+    for name in ["a".repeat(256), "😀".repeat(128)] {
+        assert_eq!(
+            index.insert(
+                root,
+                name.into(),
+                Kind::File,
+                Sizes::default(),
+                None,
+                State::Complete
+            ),
+            Err(IndexError::InvalidName)
+        );
+    }
+    let astral_at_limit = index
+        .insert(
+            root,
+            format!("{}a", "😀".repeat(127)).into(),
+            Kind::File,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .is_ok();
+    assert!(astral_at_limit);
 }
 
 #[cfg(windows)]

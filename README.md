@@ -8,7 +8,7 @@ A planned disk-space analyzer for Windows 11 that draws a scanned folder or volu
 
 ## Status
 
-HogMap is in early development. The repository contains an in-memory metadata index and a name/logical-size filter, with tests on Windows. There is no application window, filesystem scanner, installer or release yet. The `0.0.0` Cargo package is an unpublished development marker, not a downloadable version.
+HogMap is in early development. The repository contains an in-memory metadata index, a name/logical-size filter, a scanner contract with a deterministic synthetic producer, and a pure treemap layout, with tests on Windows. There is no application window, filesystem scanner, installer or release yet. The `0.0.0` Cargo package is an unpublished development marker, not a downloadable version.
 
 The core performs no filesystem or network operations. Its [contract](docs/core.md) describes the implemented subset and its limits; [CONTRIBUTING.md](CONTRIBUTING.md#build-and-tests) lists the development checks. The analyzer capabilities below are still goals, not features you can use today. No scan-speed, memory-use or GUI-compatibility claim has been established.
 

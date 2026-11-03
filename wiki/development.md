@@ -1,12 +1,12 @@
 # Development and checks
 
-The current code is a library, not an application. It has no `cargo run` entry point. Development checks exercise the public index and filter API with synthetic metadata in memory; they do not scan your files.
+The current code is a library, not an application. It has no `cargo run` entry point and no window. Development checks exercise the public index, filter, scanner-contract, synthetic-producer and layout APIs with metadata in memory; they do not scan your files.
 
 ## Requirements
 
 Use Rust 1.94.1 with rustfmt and clippy. Windows 11 x64 is the intended product platform, and the Windows CI job also exercises preservation of native file names that are not valid Unicode.
 
-The core currently has no third-party dependencies. The GUI stack has been selected as egui/eframe 0.35.0, but it has not been added or tested as an application yet.
+The core currently has no third-party dependencies. The GUI stack has been selected as egui/eframe 0.35.0, but it has not been added or tested as an application yet. A reduced development profile keeps builds smaller by limiting debug information, disabling incremental caches and turning off dependency debug information; release builds are compiled separately.
 
 ## Run the checks
 
@@ -26,10 +26,13 @@ Configure build/cache/temporary locations in your own shell session when needed.
 
 - `src/index.rs` owns the flat metadata snapshot and entry IDs.
 - `src/filter.rs` parses and evaluates name/logical-size conditions.
-- `tests/core.rs` checks their public behavior with fixed expected answers.
+- `src/scan.rs` defines the generation-tagged scanner contract, bounded batches and the reducer that builds an index.
+- `src/synthetic.rs` streams a deterministic in-memory tree through that contract.
+- `src/treemap.rs` computes squarified rectangles, headers and navigable aggregates without drawing.
+- `tests/core.rs`, `tests/scan.rs` and `tests/treemap.rs` check their public behavior with fixed expected answers.
 - The [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md) is the technical reference for implemented behavior.
 
-Entry IDs belong to one index snapshot. A future scanner/UI transport must check the owning scan generation before using them. IPC, privileged NTFS reading and physical attribution are not implemented by this unit.
+Entry IDs belong to one index snapshot. The scanner contract checks the owning generation before applying records; the reducer never resolves an unknown parent later. IPC, privileged NTFS reading, a real filesystem scanner, a renderer and physical attribution are not implemented by this unit.
 
 ## Propose a change
 

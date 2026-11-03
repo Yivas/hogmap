@@ -13,3 +13,12 @@ unsafe_code = "forbid"
 
 [lints.clippy]
 all = "warn"
+
+# Keep development builds small enough for the per-session disk budget.
+# Release builds are compiled separately, only to measure or package.
+[profile.dev]
+debug = "line-tables-only"
+incremental = false
+
+[profile.dev.package."*"]
+debug = false
