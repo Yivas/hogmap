@@ -22,7 +22,7 @@ cargo build --locked
 
 Configure build/cache/temporary locations in your own shell session when needed. Do not change machine-wide settings or fill a disk to reproduce a test. Fixtures should be small and synthetic; a million-entry memory benchmark is not a reason to create a million real files.
 
-[GitHub Actions](https://github.com/Yivas/hogmap/actions) runs the checks on Windows. CI also fails if `allow(unsafe_code)` appears outside `src/scan_win.rs` and `src/volume.rs`. A successful test job is not evidence of faithful native-window behavior, whole-volume accuracy or a portable ZIP.
+[GitHub Actions](https://github.com/Yivas/hogmap/actions) runs the checks on Windows. CI also fails if `allow(unsafe_code)` appears outside the audited `src/scan_win.rs`, `src/volume.rs` and `src/name_arena.rs` boundaries. A successful test job is not evidence of faithful native-window behavior, whole-volume accuracy or a portable ZIP.
 
 ## Run the window
 
@@ -65,6 +65,8 @@ Only the window geometry and the chosen theme are saved in eframe's application-
 - `src/main.rs` and `src/ui/` own the desktop consumer, cached rendering, navigation and UI strings.
 - `tests/core.rs`, `tests/scan.rs`, `tests/treemap.rs`, `tests/aggregate_navigation.rs` and `tests/navigation.rs` check public behavior and pure UI logic with fixed expected answers. Unit tests in `src/ui/` check location text, volume-choice mapping, path validation, scan-code messages, theme contrast and the stored theme preference. `tests/scan_win.rs` exercises small real Windows fixtures, not whole drives.
 - The [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md) is the technical reference for implemented behavior.
+
+Checked u32 entry-ID and name-arena ceilings return `CapacityExceeded`; these [representation limits](https://github.com/Yivas/hogmap/blob/main/docs/core.md#metadata-index) are not a safe process-memory budget, and allocation exhaustion can occur sooner.
 
 Entry IDs belong to one index snapshot. The scanner contract checks the owning generation before applying records; the reducer never resolves an unknown parent later. IPC, privileged NTFS reading and physical attribution are not implemented. Real cloud providers, long-path I/O and path-replacement races still need authorized environment-specific checks; see the [engine limits](https://github.com/Yivas/hogmap/blob/main/docs/core.md#windows-metadata-engine). Layout rebuilds are limited to four per second while scanning and cached otherwise; hover does not rebuild the tree.
 

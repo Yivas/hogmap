@@ -93,7 +93,7 @@ fn snapshot(index: &Index) -> Vec<SnapshotEntry> {
         .map(|(_, entry)| {
             (
                 entry.parent,
-                entry.name.clone(),
+                entry.name.to_os_string(),
                 entry.kind,
                 entry.sizes,
                 entry.identity,
@@ -278,7 +278,7 @@ fn synthetic_hardlinks_share_one_logical_charge() {
     heavy.progress_every = 1;
     let (reducer, _) = run_to_end(heavy, 11, 2, generation, generation);
     let index = reducer.index().unwrap();
-    let mut groups: HashMap<FileIdentity, Vec<&hogmap::index::Entry>> = HashMap::new();
+    let mut groups: HashMap<FileIdentity, Vec<hogmap::index::Entry<'_>>> = HashMap::new();
     for (_, entry) in index.entries() {
         if entry.kind == Kind::File {
             groups
@@ -431,6 +431,58 @@ fn events_after_the_terminal_are_counted() {
     assert!(second.disconnected);
     assert_eq!(reducer.diagnostics().events_after_terminal, 1);
     assert_eq!(reducer.index().unwrap().entries().count(), 1);
+}
+
+#[test]
+fn sparse_and_reordered_keys_keep_hierarchy_without_key_sized_allocations() {
+    let generation = ScanGeneration::new(101);
+    let (sender, receiver) = sync_channel(4);
+    sender
+        .send(event(
+            generation,
+            ScanEventKind::Batch(batch_of([
+                record(u64::MAX, None, "Root", Kind::Directory),
+                record(1, Some(u64::MAX), "dense-dir", Kind::Directory),
+                record(5000, Some(1), "sparse-dir", Kind::Directory),
+                record(0, Some(5000), "dense-file", Kind::File),
+                record(u64::MAX - 1, Some(5000), "sparse-file", Kind::File),
+                record(5000, Some(1), "duplicate", Kind::Directory),
+            ])),
+        ))
+        .unwrap();
+    sender
+        .send(event(
+            generation,
+            ScanEventKind::DirectoryDone(NodeKey::new(5000)),
+        ))
+        .unwrap();
+    sender
+        .send(event(
+            generation,
+            ScanEventKind::Terminal(Terminal::Cancelled),
+        ))
+        .unwrap();
+    let mut reducer = ScanReducer::new(generation);
+    drain_until_end(&mut reducer, &receiver);
+    assert_eq!(reducer.diagnostics().duplicate_key_records, 1);
+    assert_eq!(reducer.diagnostics().unknown_parent_records, 0);
+    assert_eq!(reducer.diagnostics().partial_directories, 2);
+    let index = reducer.index().unwrap();
+    assert_eq!(index.len(), 5);
+    let sparse = index
+        .entries()
+        .find(|(_, entry)| entry.name == "sparse-dir")
+        .unwrap()
+        .0;
+    assert_eq!(index.get(sparse).unwrap().state, State::Complete);
+    assert_eq!(
+        index
+            .entries()
+            .filter(|(_, entry)| entry.parent == Some(sparse))
+            .count(),
+        2
+    );
+    assert!(reducer.memory_before_release().1 < 64 * 1024);
 }
 
 #[test]

@@ -1,11 +1,26 @@
+use crate::name_arena::{NameArena, NameRef};
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
+use std::num::NonZeroU32;
 
 /// Win32 reports the maximum component length in UTF-16 units; NTFS uses 255.
 const MAX_COMPONENT_UTF16_UNITS: usize = 255;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct EntryId(usize);
+pub struct EntryId(NonZeroU32);
+
+impl EntryId {
+    pub fn position(self) -> usize {
+        self.0.get() as usize - 1
+    }
+    pub(crate) fn at(position: usize) -> Option<Self> {
+        u32::try_from(position)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .and_then(NonZeroU32::new)
+            .map(Self)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
@@ -37,9 +52,9 @@ pub struct Sizes {
 }
 
 #[derive(Debug)]
-pub struct Entry {
+pub struct Entry<'a> {
     pub parent: Option<EntryId>,
-    pub name: OsString,
+    pub name: &'a OsStr,
     pub kind: Kind,
     pub sizes: Sizes,
     pub identity: Option<FileIdentity>,
@@ -52,6 +67,7 @@ pub enum IndexError {
     InvalidParent,
     NotDirectory,
     SizeOverflow,
+    CapacityExceeded,
 }
 
 /// Logical totals. `known_logical_bytes` counts visible entries, so it equals
@@ -86,32 +102,53 @@ struct FileTotals {
 /// answer `summary()` in constant time; that set is the memory cost of hardlink accounting.
 #[derive(Debug)]
 pub struct Index {
-    entries: Vec<Entry>,
+    entries: Vec<StoredEntry>,
+    names: NameArena,
+    identities: Vec<StoredIdentity>,
     totals: FileTotals,
-    charged_identities: HashSet<FileIdentity>,
+    charged_identities: HashSet<StoredIdentity>,
     incomplete_entries: usize,
 }
 
 impl Index {
     pub fn new(root_name: OsString) -> Result<Self, IndexError> {
         validate_name(&root_name)?;
+        let mut names = NameArena::default();
+        let name = names.push(&root_name).ok_or(IndexError::CapacityExceeded)?;
         Ok(Self {
-            entries: vec![Entry {
-                parent: None,
-                name: root_name,
-                kind: Kind::Directory,
-                sizes: Sizes::default(),
-                identity: None,
-                state: State::Pending,
-            }],
+            entries: vec![StoredEntry::new(
+                None,
+                name,
+                Kind::Directory,
+                Sizes::default(),
+                u32::MAX,
+                State::Pending,
+            )],
+            names,
+            identities: Vec::new(),
             totals: FileTotals::default(),
             charged_identities: HashSet::new(),
             incomplete_entries: 1,
         })
     }
 
+    /// Allocation-capacity estimate, excluding allocator headers and process overhead.
+    pub fn memory_estimate(&self) -> IndexMemory {
+        IndexMemory {
+            entry_bytes: self.entries.len() * std::mem::size_of::<StoredEntry>(),
+            entry_capacity_bytes: self.entries.capacity() * std::mem::size_of::<StoredEntry>(),
+            name_bytes: self.names.len(),
+            name_capacity_bytes: self.names.capacity(),
+            name_boundary_capacity_bytes: self.names.boundary_capacity_bytes(),
+            identity_bytes: self.identities.capacity() * std::mem::size_of::<StoredIdentity>(),
+            charged_identity_bytes: hash_bytes::<StoredIdentity>(
+                self.charged_identities.capacity(),
+            ),
+        }
+    }
+
     pub fn root(&self) -> EntryId {
-        EntryId(0)
+        EntryId::at(0).expect("root ID fits")
     }
 
     /// Appends only below an existing directory, so parent references cannot form cycles.
@@ -129,21 +166,39 @@ impl Index {
             return Err(IndexError::NotDirectory);
         }
         validate_name(&name)?;
-        let id = EntryId(self.entries.len());
-        let entry = Entry {
+        let id = EntryId::at(self.entries.len()).ok_or(IndexError::CapacityExceeded)?;
+        let identity_slot = if identity.is_some() {
+            u32::try_from(self.identities.len())
+                .ok()
+                .filter(|slot| *slot != u32::MAX)
+                .ok_or(IndexError::CapacityExceeded)?
+        } else {
+            u32::MAX
+        };
+        let name_ref = self.names.push(&name).ok_or(IndexError::CapacityExceeded)?;
+        if let Some(identity) = identity {
+            self.identities.push(identity.into());
+        }
+        self.account(&Entry {
             parent: Some(parent),
-            name,
+            name: &name,
             kind,
             sizes,
             identity,
             state,
-        };
-        self.account(&entry);
-        self.entries.push(entry);
+        });
+        self.entries.push(StoredEntry::new(
+            Some(parent),
+            name_ref,
+            kind,
+            sizes,
+            identity_slot,
+            state,
+        ));
         Ok(id)
     }
 
-    fn account(&mut self, entry: &Entry) {
+    fn account(&mut self, entry: &Entry<'_>) {
         if entry.state != State::Complete {
             self.incomplete_entries += 1;
         }
@@ -161,7 +216,7 @@ impl Index {
             &mut self.totals.overflowed,
         );
         let first_charge = match entry.identity {
-            Some(identity) => self.charged_identities.insert(identity),
+            Some(identity) => self.charged_identities.insert(identity.into()),
             None => true,
         };
         if first_charge {
@@ -179,25 +234,58 @@ impl Index {
         }
     }
 
-    pub fn get(&self, id: EntryId) -> Option<&Entry> {
-        self.entries.get(id.0)
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 
-    pub fn entries(&self) -> impl Iterator<Item = (EntryId, &Entry)> {
+    pub fn get(&self, id: EntryId) -> Option<Entry<'_>> {
+        self.entries
+            .get(id.position())
+            .map(|entry| self.view(entry))
+    }
+
+    fn view(&self, entry: &StoredEntry) -> Entry<'_> {
+        Entry {
+            parent: entry.parent,
+            name: self.names.get(entry.name),
+            kind: if entry.flags & 1 == 0 {
+                Kind::Directory
+            } else {
+                Kind::File
+            },
+            sizes: Sizes {
+                logical: (entry.flags & 2 != 0).then_some(entry.logical),
+                allocated: (entry.flags & 4 != 0).then_some(entry.allocated),
+            },
+            identity: self
+                .identities
+                .get(entry.identity as usize)
+                .copied()
+                .map(Into::into),
+            state: entry.state(),
+        }
+    }
+
+    pub fn entries(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (EntryId, Entry<'_>)> + ExactSizeIterator {
         self.entries
             .iter()
             .enumerate()
-            .map(|(id, entry)| (EntryId(id), entry))
+            .map(|(id, entry)| (EntryId::at(id).expect("stored ID fits"), self.view(entry)))
     }
 
     pub fn set_state(&mut self, id: EntryId, state: State) -> Result<(), IndexError> {
         let entry = self
             .entries
-            .get_mut(id.0)
+            .get_mut(id.position())
             .ok_or(IndexError::InvalidParent)?;
-        let was_complete = entry.state == State::Complete;
+        let was_complete = entry.state() == State::Complete;
         let is_complete = state == State::Complete;
-        entry.state = state;
+        entry.set_state(state);
         match (was_complete, is_complete) {
             (true, false) => self.incomplete_entries += 1,
             (false, true) => self.incomplete_entries -= 1,
@@ -222,6 +310,113 @@ impl Index {
             complete: self.incomplete_entries == 0 && self.totals.unknown_size_files == 0,
         })
     }
+}
+
+#[derive(Debug)]
+struct StoredEntry {
+    logical: u64,
+    allocated: u64,
+    parent: Option<EntryId>,
+    name: NameRef,
+    identity: u32,
+    flags: u8,
+}
+impl StoredEntry {
+    fn new(
+        parent: Option<EntryId>,
+        name: NameRef,
+        kind: Kind,
+        sizes: Sizes,
+        identity: u32,
+        state: State,
+    ) -> Self {
+        let mut entry = Self {
+            logical: sizes.logical.unwrap_or(0),
+            allocated: sizes.allocated.unwrap_or(0),
+            parent,
+            name,
+            identity,
+            flags: u8::from(kind == Kind::File)
+                | (u8::from(sizes.logical.is_some()) << 1)
+                | (u8::from(sizes.allocated.is_some()) << 2),
+        };
+        entry.set_state(state);
+        entry
+    }
+    fn set_state(&mut self, state: State) {
+        let value = match state {
+            State::Pending => 0,
+            State::Complete => 1,
+            State::Partial => 2,
+            State::Inaccessible => 3,
+            State::Stale => 4,
+        };
+        self.flags = (self.flags & 7) | (value << 3);
+    }
+    fn state(&self) -> State {
+        match self.flags >> 3 {
+            0 => State::Pending,
+            1 => State::Complete,
+            2 => State::Partial,
+            3 => State::Inaccessible,
+            4 => State::Stale,
+            _ => unreachable!("internal state bits"),
+        }
+    }
+}
+
+// Avoid u128's 16-byte alignment padding in the identity vector and charge set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct StoredIdentity {
+    volume: u64,
+    low: u64,
+    high: u64,
+}
+impl From<FileIdentity> for StoredIdentity {
+    fn from(id: FileIdentity) -> Self {
+        Self {
+            volume: id.volume,
+            low: id.file as u64,
+            high: (id.file >> 64) as u64,
+        }
+    }
+}
+impl From<StoredIdentity> for FileIdentity {
+    fn from(id: StoredIdentity) -> Self {
+        Self {
+            volume: id.volume,
+            file: u128::from(id.low) | (u128::from(id.high) << 64),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IndexMemory {
+    pub entry_bytes: usize,
+    pub entry_capacity_bytes: usize,
+    pub name_bytes: usize,
+    pub name_capacity_bytes: usize,
+    pub name_boundary_capacity_bytes: usize,
+    pub identity_bytes: usize,
+    pub charged_identity_bytes: usize,
+}
+impl IndexMemory {
+    pub fn total_bytes(self) -> usize {
+        self.entry_capacity_bytes
+            + self.name_capacity_bytes
+            + self.name_boundary_capacity_bytes
+            + self.identity_bytes
+            + self.charged_identity_bytes
+    }
+}
+
+// Approximate SwissTable buckets plus control bytes; excludes allocator headers.
+pub(crate) fn hash_bytes<T>(capacity: usize) -> usize {
+    if capacity == 0 {
+        return 0;
+    }
+    let buckets = (capacity * 8 / 7).next_power_of_two();
+    buckets * (std::mem::size_of::<T>() + 1) + 16
 }
 
 fn accumulate(sum: &mut u64, bytes: u64, overflowed: &mut bool) {

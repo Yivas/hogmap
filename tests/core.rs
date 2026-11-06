@@ -148,7 +148,7 @@ fn index_keeps_unknowns_and_charges_hardlinks_once_without_mutating_totals_when_
         .entries()
         .filter(|(_, entry)| {
             entry.kind == Kind::File
-                && filter.evaluate(&entry.name, entry.sizes.logical) == Match::Yes
+                && filter.evaluate(entry.name, entry.sizes.logical) == Match::Yes
         })
         .collect();
     assert_eq!(matched.len(), 2);
@@ -414,6 +414,64 @@ fn names_are_limited_to_255_utf16_units() {
         )
         .is_ok();
     assert!(astral_at_limit);
+}
+
+#[test]
+fn compact_metadata_preserves_max_sizes_identity_bits_and_all_states() {
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let identity = FileIdentity {
+        volume: u64::MAX,
+        file: u128::MAX,
+    };
+    for (number, state) in [
+        State::Pending,
+        State::Complete,
+        State::Partial,
+        State::Inaccessible,
+        State::Stale,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let sizes = Sizes {
+            logical: Some(0),
+            allocated: Some(u64::MAX),
+        };
+        let id = index
+            .insert(
+                index.root(),
+                format!("file-{number}").into(),
+                Kind::File,
+                sizes,
+                Some(identity),
+                state,
+            )
+            .unwrap();
+        let entry = index.get(id).unwrap();
+        assert_eq!(entry.sizes, sizes);
+        assert_eq!(entry.identity, Some(identity));
+        assert_eq!(entry.kind, Kind::File);
+        assert_eq!(entry.state, state);
+        index.set_state(id, State::Complete).unwrap();
+        assert_eq!(index.get(id).unwrap().state, State::Complete);
+        assert_eq!(index.get(id).unwrap().sizes.allocated, Some(u64::MAX));
+    }
+    let id = index
+        .insert(
+            index.root(),
+            "max-logical".into(),
+            Kind::File,
+            Sizes {
+                logical: Some(u64::MAX),
+                allocated: None,
+            },
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    assert_eq!(index.get(id).unwrap().sizes.logical, Some(u64::MAX));
+    assert_eq!(index.get(id).unwrap().sizes.allocated, None);
+    assert_eq!(index.summary().unwrap().known_logical_bytes, u64::MAX);
 }
 
 #[cfg(windows)]

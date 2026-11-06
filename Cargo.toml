@@ -24,7 +24,7 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [lints.rust]
-# Only scan_win and volume allow unsafe for audited Win32 FFI; forbid cannot be relaxed per module.
+# Audited unsafe is isolated to scan_win/volume FFI and name_arena's whole-name accessor.
 unsafe_code = "deny"
 
 [lints.clippy]

@@ -10,7 +10,7 @@
 //! it needs volume capacity data that this module does not receive.
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 
 use crate::index::{Entry, EntryId, FileIdentity, Index, Kind, State};
 
@@ -143,10 +143,10 @@ fn layout_selection(
     let mut children = children_map(index);
     let totals = subtree_totals(index)?;
     let root_totals = if let Some(members) = members {
-        children.insert(root, members.to_vec());
+        children[root.position()] = members.to_vec();
         let mut selected = Totals::default();
         for id in members {
-            let value = totals.get(id).copied().unwrap_or_default();
+            let value = totals[id.position()];
             selected.known_sum = selected
                 .known_sum
                 .checked_add(value.known_sum)
@@ -155,11 +155,11 @@ fn layout_selection(
         }
         selected
     } else {
-        totals.get(&root).copied().unwrap_or_default()
+        totals[root.position()]
     };
     let root_placed = place(
         NodeRef::Entry(root),
-        root_entry,
+        &root_entry,
         rect,
         root_totals,
         params.header_height,
@@ -177,13 +177,13 @@ fn layout_selection(
         queue.push_back((root, root_placed.content));
     }
     while let Some((parent, content)) = queue.pop_front() {
-        let Some(child_ids) = children.get(&parent) else {
+        let Some(child_ids) = children.get(parent.position()) else {
             continue;
         };
         let mut weights: Vec<(EntryId, u64)> = child_ids
             .iter()
             .filter_map(|id| {
-                let weight = totals.get(id)?.known_sum;
+                let weight = totals.get(id.position())?.known_sum;
                 (weight > 0).then_some((*id, weight))
             })
             .collect();
@@ -230,10 +230,10 @@ fn layout_selection(
             match cell.node {
                 Some(id) => {
                     let entry = index.get(id).ok_or(LayoutError::UnknownRoot)?;
-                    let cell_totals = totals.get(&id).copied().unwrap_or_default();
+                    let cell_totals = totals[id.position()];
                     let placed = place(
                         NodeRef::Entry(id),
-                        entry,
+                        &entry,
                         cell_rect,
                         cell_totals,
                         params.header_height,
@@ -248,7 +248,7 @@ fn layout_selection(
                 None => {
                     let has_unknown = aggregate_members
                         .iter()
-                        .any(|id| totals.get(id).is_some_and(|value| value.has_unknown));
+                        .any(|id| totals[id.position()].has_unknown);
                     result.placed.push(Placed {
                         node: NodeRef::Aggregate { parent },
                         rect: cell_rect,
@@ -281,11 +281,11 @@ fn validate_rect(rect: Rect) -> Result<(), LayoutError> {
     Ok(())
 }
 
-fn children_map(index: &Index) -> HashMap<EntryId, Vec<EntryId>> {
-    let mut children: HashMap<EntryId, Vec<EntryId>> = HashMap::new();
+fn children_map(index: &Index) -> Vec<Vec<EntryId>> {
+    let mut children = vec![Vec::new(); index.len()];
     for (id, entry) in index.entries() {
         if let Some(parent) = entry.parent {
-            children.entry(parent).or_default().push(id);
+            children[parent.position()].push(id);
         }
     }
     children
@@ -297,12 +297,10 @@ struct Totals {
     has_unknown: bool,
 }
 
-fn subtree_totals(index: &Index) -> Result<HashMap<EntryId, Totals>, LayoutError> {
+fn subtree_totals(index: &Index) -> Result<Vec<Totals>, LayoutError> {
     let mut seen_identities: HashSet<FileIdentity> = HashSet::new();
-    let mut totals: HashMap<EntryId, Totals> = HashMap::new();
-    let mut order = Vec::new();
+    let mut totals = vec![Totals::default(); index.len()];
     for (id, entry) in index.entries() {
-        order.push(id);
         let mut known_sum = 0_u64;
         let mut has_unknown = entry.state != State::Complete;
         if entry.kind == Kind::File {
@@ -317,24 +315,21 @@ fn subtree_totals(index: &Index) -> Result<HashMap<EntryId, Totals>, LayoutError
                 None => has_unknown = true,
             }
         }
-        totals.insert(
-            id,
-            Totals {
-                known_sum,
-                has_unknown,
-            },
-        );
+        totals[id.position()] = Totals {
+            known_sum,
+            has_unknown,
+        };
     }
 
     // The index appends a child below an existing directory, so reverse insertion order
     // finalizes every descendant before its parent.
-    for id in order.iter().rev() {
-        let parent = match index.get(*id).and_then(|entry| entry.parent) {
+    for (id, entry) in index.entries().rev() {
+        let parent = match entry.parent {
             Some(parent) => parent,
             None => continue,
         };
-        let child = totals.get(id).copied().unwrap_or_default();
-        let parent_totals = totals.entry(parent).or_default();
+        let child = totals[id.position()];
+        let parent_totals = &mut totals[parent.position()];
         parent_totals.known_sum = parent_totals
             .known_sum
             .checked_add(child.known_sum)
@@ -346,13 +341,19 @@ fn subtree_totals(index: &Index) -> Result<HashMap<EntryId, Totals>, LayoutError
 
 fn compare_children(index: &Index, a: &(EntryId, u64), b: &(EntryId, u64)) -> Ordering {
     let name_order = match (index.get(a.0), index.get(b.0)) {
-        (Some(a), Some(b)) => a.name.cmp(&b.name),
+        (Some(a), Some(b)) => a.name.cmp(b.name),
         _ => a.0.cmp(&b.0),
     };
     b.1.cmp(&a.1).then(name_order).then_with(|| a.0.cmp(&b.0))
 }
 
-fn place(node: NodeRef, entry: &Entry, rect: Rect, totals: Totals, header_height: f32) -> Placed {
+fn place(
+    node: NodeRef,
+    entry: &Entry<'_>,
+    rect: Rect,
+    totals: Totals,
+    header_height: f32,
+) -> Placed {
     let (header, content) = if entry.kind == Kind::Directory {
         split_header(rect, header_height)
     } else {

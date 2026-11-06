@@ -7,7 +7,25 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hogmap::index::{Entry, Kind, State};
+use hogmap::index::{FileIdentity, Kind, Sizes, State};
+use hogmap::scan::{
+    Batch, DirectoryOutcome, NodeKey, ScanEvent, ScanEventKind, ScanRecord, ScanSender,
+};
+#[allow(dead_code)]
+#[path = "../src/ui/logic.rs"]
+mod logic;
+#[cfg(feature = "desktop")]
+#[allow(dead_code)]
+#[path = "../src/ui/paint.rs"]
+mod paint;
+#[cfg(feature = "desktop")]
+#[allow(dead_code)]
+#[path = "../src/ui/text.rs"]
+mod text;
+#[cfg(feature = "desktop")]
+#[allow(dead_code)]
+#[path = "../src/ui/theme.rs"]
+mod theme;
 use hogmap::scan::{
     DEFAULT_CHANNEL_CAPACITY, ScanCancellation, ScanGeneration, ScanReducer, Terminal,
     event_channel,
@@ -25,12 +43,14 @@ struct Arguments {
     unthrottled: bool,
     hold_for_sample: bool,
     time_limit: Option<Duration>,
+    synthetic_million: bool,
 }
 
 fn arguments() -> Result<Arguments, &'static str> {
     let mut args = env::args_os().skip(1);
     let root = args.next().ok_or("missing_root")?;
-    if root.is_empty() || root.to_string_lossy().starts_with("--") {
+    let synthetic_million = root == "--synthetic-million";
+    if root.is_empty() || (!synthetic_million && root.to_string_lossy().starts_with("--")) {
         return Err("invalid_root");
     }
     let mut parsed = Arguments {
@@ -39,6 +59,7 @@ fn arguments() -> Result<Arguments, &'static str> {
         unthrottled: true,
         hold_for_sample: false,
         time_limit: None,
+        synthetic_million,
     };
     let mut workers_seen = false;
     while let Some(argument) = args.next() {
@@ -75,8 +96,16 @@ fn optional_count(value: Option<impl std::fmt::Display>) -> String {
 
 fn run(args: Arguments) -> Result<bool, &'static str> {
     // Query capacity outside the scan timing; never print roots, labels or filesystem names.
-    let volume_root = volume_root_for(&args.root);
-    let volumes = list_drives();
+    let volume_root = if args.synthetic_million {
+        None
+    } else {
+        volume_root_for(&args.root)
+    };
+    let volumes = if args.synthetic_million {
+        Ok(Vec::new())
+    } else {
+        list_drives()
+    };
     let volume_error = volumes.as_ref().err().map(|error| error.code);
     let volume = volumes.ok().and_then(|volumes| {
         volumes.into_iter().find(|volume| {
@@ -106,8 +135,14 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     let producer = thread::Builder::new()
         .name("hogmap-scan-bench".into())
         .spawn(move || {
-            let result =
-                run_win_scan_with_options(generation, args.root, sender, &flag, args.options);
+            let result = if args.synthetic_million {
+                (
+                    synthetic_million(generation, sender, &flag),
+                    hogmap::scan_win::ScanReport::default(),
+                )
+            } else {
+                run_win_scan_with_options(generation, args.root, sender, &flag, args.options)
+            };
             (result, Instant::now())
         })
         .map_err(|_| "producer_start_failed")?;
@@ -254,10 +289,39 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     println!("inaccessible_directories={inaccessible}");
     println!("partial_directories={partial}");
     println!("summary_complete={}", u8::from(summary.complete));
-    println!("entry_struct_size_bytes={}", size_of::<Entry>());
+    println!(
+        "entry_struct_size_bytes={}",
+        index.memory_estimate().entry_bytes / index.len()
+    );
+    println!("entry_id_bytes={}", size_of::<hogmap::index::EntryId>());
+    println!("index_memory={:?}", index.memory_estimate());
+    println!(
+        "name_boundary_capacity_bytes={}",
+        index.memory_estimate().name_boundary_capacity_bytes
+    );
+    println!(
+        "index_memory_estimate_bytes={}",
+        index.memory_estimate().total_bytes()
+    );
+    println!(
+        "consumer_memory_before_release={:?}",
+        reducer.memory_before_release()
+    );
+    println!(
+        "scan_record_struct_bytes={}",
+        size_of::<hogmap::scan::ScanRecord>()
+    );
+    println!(
+        "scan_report_struct_bytes={}",
+        size_of::<hogmap::scan_win::ScanReport>()
+    );
+    println!(
+        "in_flight_batch_payload_bound_bytes={}",
+        (DEFAULT_CHANNEL_CAPACITY + 2) * hogmap::scan::MAX_BATCH_BYTES
+    );
     println!(
         "index_inline_memory_estimate_bytes={}",
-        u128::from(entries) * size_of::<Entry>() as u128
+        index.memory_estimate().entry_bytes
     );
     println!(
         "report_fallback_directories={}",
@@ -384,15 +448,152 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     );
     let partial_run = cancellation.is_cancelled();
     println!("run_partial={}", u8::from(partial_run));
+    let mut synthetic_cache = None;
+    #[cfg(feature = "desktop")]
+    let mut prepared_cells = None;
+    #[cfg(feature = "desktop")]
+    let context = args.synthetic_million.then(eframe::egui::Context::default);
+    if args.synthetic_million {
+        let started = Instant::now();
+        let layout = hogmap::treemap::layout(
+            index,
+            index.root(),
+            hogmap::treemap::Rect::new(0.0, 0.0, 1920.0, 1080.0),
+            hogmap::treemap::LayoutParams {
+                min_pixel_area: 400.0,
+                header_height: 20.0,
+            },
+        )
+        .map_err(|_| "synthetic_layout_failed")?;
+        let matches = logic::HighlightFilter::default().matches(index);
+        #[cfg(feature = "desktop")]
+        let _ = context.as_ref().expect("synthetic context").run_ui(
+            eframe::egui::RawInput::default(),
+            |ui| {
+                prepared_cells = Some(paint::prepare(ui, index, &layout, None));
+            },
+        );
+        println!(
+            "synthetic_ui_cache_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0
+        );
+        println!("synthetic_layout_cells={}", layout.placed.len());
+        println!(
+            "synthetic_match_capacity_bytes={}",
+            matches.capacity() * size_of::<hogmap::filter::Match>()
+        );
+        println!("synthetic_native_window=0");
+        println!(
+            "synthetic_desktop_cache={}",
+            u8::from(cfg!(feature = "desktop"))
+        );
+        synthetic_cache = Some((layout, matches));
+    }
     println!("scan_done=1");
     io::stdout().flush().map_err(|_| "stdout_failed")?;
     if args.hold_for_sample {
         thread::sleep(SAMPLE_HOLD);
         std::hint::black_box(&reducer);
+        std::hint::black_box(&synthetic_cache);
+        #[cfg(feature = "desktop")]
+        std::hint::black_box((&context, &prepared_cells));
     }
     Ok((terminal == Some(Terminal::Finished)
         || (partial_run && terminal == Some(Terminal::Cancelled)))
         && !diagnostics.missing_terminal)
+}
+
+/// Streaming fixture: exactly 1M entries, every non-root identity present, no disk/plan allocation.
+fn synthetic_million(
+    generation: ScanGeneration,
+    sender: ScanSender,
+    cancel: &ScanCancellation,
+) -> hogmap::synthetic::ProducerOutcome {
+    use hogmap::synthetic::ProducerOutcome;
+    let flush = |batch: &mut Batch| -> Result<(), ProducerOutcome> {
+        match hogmap::scan::send_event(
+            &sender,
+            ScanEvent {
+                generation,
+                event: ScanEventKind::Batch(std::mem::take(batch)),
+            },
+            cancel,
+        ) {
+            hogmap::scan::SendOutcome::Sent => Ok(()),
+            hogmap::scan::SendOutcome::Disconnected => Err(ProducerOutcome::Disconnected),
+            hogmap::scan::SendOutcome::Cancelled => Err(
+                if hogmap::scan::send_terminal(&sender, generation, Terminal::Cancelled) {
+                    ProducerOutcome::Cancelled
+                } else {
+                    ProducerOutcome::Disconnected
+                },
+            ),
+        }
+    };
+    let mut batch = Batch::new();
+    for key in 0..1_000_000_u64 {
+        let directory = key <= 1000;
+        let record = ScanRecord {
+            key: NodeKey::new(key),
+            parent: if key == 0 {
+                None
+            } else if directory {
+                Some(NodeKey::new(0))
+            } else {
+                Some(NodeKey::new(1 + (key - 1001) % 1000))
+            },
+            name: if key == 0 {
+                "Synthetic million".into()
+            } else {
+                format!("entry-{key:07}.bin").into()
+            },
+            kind: if directory {
+                Kind::Directory
+            } else {
+                Kind::File
+            },
+            sizes: if directory || key % 10000 == 0 {
+                Sizes::default()
+            } else {
+                Sizes {
+                    logical: Some(key % 65536),
+                    allocated: Some(65536),
+                }
+            },
+            identity: (key > 0).then_some(FileIdentity {
+                volume: 1,
+                file: u128::from(key),
+            }),
+        };
+        if !batch.push(record.clone()) {
+            if let Err(outcome) = flush(&mut batch) {
+                return outcome;
+            }
+            assert!(batch.push(record));
+        }
+    }
+    for key in 0..=1000 {
+        let outcome = DirectoryOutcome {
+            key: NodeKey::new(key),
+            code: None,
+        };
+        if !batch.push_outcome(outcome) {
+            if let Err(outcome) = flush(&mut batch) {
+                return outcome;
+            }
+            assert!(batch.push_outcome(outcome));
+        }
+    }
+    if !batch.is_empty()
+        && let Err(outcome) = flush(&mut batch)
+    {
+        return outcome;
+    }
+    if hogmap::scan::send_terminal(&sender, generation, Terminal::Finished) {
+        ProducerOutcome::Finished
+    } else {
+        ProducerOutcome::Disconnected
+    }
 }
 
 fn main() -> ExitCode {

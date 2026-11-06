@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::OsString;
 
 use hogmap::filter::{Filter, FilterError, Match};
@@ -41,7 +40,7 @@ impl Location {
         while let Some(id) = next {
             let Some(entry) = index.get(id) else { break };
             if entry.parent.is_some() {
-                path.push(entry.name.clone());
+                path.push(entry.name.to_os_string());
             }
             next = entry.parent;
         }
@@ -59,7 +58,7 @@ impl Location {
                 .entries()
                 .find(|(_, entry)| {
                     entry.parent == Some(parent)
-                        && entry.name == *component
+                        && entry.name == component
                         && entry.kind == Kind::Directory
                 })?
                 .0;
@@ -67,7 +66,9 @@ impl Location {
         let members = self.members.as_ref().map(|names| {
             index
                 .entries()
-                .filter(|(_, entry)| entry.parent == Some(parent) && names.contains(&entry.name))
+                .filter(|(_, entry)| {
+                    entry.parent == Some(parent) && names.iter().any(|name| name == entry.name)
+                })
                 .map(|(id, _)| id)
                 .collect()
         });
@@ -179,24 +180,21 @@ impl HighlightFilter {
         }
     }
 
-    pub fn matches(&self, index: &Index) -> HashMap<EntryId, Match> {
-        let mut result = HashMap::new();
-        let entries: Vec<_> = index.entries().collect();
-        for (id, entry) in &entries {
-            result.insert(
-                *id,
+    pub fn matches(&self, index: &Index) -> Vec<Match> {
+        let mut result: Vec<_> = index
+            .entries()
+            .map(|(_, entry)| {
                 if entry.kind == Kind::File {
-                    self.filter.evaluate(&entry.name, entry.sizes.logical)
+                    self.filter.evaluate(entry.name, entry.sizes.logical)
                 } else {
                     Match::No
-                },
-            );
-        }
-        for (id, entry) in entries.iter().rev() {
+                }
+            })
+            .collect();
+        for (id, entry) in index.entries().rev() {
             if let Some(parent) = entry.parent {
-                let child = result[id];
-                let parent_match = result.entry(parent).or_insert(Match::No);
-                *parent_match = combine(*parent_match, child);
+                result[parent.position()] =
+                    combine(result[parent.position()], result[id.position()]);
             }
         }
         result
@@ -209,14 +207,16 @@ pub fn show_match_count(expression: &str) -> bool {
 }
 
 /// Counts files only: directory matches provide context, not additional matching results.
-pub fn match_counts(index: &Index, matches: &HashMap<EntryId, Match>) -> (usize, usize) {
+pub fn match_counts(index: &Index, matches: &[Match]) -> (usize, usize) {
     index
         .entries()
         .filter(|(_, entry)| entry.kind == Kind::File)
-        .fold((0, 0), |(yes, unknown), (id, _)| match matches.get(&id) {
-            Some(Match::Yes) => (yes + 1, unknown),
-            Some(Match::Unknown) | None => (yes, unknown + 1),
-            Some(Match::No) => (yes, unknown),
+        .fold((0, 0), |(yes, unknown), (id, _)| {
+            match matches.get(id.position()) {
+                Some(Match::Yes) => (yes + 1, unknown),
+                Some(Match::Unknown) | None => (yes, unknown + 1),
+                Some(Match::No) => (yes, unknown),
+            }
         })
 }
 
@@ -228,11 +228,20 @@ fn combine(left: Match, right: Match) -> Match {
     }
 }
 
-pub fn highlight(node: NodeRef, members: &[EntryId], matches: &HashMap<EntryId, Match>) -> Match {
+pub fn highlight(node: NodeRef, members: &[EntryId], matches: &[Match]) -> Match {
     match node {
-        NodeRef::Entry(id) => matches.get(&id).copied().unwrap_or(Match::Unknown),
+        NodeRef::Entry(id) => matches
+            .get(id.position())
+            .copied()
+            .unwrap_or(Match::Unknown),
         NodeRef::Aggregate { .. } => members.iter().fold(Match::No, |found, id| {
-            combine(found, matches.get(id).copied().unwrap_or(Match::Unknown))
+            combine(
+                found,
+                matches
+                    .get(id.position())
+                    .copied()
+                    .unwrap_or(Match::Unknown),
+            )
         }),
     }
 }

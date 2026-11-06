@@ -183,12 +183,7 @@ fn base_tone(palette: &Palette, surface: Surface) -> Tone {
 
 /// The tone a cell is painted with: its surface, or the dimmed or undecided fill the highlight
 /// chooses. Marks are read from this same tone, so a dimmed cell cannot keep a state mark.
-fn painted_tone(
-    palette: &Palette,
-    surface: Surface,
-    matches: &HashMap<EntryId, Match>,
-    placed: &Placed,
-) -> Tone {
+fn painted_tone(palette: &Palette, surface: Surface, matches: &[Match], placed: &Placed) -> Tone {
     match logic::highlight(placed.node, &placed.members, matches) {
         Match::Yes => base_tone(palette, surface),
         Match::No => palette.dimmed,
@@ -212,7 +207,7 @@ pub fn draw(
     palette: &Palette,
     layout: &Layout,
     cells: &[Cell],
-    matches: &HashMap<EntryId, Match>,
+    matches: &[Match],
     selected: Option<NodeRef>,
     hovered: Option<usize>,
 ) {

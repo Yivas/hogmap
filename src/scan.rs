@@ -10,7 +10,7 @@
 //! attributes will be added when the Win32 producer needs to classify them,
 //! not by guessing Win32 bits here.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::mpsc::TryRecvError;
 
@@ -256,11 +256,51 @@ pub struct DrainReport {
 pub struct ScanReducer {
     generation: ScanGeneration,
     index: Option<Index>,
-    keys: HashMap<NodeKey, EntryId>,
-    pending_directories: HashSet<EntryId>,
+    keys: ProducerKeys,
     diagnostics: ScanDiagnostics,
     progress: Progress,
     terminal: Option<Terminal>,
+    memory_before_release: (usize, usize),
+}
+
+/// Dense built-in producer keys use four-byte slots. Sparse/untrusted keys never dictate
+/// an arbitrary allocation: at most twice the accepted key count plus a small reorder window.
+#[derive(Debug, Default)]
+struct ProducerKeys {
+    dense: Vec<Option<EntryId>>,
+    sparse: HashMap<NodeKey, EntryId>,
+    count: usize,
+}
+impl ProducerKeys {
+    fn get(&self, key: NodeKey) -> Option<EntryId> {
+        usize::try_from(key.value())
+            .ok()
+            .and_then(|key| self.dense.get(key))
+            .copied()
+            .flatten()
+            .or_else(|| self.sparse.get(&key).copied())
+    }
+    fn insert(&mut self, key: NodeKey, id: EntryId) {
+        if let Ok(position) = usize::try_from(key.value())
+            && position
+                <= self
+                    .count
+                    .saturating_mul(2)
+                    .saturating_add(MAX_BATCH_RECORDS)
+        {
+            if position >= self.dense.len() {
+                self.dense.resize(position + 1, None);
+            }
+            self.dense[position] = Some(id);
+        } else {
+            self.sparse.insert(key, id);
+        }
+        self.count += 1;
+    }
+    fn memory_bytes(&self) -> usize {
+        self.dense.capacity() * std::mem::size_of::<Option<EntryId>>()
+            + crate::index::hash_bytes::<(NodeKey, EntryId)>(self.sparse.capacity())
+    }
 }
 
 impl ScanReducer {
@@ -268,12 +308,17 @@ impl ScanReducer {
         Self {
             generation,
             index: None,
-            keys: HashMap::new(),
-            pending_directories: HashSet::new(),
+            keys: ProducerKeys::default(),
             diagnostics: ScanDiagnostics::default(),
             progress: Progress::default(),
             terminal: None,
+            memory_before_release: (0, 0),
         }
+    }
+
+    /// Index and producer-key allocation estimates at terminal/disconnect, not peak memory.
+    pub fn memory_before_release(&self) -> (usize, usize) {
+        self.memory_before_release
     }
 
     pub fn generation(&self) -> ScanGeneration {
@@ -405,7 +450,7 @@ impl ScanReducer {
     }
 
     fn apply_record(&mut self, record: &ScanRecord) {
-        if self.keys.contains_key(&record.key) {
+        if self.keys.get(record.key).is_some() {
             self.diagnostics.duplicate_key_records += 1;
             return;
         }
@@ -417,7 +462,7 @@ impl ScanReducer {
             self.diagnostics.invalid_records += 1;
             return;
         };
-        let Some(parent_id) = self.keys.get(&parent_key).copied() else {
+        let Some(parent_id) = self.keys.get(parent_key) else {
             self.diagnostics.unknown_parent_records += 1;
             return;
         };
@@ -440,9 +485,6 @@ impl ScanReducer {
         match inserted {
             Ok(id) => {
                 self.keys.insert(record.key, id);
-                if record.kind == Kind::Directory {
-                    self.pending_directories.insert(id);
-                }
             }
             Err(_) => self.diagnostics.invalid_records += 1,
         }
@@ -462,14 +504,13 @@ impl ScanReducer {
                 let root = index.root();
                 self.index = Some(index);
                 self.keys.insert(record.key, root);
-                self.pending_directories.insert(root);
             }
             Err(_) => self.diagnostics.invalid_records += 1,
         }
     }
 
     fn finish_directory(&mut self, key: NodeKey, failure_code: Option<u32>) {
-        let Some(id) = self.keys.get(&key).copied() else {
+        let Some(id) = self.keys.get(key) else {
             self.diagnostics.unknown_directory_events += 1;
             return;
         };
@@ -482,7 +523,12 @@ impl ScanReducer {
             self.diagnostics.unknown_directory_events += 1;
             return;
         }
-        if !self.pending_directories.remove(&id) {
+        if self
+            .index
+            .as_ref()
+            .and_then(|index| index.get(id))
+            .is_none_or(|entry| entry.state != State::Pending)
+        {
             self.diagnostics.duplicate_directory_outcomes += 1;
             return;
         }
@@ -508,13 +554,28 @@ impl ScanReducer {
     /// Every later event is rejected before key resolution, so the map is dead weight once
     /// the scan has ended. The UI keeps the reducer for its snapshot, not for more records.
     fn release_keys(&mut self) {
-        self.keys = HashMap::new();
+        self.memory_before_release = (
+            self.index
+                .as_ref()
+                .map_or(0, |index| index.memory_estimate().total_bytes()),
+            self.keys.memory_bytes(),
+        );
+        self.keys = ProducerKeys::default();
     }
 
     fn partialize_pending(&mut self) {
-        let pending = std::mem::take(&mut self.pending_directories);
+        let count = self.index.as_ref().map_or(0, Index::len);
         let mut partial = 0;
-        for id in pending {
+        for position in 0..count {
+            let id = EntryId::at(position).expect("stored ID fits");
+            if self
+                .index
+                .as_ref()
+                .and_then(|index| index.get(id))
+                .is_none_or(|entry| entry.kind != Kind::Directory || entry.state != State::Pending)
+            {
+                continue;
+            }
             let updated = match self.index.as_mut() {
                 Some(index) => index.set_state(id, State::Partial).is_ok(),
                 None => false,

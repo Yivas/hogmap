@@ -164,7 +164,7 @@ fn highlighting_keeps_context_totals_and_previous_valid_filter() {
     let mut filter = HighlightFilter::default();
     assert!(filter.set("*.jpg;>1mb"));
     let matches = filter.matches(&index);
-    assert_eq!(matches[&directory], Match::Yes);
+    assert_eq!(matches[directory.position()], Match::Yes);
     assert_eq!(
         logic::highlight(NodeRef::Entry(file), &[], &matches),
         Match::Yes
@@ -236,6 +236,6 @@ fn unknown_filter_decisions_are_not_non_matches() {
     let mut filter = HighlightFilter::default();
     filter.set(">1mb");
     let matches = filter.matches(&index);
-    assert_eq!(matches[&file], Match::Unknown);
-    assert_eq!(matches[&index.root()], Match::Unknown);
+    assert_eq!(matches[file.position()], Match::Unknown);
+    assert_eq!(matches[index.root().position()], Match::Unknown);
 }

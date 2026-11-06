@@ -2,6 +2,7 @@
 
 pub mod filter;
 pub mod index;
+mod name_arena;
 pub mod scan;
 pub mod scan_win;
 pub mod synthetic;

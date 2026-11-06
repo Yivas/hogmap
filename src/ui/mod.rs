@@ -5,7 +5,6 @@ mod paint;
 pub mod text;
 mod theme;
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -40,7 +39,7 @@ type PreparedScan = Result<(PathBuf, dialog::DriveChoice), String>;
 struct Cache {
     layout: Layout,
     cells: Vec<paint::Cell>,
-    matches: HashMap<EntryId, Match>,
+    matches: Vec<Match>,
     match_counts: (usize, usize),
     version: u64,
     location: Location,
@@ -464,7 +463,7 @@ impl HogMap {
                     location.members = Some(
                         cell.members
                             .iter()
-                            .filter_map(|id| index.get(*id).map(|entry| entry.name.clone()))
+                            .filter_map(|id| index.get(*id).map(|entry| entry.name.to_os_string()))
                             .collect(),
                     );
                     location
