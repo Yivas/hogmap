@@ -2,17 +2,43 @@
 #![allow(unsafe_code)]
 
 use std::path::Path;
+use std::time::SystemTime;
 
 pub use crate::scan_win::ScanError;
+
+/// Provider and scope of the capacity query, including failed attempts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacitySource {
+    /// GetDiskSpaceInformationW Actual* fields: whole filesystem, without caller quotas.
+    WindowsActualGlobalFilesystem,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapacityIssue {
+    QueryFailed(i32),
+    InvalidAllocationUnit,
+    SizeOverflow,
+    IncoherentFreeSpace,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapacityMetadata {
+    pub source: CapacitySource,
+    /// Wall-clock completion time of the query, not an atomic snapshot with file metadata.
+    pub captured_at: SystemTime,
+    pub issue: Option<CapacityIssue>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VolumeInfo {
     pub root: String,
     pub label: Option<String>,
     pub filesystem: Option<String>,
+    /// Global filesystem capacity, never a caller-quota total or partition length.
     pub total_bytes: Option<u64>,
-    /// Free bytes on the volume, not quota-available bytes. Some(0) means full; None is unknown.
+    /// Global available filesystem bytes, ignoring caller quotas. Some(0) is known full.
     pub free_bytes: Option<u64>,
+    pub capacity: CapacityMetadata,
 }
 
 #[cfg(not(windows))]
@@ -90,7 +116,8 @@ mod platform {
     use super::*;
     use std::ptr::null_mut;
     use windows_sys::Win32::Storage::FileSystem::{
-        GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW, GetVolumePathNameW,
+        DISK_SPACE_INFORMATION, GetDiskSpaceInformationW, GetLogicalDriveStringsW,
+        GetVolumeInformationW, GetVolumePathNameW,
     };
 
     pub(crate) fn filesystem_for(path: &Path) -> Option<String> {
@@ -225,8 +252,6 @@ mod platform {
             terminated.push(0);
             let mut label = [0_u16; 261];
             let mut filesystem = [0_u16; 261];
-            let mut total = 0;
-            let mut free = 0;
             // SAFETY: root is NUL-terminated; all output buffers/pointers are valid for the call.
             let information_ok = unsafe {
                 GetVolumeInformationW(
@@ -240,19 +265,57 @@ mod platform {
                     filesystem.len() as u32,
                 )
             } != 0;
-            // SAFETY: root is NUL-terminated and the capacity outputs are valid u64 pointers.
-            let capacity_ok = unsafe {
-                GetDiskFreeSpaceExW(terminated.as_ptr(), null_mut(), &mut total, &mut free)
-            } != 0;
+            let mut space = DISK_SPACE_INFORMATION::default();
+            // SAFETY: root is NUL-terminated; space is a writable binding-defined output.
+            // This metadata query needs no raw-disk handle or privilege request.
+            let result = unsafe { GetDiskSpaceInformationW(terminated.as_ptr(), &mut space) };
+            let captured_at = SystemTime::now();
+            let values = capacity_values(result, &space);
+            let (total_bytes, free_bytes) =
+                values.map_or((None, None), |(total, free)| (Some(total), Some(free)));
             drives.push(VolumeInfo {
                 root: text(root),
                 label: information_ok.then(|| text(&label)),
                 filesystem: information_ok.then(|| text(&filesystem)),
-                total_bytes: capacity_ok.then_some(total),
-                free_bytes: capacity_ok.then_some(free),
+                total_bytes,
+                free_bytes,
+                capacity: CapacityMetadata {
+                    source: CapacitySource::WindowsActualGlobalFilesystem,
+                    captured_at,
+                    issue: values.err(),
+                },
             });
         }
         Ok(drives)
+    }
+
+    fn capacity_values(
+        result: i32,
+        space: &DISK_SPACE_INFORMATION,
+    ) -> Result<(u64, u64), CapacityIssue> {
+        // The documented success is S_OK. Never reinterpret a failed/unsupported query's
+        // zero-initialized output as a known empty filesystem, or fall back to caller quotas.
+        if result != 0 {
+            return Err(CapacityIssue::QueryFailed(result));
+        }
+        if space.SectorsPerAllocationUnit == 0 || space.BytesPerSector == 0 {
+            return Err(CapacityIssue::InvalidAllocationUnit);
+        }
+        if space.ActualAvailableAllocationUnits > space.ActualTotalAllocationUnits {
+            return Err(CapacityIssue::IncoherentFreeSpace);
+        }
+        let unit = u64::from(space.SectorsPerAllocationUnit)
+            .checked_mul(u64::from(space.BytesPerSector))
+            .ok_or(CapacityIssue::SizeOverflow)?;
+        let total = space
+            .ActualTotalAllocationUnits
+            .checked_mul(unit)
+            .ok_or(CapacityIssue::SizeOverflow)?;
+        let free = space
+            .ActualAvailableAllocationUnits
+            .checked_mul(unit)
+            .ok_or(CapacityIssue::SizeOverflow)?;
+        Ok((total, free))
     }
 
     pub fn volume_root_for(path: &Path) -> Option<String> {
@@ -270,6 +333,57 @@ mod platform {
             Some(format!(r"\\{unc}"))
         } else {
             Some(root.strip_prefix(r"\\?\").unwrap_or(&root).to_owned())
+        }
+    }
+
+    #[cfg(test)]
+    mod capacity_tests {
+        use super::*;
+
+        #[test]
+        fn actual_capacity_ignores_caller_quotas_and_rejects_invalid_observations() {
+            let mut space = DISK_SPACE_INFORMATION {
+                ActualTotalAllocationUnits: 100,
+                ActualAvailableAllocationUnits: 60,
+                CallerTotalAllocationUnits: 40,
+                CallerAvailableAllocationUnits: 20,
+                SectorsPerAllocationUnit: 2,
+                BytesPerSector: 512,
+                ..Default::default()
+            };
+            // Both an impossible mixed pair (40,60) and a plausible one (80,60) must use Actual*.
+            for caller_total in [40, 80] {
+                space.CallerTotalAllocationUnits = caller_total;
+                assert_eq!(capacity_values(0, &space), Ok((102400, 61440)));
+            }
+            space.ActualAvailableAllocationUnits = 0;
+            assert_eq!(capacity_values(0, &space), Ok((102400, 0)));
+            space.ActualTotalAllocationUnits = 0;
+            assert_eq!(capacity_values(0, &space), Ok((0, 0)));
+            assert_eq!(
+                capacity_values(-2147467263, &space),
+                Err(CapacityIssue::QueryFailed(-2147467263))
+            );
+            space.ActualAvailableAllocationUnits = 1;
+            assert_eq!(
+                capacity_values(0, &space),
+                Err(CapacityIssue::IncoherentFreeSpace)
+            );
+            space.ActualAvailableAllocationUnits = 0;
+            space.SectorsPerAllocationUnit = 0;
+            assert_eq!(
+                capacity_values(0, &space),
+                Err(CapacityIssue::InvalidAllocationUnit)
+            );
+            space.SectorsPerAllocationUnit = 1;
+            space.BytesPerSector = 0;
+            assert_eq!(
+                capacity_values(0, &space),
+                Err(CapacityIssue::InvalidAllocationUnit)
+            );
+            space.BytesPerSector = 2;
+            space.ActualTotalAllocationUnits = u64::MAX;
+            assert_eq!(capacity_values(0, &space), Err(CapacityIssue::SizeOverflow));
         }
     }
 }
@@ -299,19 +413,38 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_query_matches_the_drive_listing() {
+    fn local_drive_listing_activates_global_capacity_and_reports_filesystem() {
         // A broken query would silently disable the MFT frontier; compare it with the listing.
         let path = std::env::temp_dir();
         let root = volume_root_for(&path).expect("temp directory volume root");
-        let listed = list_drives()
+        let before = SystemTime::now();
+        let volume = list_drives()
             .unwrap()
             .into_iter()
             .find(|volume| volume.root.eq_ignore_ascii_case(&root))
-            .and_then(|volume| volume.filesystem);
+            .expect("temp volume listed");
         assert!(
-            listed.is_some(),
+            volume.filesystem.is_some(),
             "the temp volume must report its filesystem"
         );
-        assert_eq!(filesystem_for(&path), listed);
+        assert_eq!(filesystem_for(&path), volume.filesystem);
+        assert_eq!(
+            volume.capacity.source,
+            CapacitySource::WindowsActualGlobalFilesystem
+        );
+        assert_eq!(
+            volume.capacity.issue, None,
+            "the native global provider must activate on the local test volume"
+        );
+        assert!(
+            volume.capacity.captured_at >= before
+                && volume.capacity.captured_at <= SystemTime::now()
+        );
+        let total = volume.total_bytes.expect("global total known");
+        let free = volume.free_bytes.expect("global free known");
+        assert!(total > 0 && free <= total);
+        println!(
+            "native_capacity_source=WindowsActualGlobalFilesystem total_bytes={total} free_bytes={free} coherent=1 capture_time_recorded=1"
+        );
     }
 }

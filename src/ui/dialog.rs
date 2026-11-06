@@ -2,7 +2,7 @@ use std::path::{Component, Path, PathBuf};
 use std::thread::{self, JoinHandle};
 
 use hogmap::scan_win::ScanError;
-use hogmap::volume::{self, VolumeInfo};
+use hogmap::volume::{self, CapacityMetadata, VolumeInfo};
 
 use eframe::egui::{self, Key, Modifiers, Stroke, StrokeKind};
 
@@ -18,6 +18,7 @@ pub struct DriveChoice {
     pub label: String,
     pub free_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
+    pub capacity: Option<CapacityMetadata>,
 }
 
 impl From<VolumeInfo> for DriveChoice {
@@ -27,6 +28,7 @@ impl From<VolumeInfo> for DriveChoice {
             label: volume.label.unwrap_or_default(),
             free_bytes: volume.free_bytes,
             total_bytes: volume.total_bytes,
+            capacity: Some(volume.capacity),
         }
     }
 }
@@ -54,6 +56,7 @@ pub fn volume_choice(
                 label: String::new(),
                 free_bytes: None,
                 total_bytes: None,
+                capacity: None,
             },
             DriveChoice::from,
         )
@@ -293,6 +296,10 @@ impl SpaceDialog {
                                                 drive.free_bytes,
                                                 drive.total_bytes,
                                             );
+                                            let capacity_detail = text::capacity_detail(
+                                                drive.capacity.as_ref(),
+                                                std::time::SystemTime::now(),
+                                            );
                                             let painter =
                                                 ui.painter().with_clip_rect(rect.shrink(8.0));
                                             painter.text(
@@ -314,7 +321,9 @@ impl SpaceDialog {
                                                     egui::WidgetType::Button,
                                                     true,
                                                     selected,
-                                                    format!("{caption}, {capacity}"),
+                                                    format!(
+                                                        "{caption}, {capacity}. {capacity_detail}"
+                                                    ),
                                                 )
                                             });
                                             if response.has_focus() {
@@ -340,8 +349,9 @@ impl SpaceDialog {
                                             {
                                                 action = Some(Action::Start(drive.root.clone()));
                                             }
-                                            response
-                                                .on_hover_text(format!("{caption}\n{capacity}"));
+                                            response.on_hover_text(format!(
+                                                "{caption}\n{capacity}\n{capacity_detail}"
+                                            ));
                                         }
                                     });
                                 }
@@ -416,6 +426,14 @@ impl SpaceDialog {
 mod tests {
     use super::*;
 
+    fn capacity_metadata(issue: Option<volume::CapacityIssue>) -> CapacityMetadata {
+        CapacityMetadata {
+            source: volume::CapacitySource::WindowsActualGlobalFilesystem,
+            captured_at: std::time::SystemTime::UNIX_EPOCH,
+            issue,
+        }
+    }
+
     fn escape(context: &egui::Context, dialog: &mut SpaceDialog, has_scan: bool) -> Option<Action> {
         let mut action = None;
         let input = egui::RawInput {
@@ -442,19 +460,24 @@ mod tests {
             filesystem: Some("NTFS".into()),
             total_bytes: Some(8192),
             free_bytes: Some(2048),
+            capacity: capacity_metadata(None),
         };
         let choice = DriveChoice::from(volume.clone());
+        assert_eq!(choice.capacity, Some(volume.capacity));
         assert_eq!(choice.root, PathBuf::from(r"X:\"));
         assert_eq!(choice.label, "Fixture");
         assert_eq!(
             (choice.free_bytes, choice.total_bytes),
             (Some(2048), Some(8192))
         );
+        let failed = capacity_metadata(Some(volume::CapacityIssue::QueryFailed(-2147467263)));
         let choice = DriveChoice::from(VolumeInfo {
             free_bytes: None,
             total_bytes: None,
+            capacity: failed,
             ..volume.clone()
         });
+        assert_eq!(choice.capacity, Some(failed));
         assert_eq!(choice.label, "Fixture");
         assert_eq!((choice.free_bytes, choice.total_bytes), (None, None));
         let choice = DriveChoice::from(VolumeInfo {
@@ -488,6 +511,7 @@ mod tests {
                 filesystem: Some("NTFS".into()),
                 total_bytes: Some(8192),
                 free_bytes: Some(4096),
+                capacity: capacity_metadata(None),
             },
             VolumeInfo {
                 root: r"Y:\".into(),
@@ -495,6 +519,7 @@ mod tests {
                 filesystem: Some("NTFS".into()),
                 total_bytes: Some(1024),
                 free_bytes: Some(0),
+                capacity: capacity_metadata(None),
             },
         ];
         let choice = volume_choice(Path::new(r"X:\fixture"), Some(r"x:\"), fresh);
@@ -505,6 +530,23 @@ mod tests {
             (choice.free_bytes, choice.total_bytes),
             (Some(4096), Some(8192))
         );
+        assert_eq!(choice.capacity, Some(capacity_metadata(None)));
+        let failed = capacity_metadata(Some(volume::CapacityIssue::IncoherentFreeSpace));
+        let choice = volume_choice(
+            Path::new(r"X:\fixture"),
+            Some(r"X:\"),
+            vec![VolumeInfo {
+                root: r"X:\".into(),
+                label: Some("Still labelled".into()),
+                filesystem: None,
+                total_bytes: None,
+                free_bytes: None,
+                capacity: failed,
+            }],
+        );
+        assert_eq!(choice.capacity, Some(failed));
+        assert_eq!((choice.total_bytes, choice.free_bytes), (None, None));
+        assert_eq!(choice.label, "Still labelled");
         // An empty listing (first Start still loading) or an unknown volume keeps unknown numbers.
         let choice = volume_choice(
             Path::new(r"\\server\share\folder"),
@@ -512,6 +554,7 @@ mod tests {
             Vec::new(),
         );
         assert_eq!(choice.root, PathBuf::from(r"\\server\share\folder"));
+        assert_eq!(choice.capacity, None);
         assert!(choice.label.is_empty());
         assert_eq!((choice.free_bytes, choice.total_bytes), (None, None));
         let choice = volume_choice(Path::new(r"X:\fixture"), None, Vec::new());

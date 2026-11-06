@@ -893,7 +893,21 @@ impl HogMap {
                         egui::Label::new(egui::RichText::new(&root).strong()).truncate(),
                     )
                     .on_hover_text(&root);
-                    ui.label(capacity);
+                    let detail = text::capacity_detail(
+                        self.volume
+                            .as_ref()
+                            .and_then(|volume| volume.capacity.as_ref()),
+                        std::time::SystemTime::now(),
+                    );
+                    let response = ui.label(&capacity);
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(
+                            egui::WidgetType::Label,
+                            true,
+                            format!("{capacity}. {detail}"),
+                        )
+                    });
+                    response.on_hover_text(detail);
                 });
             });
     }
@@ -1233,6 +1247,7 @@ mod tests {
             label: "old".into(),
             free_bytes: Some(1),
             total_bytes: Some(2),
+            capacity: None,
         });
         app.rescan();
         app.drain(&context);

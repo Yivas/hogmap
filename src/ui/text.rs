@@ -4,6 +4,8 @@ use hogmap::filter::FilterError;
 use hogmap::index::{State, Summary};
 use hogmap::scan::ScanDiagnostics;
 use hogmap::scan_win::{self, ScanReport};
+use hogmap::volume::{CapacityIssue, CapacityMetadata, CapacitySource};
+use std::time::SystemTime;
 
 pub const TITLE: &str = "HogMap";
 pub const FILE: &str = "File";
@@ -271,6 +273,50 @@ pub fn drive_capacity(free: Option<u64>, total: Option<u64>) -> String {
     let known =
         |value: Option<u64>| value.map_or_else(|| "unknown".into(), |bytes| size(bytes, false));
     format!("{} free / {} total", known(free), known(total))
+}
+
+/// Detail shared by the chooser and header; wall-clock changes never invent a capture age.
+pub fn capacity_detail(metadata: Option<&CapacityMetadata>, now: SystemTime) -> String {
+    let Some(metadata) = metadata else {
+        return "No global filesystem capacity observation is available.".into();
+    };
+    let source = match metadata.source {
+        CapacitySource::WindowsActualGlobalFilesystem => {
+            "Windows GetDiskSpaceInformationW: global filesystem, quotas excluded"
+        }
+    };
+    let age = match now.duration_since(metadata.captured_at) {
+        Ok(age) => {
+            let seconds = age.as_secs();
+            if seconds < 60 {
+                format!("Queried {seconds} s ago")
+            } else if seconds < 3600 {
+                format!("Queried {} min ago", seconds / 60)
+            } else if seconds < 86400 {
+                format!("Queried {} h ago", seconds / 3600)
+            } else {
+                format!("Queried {} days ago", seconds / 86400)
+            }
+        }
+        Err(_) => "Query age unavailable: system clock changed".into(),
+    };
+    let issue = match metadata.issue {
+        None => "Capacity observed".into(),
+        Some(CapacityIssue::QueryFailed(code)) => format!(
+            "Capacity unknown: Windows query failed (HRESULT 0x{:08X})",
+            code as u32
+        ),
+        Some(CapacityIssue::InvalidAllocationUnit) => {
+            "Capacity unknown: invalid filesystem allocation unit".into()
+        }
+        Some(CapacityIssue::SizeOverflow) => {
+            "Capacity unknown: filesystem byte count overflowed".into()
+        }
+        Some(CapacityIssue::IncoherentFreeSpace) => {
+            "Capacity unknown: reported free space exceeds total capacity".into()
+        }
+    };
+    format!("{source}. {age}. {issue}.")
 }
 
 pub fn files(count: usize) -> String {
