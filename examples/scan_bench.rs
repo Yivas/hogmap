@@ -47,7 +47,7 @@ fn arguments() -> Result<Arguments, &'static str> {
                 let workers = args
                     .next()
                     .and_then(|value| value.to_str().and_then(|value| value.parse::<usize>().ok()))
-                    .filter(|workers| (0..=8).contains(workers))
+                    .filter(|workers| (0..=16).contains(workers))
                     .ok_or("invalid_workers")?;
                 parsed.options.workers = workers;
                 workers_seen = true;
@@ -239,6 +239,7 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     );
     println!("workers={}", report.selected_workers);
     println!("seek_penalty={}", optional_count(report.seek_penalty));
+    println!("mft_ordered={}", u8::from(report.mft_ordered));
     println!("drain_cadence_ms={}", if args.unthrottled { 0 } else { 33 });
     println!("drain_calls={drains}");
     println!("events={events}");

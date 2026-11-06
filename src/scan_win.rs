@@ -43,7 +43,7 @@ impl ScanError {
 
 #[derive(Clone, Copy, Debug)]
 pub struct ScanOptions {
-    /// Zero selects the volume policy; explicit values are clamped to 1..=8.
+    /// Zero selects the volume policy; explicit values are clamped to 1..=16.
     pub workers: usize,
     /// Shared queue bound, clamped to 1..=1024. Overflow stays local to a worker.
     pub queue_capacity: usize,
@@ -64,9 +64,18 @@ impl Default for ScanOptions {
     }
 }
 
-/// Unknown storage is treated conservatively, like a seek-penalty device.
+/// Local worker curves currently select four for both media, with different confidence:
+/// the no-seek choice is measured on a repeated tree; the HDD choice remains provisional.
+/// Unknown storage (UNC, mapped or USB drives without the query) uses the HDD choice.
+/// The two constants are equal today but stay separate so each medium can be retuned.
+/// This is not a portable performance guarantee.
 pub fn worker_count_for(seek_penalty: Option<bool>, available: usize) -> usize {
-    let desired = if seek_penalty == Some(false) { 4 } else { 1 };
+    const SSD_WORKERS: usize = 4;
+    const HDD_WORKERS: usize = 4;
+    let desired = match seek_penalty {
+        Some(false) => SSD_WORKERS,
+        Some(true) | None => HDD_WORKERS,
+    };
     desired.min(available.max(1))
 }
 
@@ -106,9 +115,10 @@ pub struct ScanReport {
     pub pending_node_struct_bytes: usize,
     /// Directory-worker counters only: the coordinating thread's root record, final flush and
     /// progress are not included, so summing these does not give the scan's totals.
-    pub workers: [WorkerMetrics; 8],
+    pub workers: [WorkerMetrics; 16],
     pub selected_workers: usize,
     pub seek_penalty: Option<bool>,
+    pub mft_ordered: bool,
     pub first_open_ns: Option<u64>,
     pub first_batch_sent_ns: Option<u64>,
     pub last_outcome_ns: Option<u64>,
@@ -160,7 +170,8 @@ mod platform {
         Batch, DirectoryOutcome, NodeKey, Progress, ScanEvent, ScanEventKind, ScanRecord, ScanWake,
         SendOutcome, Terminal, send_event, send_terminal,
     };
-    use std::collections::VecDeque;
+    use std::cmp::{Ordering as CompareOrdering, Reverse};
+    use std::collections::{BinaryHeap, VecDeque};
     use std::ffi::{OsStr, OsString};
     use std::mem::{offset_of, size_of};
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -361,9 +372,86 @@ mod platform {
             }
         }
     }
+    fn mft_order_for(seek_penalty: Option<bool>, filesystem: Option<&str>) -> bool {
+        seek_penalty == Some(true) && filesystem.is_some_and(|fs| fs.eq_ignore_ascii_case("NTFS"))
+    }
+
+    fn pending_priority(file_id: Option<u128>, key: NodeKey) -> (Reverse<u64>, Reverse<u64>) {
+        // NTFS sequence bits are not part of the low-48-bit MFT record number.
+        // Find fallback has no identity; those entries follow known records in discovery order.
+        (
+            Reverse(file_id.map_or(u64::MAX, |id| (id & 0xFFFF_FFFF_FFFF) as u64)),
+            Reverse(key.value()),
+        )
+    }
+
     struct Work {
         path: Arc<DirectoryPath>,
         key: NodeKey,
+        file_id: Option<u128>,
+    }
+    impl PartialEq for Work {
+        fn eq(&self, other: &Self) -> bool {
+            self.cmp(other) == CompareOrdering::Equal
+        }
+    }
+    impl Eq for Work {}
+    impl PartialOrd for Work {
+        fn partial_cmp(&self, other: &Self) -> Option<CompareOrdering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Work {
+        fn cmp(&self, other: &Self) -> CompareOrdering {
+            pending_priority(self.file_id, self.key)
+                .cmp(&pending_priority(other.file_id, other.key))
+        }
+    }
+    enum Frontier {
+        DepthFirst(VecDeque<Work>),
+        Mft(BinaryHeap<Work>),
+    }
+    impl Frontier {
+        fn new(mft_order: bool, capacity: usize) -> Self {
+            if mft_order {
+                Self::Mft(BinaryHeap::with_capacity(capacity))
+            } else {
+                Self::DepthFirst(VecDeque::with_capacity(capacity))
+            }
+        }
+        fn push(&mut self, work: Work) {
+            match self {
+                Self::DepthFirst(stack) => stack.push_back(work),
+                Self::Mft(heap) => heap.push(work),
+            }
+        }
+        fn pop(&mut self) -> Option<Work> {
+            match self {
+                Self::DepthFirst(stack) => stack.pop_back(),
+                Self::Mft(heap) => heap.pop(),
+            }
+        }
+        fn steal(&mut self) -> Option<Work> {
+            match self {
+                Self::DepthFirst(stack) => stack.pop_front(),
+                Self::Mft(heap) => heap.pop(),
+            }
+        }
+        fn peek(&self) -> Option<&Work> {
+            match self {
+                Self::DepthFirst(stack) => stack.back(),
+                Self::Mft(heap) => heap.peek(),
+            }
+        }
+        fn len(&self) -> usize {
+            match self {
+                Self::DepthFirst(stack) => stack.len(),
+                Self::Mft(heap) => heap.len(),
+            }
+        }
+        fn is_empty(&self) -> bool {
+            self.len() == 0
+        }
     }
     struct ActiveWork {
         path: PathBuf,
@@ -371,7 +459,7 @@ mod platform {
         key: NodeKey,
     }
     struct Queue {
-        entries: VecDeque<Work>,
+        entries: Frontier,
         outstanding: usize,
         report: ScanReport,
     }
@@ -394,6 +482,7 @@ mod platform {
         started: Instant,
         pending_memory: Arc<PendingMemory>,
         idle_workers: AtomicUsize,
+        mft_order: bool,
     }
 
     impl Shared<'_> {
@@ -447,7 +536,9 @@ mod platform {
             if sent {
                 // Only publish stealable work after its directory record is in the channel.
                 let mut queue = self.queue.lock().unwrap();
-                queue.entries.extend(output.unpublished.drain(..));
+                for work in output.unpublished.drain(..) {
+                    queue.entries.push(work);
+                }
                 queue.report.max_queue_depth =
                     queue.report.max_queue_depth.max(queue.entries.len());
                 drop(queue);
@@ -504,7 +595,7 @@ mod platform {
                 _ => {}
             }
         }
-        fn schedule(&self, work: Work, local: &mut Vec<Work>) -> bool {
+        fn schedule(&self, work: Work, local: &mut Frontier) -> bool {
             let mut output = self.output.lock().unwrap();
             let mut queue = self.queue.lock().unwrap();
             let shared_depth = queue.entries.len() + output.unpublished.len();
@@ -535,12 +626,38 @@ mod platform {
         options: ScanOptions,
     ) -> (ProducerOutcome, ScanReport) {
         let seek_penalty = crate::volume::seek_penalty_for(&root);
+        // Only a seek-penalty volume can enable the MFT frontier, so skip the extra query otherwise.
+        let mft_order = seek_penalty == Some(true)
+            && mft_order_for(
+                seek_penalty,
+                crate::volume::filesystem_for(&root).as_deref(),
+            );
+        run_scan(
+            generation,
+            root,
+            sender,
+            cancel,
+            options,
+            seek_penalty,
+            mft_order,
+        )
+    }
+
+    fn run_scan(
+        generation: ScanGeneration,
+        root: PathBuf,
+        sender: ScanSender,
+        cancel: &ScanCancellation,
+        options: ScanOptions,
+        seek_penalty: Option<bool>,
+        mft_order: bool,
+    ) -> (ProducerOutcome, ScanReport) {
         let available = thread::available_parallelism().map_or(1, usize::from);
         let options = ScanOptions {
             workers: if options.workers == 0 {
                 worker_count_for(seek_penalty, available)
             } else {
-                options.workers.clamp(1, 8)
+                options.workers.clamp(1, 16)
             },
             queue_capacity: options.queue_capacity.clamp(1, 1024),
             local_stack_capacity: options.local_stack_capacity.clamp(1, 4096),
@@ -574,6 +691,7 @@ mod platform {
                     pending_memory_limit_hits: 1,
                     selected_workers: options.workers,
                     seek_penalty,
+                    mft_ordered: mft_order,
                     ..ScanReport::default()
                 },
             );
@@ -585,15 +703,21 @@ mod platform {
             stopped: AtomicBool::new(false),
             next_key: AtomicU64::new(1),
             queue: Mutex::new(Queue {
-                entries: VecDeque::from([Work {
-                    path: root_path,
-                    key: root_key,
-                }]),
+                entries: {
+                    let mut frontier = Frontier::new(mft_order, options.queue_capacity);
+                    frontier.push(Work {
+                        path: root_path,
+                        key: root_key,
+                        file_id: None,
+                    });
+                    frontier
+                },
                 outstanding: 1,
                 report: ScanReport {
                     max_queue_depth: 1,
                     selected_workers: options.workers,
                     seek_penalty,
+                    mft_ordered: mft_order,
                     ..ScanReport::default()
                 },
             }),
@@ -608,6 +732,7 @@ mod platform {
             started: Instant::now(),
             pending_memory,
             idle_workers: AtomicUsize::new(0),
+            mft_order,
         };
         cancel.register(&shared.wake);
         let root_sent = shared.record(ScanRecord {
@@ -716,13 +841,29 @@ mod platform {
         let Ok(_error_mode) = crate::volume::ErrorModeGuard::new() else {
             return false;
         };
-        let mut local = Vec::with_capacity(shared.options.local_stack_capacity);
+        let mut local = Frontier::new(shared.mft_order, shared.options.local_stack_capacity);
         loop {
             if shared.stopping() {
                 shared.wake.notify();
                 return true;
             }
-            let work = if let Some(work) = local.pop() {
+            // Both heaps participate in HDD selection; queue overflow must not revert to DFS.
+            // Entries move between frontiers, never into a second retained ordering index.
+            let shared_work = if shared.mft_order {
+                let mut queue = shared.queue.lock().unwrap();
+                if queue
+                    .entries
+                    .peek()
+                    .is_some_and(|candidate| local.peek().is_none_or(|work| candidate > work))
+                {
+                    queue.entries.pop()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let work = if let Some(work) = shared_work.or_else(|| local.pop()) {
                 work
             } else {
                 let needs_work = shared.queue.lock().unwrap().entries.is_empty();
@@ -738,7 +879,7 @@ mod platform {
                         }
                         return true;
                     }
-                    if let Some(work) = queue.entries.pop_front() {
+                    if let Some(work) = queue.entries.steal() {
                         break work;
                     }
                     if queue.outstanding == 0 {
@@ -782,7 +923,7 @@ mod platform {
         sizes: Sizes,
         identity: Option<FileIdentity>,
     }
-    fn child(work: &ActiveWork, shared: &Shared<'_>, local: &mut Vec<Work>, child: Child) -> bool {
+    fn child(work: &ActiveWork, shared: &Shared<'_>, local: &mut Frontier, child: Child) -> bool {
         if shared.stopping() {
             return false;
         }
@@ -830,7 +971,14 @@ mod platform {
                     &shared.pending_memory,
                     shared.options.max_pending_bytes,
                 ) {
-                    shared.schedule(Work { path, key }, local)
+                    shared.schedule(
+                        Work {
+                            path,
+                            key,
+                            file_id: child.identity.map(|identity| identity.file),
+                        },
+                        local,
+                    )
                 } else {
                     shared
                         .queue
@@ -906,13 +1054,10 @@ mod platform {
     fn enumerate(
         work: &ActiveWork,
         shared: &Shared<'_>,
-        local: &mut Vec<Work>,
+        local: &mut Frontier,
     ) -> Result<(), ScanError> {
         if work.key == NodeKey::new(0) {
             check_path(&work.path, shared)?;
-        } else {
-            // Ancestors were checked when their work was processed; recheck this final component.
-            check_directory(&work.path, shared)?;
         }
         let path = extended_path(&work.path)?;
         if shared.stopping() {
@@ -954,25 +1099,40 @@ mod platform {
         if unsafe { GetFileInformationByHandle(handle.0, &mut information) } == 0 {
             return Err(ScanError::last());
         }
-        let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
-        if shared.stopping() {
-            return Ok(());
+        // Validate the object actually opened, not another path lookup. Ordinary descendants
+        // need only the attributes already returned with the volume serial. Query the tag for
+        // the root and observed reparse objects, where it distinguishes cloud from other skips.
+        let mut current_attributes = information.dwFileAttributes;
+        let mut reparse_tag = 0;
+        if work.key == NodeKey::new(0) || current_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+            if shared.stopping() {
+                return Ok(());
+            }
+            // SAFETY: owned live handle and writable fixed-size FILE_ATTRIBUTE_TAG_INFO output.
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    handle.0,
+                    FileAttributeTagInfo,
+                    (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
+                    size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+                )
+            } != 0
+            {
+                current_attributes = tag.FileAttributes;
+                reparse_tag = tag.ReparseTag;
+            } else if current_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                // Some redirectors and filters do not support the tag query. A reparse object
+                // without a readable tag is still never enumerated or followed.
+                shared.count_skip(SKIP_REPARSE_CODE);
+                return Err(ScanError {
+                    code: SKIP_REPARSE_CODE,
+                });
+            }
+            // An ordinary root whose filesystem lacks the tag query keeps the attributes already
+            // read from the handle, as before; cloud recall bits are still checked below.
         }
-        // SAFETY: owned live handle and writable fixed-size FILE_ATTRIBUTE_TAG_INFO output.
-        let tag_ok = unsafe {
-            GetFileInformationByHandleEx(
-                handle.0,
-                FileAttributeTagInfo,
-                (&mut tag as *mut FILE_ATTRIBUTE_TAG_INFO).cast(),
-                size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
-            )
-        } != 0;
-        let current_attributes = if tag_ok {
-            tag.FileAttributes
-        } else {
-            information.dwFileAttributes
-        };
-        if let Some(code) = skip_code(current_attributes, if tag_ok { tag.ReparseTag } else { 0 }) {
+        if let Some(code) = skip_code(current_attributes, reparse_tag) {
             shared.count_skip(code);
             return Err(ScanError { code });
         }
@@ -1113,7 +1273,7 @@ mod platform {
     fn fallback(
         work: &ActiveWork,
         shared: &Shared<'_>,
-        local: &mut Vec<Work>,
+        local: &mut Frontier,
         code: u32,
     ) -> Result<(), ScanError> {
         {
@@ -1191,6 +1351,132 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        #[test]
+        fn mft_frontier_orders_only_ntfs_seek_devices_and_ignores_sequence_bits() {
+            assert!(mft_order_for(Some(true), Some("ntfs")));
+            for (seek, fs) in [
+                (Some(false), Some("NTFS")),
+                (None, Some("NTFS")),
+                (Some(true), Some("ReFS")),
+                (Some(true), None),
+            ] {
+                assert!(!mft_order_for(seek, fs));
+            }
+            let memory = Arc::new(PendingMemory::default());
+            let path = DirectoryPath::new(None, OsString::from("fixture"), &memory, 4096).unwrap();
+            for ordered in [false, true] {
+                let mut frontier = Frontier::new(ordered, 1);
+                for (key, file_id) in [
+                    (0, Some(90)),
+                    (1, Some((7_u128 << 48) | 10)),
+                    (2, None),
+                    (3, Some(40)),
+                ] {
+                    frontier.push(Work {
+                        path: path.clone(),
+                        key: NodeKey::new(key),
+                        file_id,
+                    });
+                }
+                let mut keys = Vec::new();
+                while let Some(work) = frontier.pop() {
+                    keys.push(work.key.value());
+                }
+                assert_eq!(
+                    keys,
+                    if ordered {
+                        vec![1, 3, 0, 2]
+                    } else {
+                        vec![3, 2, 1, 0]
+                    }
+                );
+            }
+            assert!(
+                pending_priority(Some(12), NodeKey::new(1))
+                    > pending_priority(Some(12), NodeKey::new(2))
+            );
+        }
+
+        #[test]
+        fn mft_scheduling_preserves_publication_outcomes_and_terminal() {
+            use std::collections::HashSet;
+            struct Fixture(PathBuf);
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    std::fs::remove_dir_all(&self.0).unwrap();
+                }
+            }
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let unique = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_nanos());
+            let fixture = Fixture(std::env::temp_dir().join(format!(
+                "hogmap-mft-order-test-{}-{unique}-{nanos}",
+                std::process::id()
+            )));
+            std::fs::create_dir(&fixture.0).unwrap();
+            for number in 0..64 {
+                std::fs::create_dir_all(fixture.0.join(format!("dir-{number}/nested"))).unwrap();
+            }
+            let generation = ScanGeneration::new(901);
+            let (sender, receiver) = crate::scan::event_channel(1);
+            let cancel = ScanCancellation::new();
+            thread::scope(|scope| {
+                let worker = scope.spawn(|| {
+                    run_scan(
+                        generation,
+                        fixture.0.clone(),
+                        sender,
+                        &cancel,
+                        ScanOptions {
+                            workers: 4,
+                            queue_capacity: 1,
+                            local_stack_capacity: 1,
+                            ..ScanOptions::default()
+                        },
+                        Some(true),
+                        true,
+                    )
+                });
+                let mut seen = HashSet::new();
+                let mut done = HashSet::new();
+                let mut terminals = 0;
+                while let Ok(event) = receiver.recv_timeout(Duration::from_secs(10)) {
+                    assert_eq!(event.generation, generation);
+                    match event.event {
+                        ScanEventKind::Batch(batch) => {
+                            for record in batch.records() {
+                                if let Some(parent) = record.parent {
+                                    assert!(seen.contains(&parent));
+                                    assert!(!done.contains(&parent));
+                                }
+                                assert!(seen.insert(record.key));
+                            }
+                            for outcome in batch.outcomes() {
+                                assert!(seen.contains(&outcome.key));
+                                assert!(done.insert(outcome.key));
+                                assert_eq!(outcome.code, None);
+                            }
+                        }
+                        ScanEventKind::Terminal(terminal) => {
+                            assert_eq!(terminal, Terminal::Finished);
+                            terminals += 1;
+                        }
+                        ScanEventKind::Progress(_) => {}
+                        _ => panic!("unexpected unbatched outcome"),
+                    }
+                }
+                let (outcome, report) = worker.join().unwrap();
+                assert_eq!(outcome, ProducerOutcome::Finished);
+                assert_eq!(seen.len(), 129);
+                assert_eq!(done, seen);
+                assert_eq!(terminals, 1);
+                assert_eq!(report.pending_memory_limit_hits, 0);
+                assert!(report.peak_pending_bytes <= ScanOptions::default().max_pending_bytes);
+            });
+        }
+
         #[test]
         fn extended_paths_preserve_drive_unc_long_and_native_names() {
             let text = |path: &str| {

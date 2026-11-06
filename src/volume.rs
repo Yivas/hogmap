@@ -34,6 +34,8 @@ pub fn seek_penalty_for(_path: &Path) -> Option<bool> {
 }
 
 #[cfg(windows)]
+pub(crate) use platform::filesystem_for;
+#[cfg(windows)]
 pub use platform::{list_drives, seek_penalty_for, volume_root_for};
 
 /// Suppresses removable-device dialogs on this thread only, preserving other mode bits.
@@ -90,6 +92,29 @@ mod platform {
     use windows_sys::Win32::Storage::FileSystem::{
         GetDiskFreeSpaceExW, GetLogicalDriveStringsW, GetVolumeInformationW, GetVolumePathNameW,
     };
+
+    pub(crate) fn filesystem_for(path: &Path) -> Option<String> {
+        let _mode = ErrorModeGuard::new().ok()?;
+        let root: Vec<u16> = volume_root_for(path)?.encode_utf16().chain([0]).collect();
+        let mut filesystem = [0_u16; 261];
+        // SAFETY: terminated volume root and writable filesystem buffer; other outputs unused.
+        if unsafe {
+            GetVolumeInformationW(
+                root.as_ptr(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                filesystem.as_mut_ptr(),
+                filesystem.len() as u32,
+            )
+        } == 0
+        {
+            return None;
+        }
+        Some(text(&filesystem))
+    }
 
     pub fn seek_penalty_for(path: &Path) -> Option<bool> {
         use std::mem::{offset_of, size_of};
@@ -271,5 +296,22 @@ mod tests {
         let _ = list_drives().unwrap();
         // SAFETY: thread-local query has no preconditions.
         assert_eq!(unsafe { GetThreadErrorMode() }, previous);
+    }
+
+    #[test]
+    fn filesystem_query_matches_the_drive_listing() {
+        // A broken query would silently disable the MFT frontier; compare it with the listing.
+        let path = std::env::temp_dir();
+        let root = volume_root_for(&path).expect("temp directory volume root");
+        let listed = list_drives()
+            .unwrap()
+            .into_iter()
+            .find(|volume| volume.root.eq_ignore_ascii_case(&root))
+            .and_then(|volume| volume.filesystem);
+        assert!(
+            listed.is_some(),
+            "the temp volume must report its filesystem"
+        );
+        assert_eq!(filesystem_for(&path), listed);
     }
 }

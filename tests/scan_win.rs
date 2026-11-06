@@ -124,7 +124,7 @@ fn directory_batches_publish_every_parent_before_descendants() {
         std::fs::create_dir_all(parent.join("nested")).unwrap();
         std::fs::write(parent.join("nested/leaf"), b"x").unwrap();
     }
-    for workers in [1, 8] {
+    for workers in [1, 8, 16] {
         let generation = ScanGeneration::new(720 + workers as u64);
         let (sender, receiver) = sync_channel(2);
         let path = fixture.0.clone();

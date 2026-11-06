@@ -1,6 +1,6 @@
 # Working with filters
 
-The core can evaluate a filter against one file's name and optional logical size. The desktop sample's Highlight field uses this evaluator: matches keep their colors, non-matches dim and unknown decisions stay distinct. Directory context is retained, totals and geometry do not change, and invalid expressions keep the previous valid highlight. There is no filesystem scanner or filtered-geometry mode yet.
+The core can evaluate a filter against one file's name and optional logical size. The window's Highlight field uses this evaluator, for both real scans and the synthetic sample: matches keep their colors, non-matches dim and unknown decisions stay distinct. Directory context is retained, totals and geometry do not change, and invalid expressions keep the previous valid highlight. There is no filtered-geometry mode yet.
 
 ## Start with a name
 

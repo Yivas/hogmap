@@ -120,10 +120,12 @@ fn batched_outcomes_apply_after_records_and_keep_generation_checks() {
 }
 
 #[test]
-fn storage_policy_is_conservative_when_unknown_and_respects_available_workers() {
-    assert_eq!(worker_count_for(None, 8), 1);
-    assert_eq!(worker_count_for(Some(true), 8), 1);
-    assert_eq!(worker_count_for(Some(false), 8), 4);
-    assert_eq!(worker_count_for(Some(false), 2), 2);
-    assert_eq!(worker_count_for(Some(false), 0), 1);
+fn storage_policy_caps_the_worker_count_by_available_parallelism() {
+    // SSD and HDD currently share the same value; this checks the cap and the minimum, not the
+    // per-medium mapping, which becomes observable only when the two values diverge.
+    for medium in [None, Some(true), Some(false)] {
+        assert_eq!(worker_count_for(medium, 16), 4);
+        assert_eq!(worker_count_for(medium, 2), 2);
+        assert_eq!(worker_count_for(medium, 0), 1);
+    }
 }
