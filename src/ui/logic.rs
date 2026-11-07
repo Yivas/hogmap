@@ -1,7 +1,7 @@
 use std::ffi::OsString;
 
 use hogmap::filter::{Filter, FilterError, Match};
-use hogmap::index::{EntryId, Index, Kind};
+use hogmap::index::{EntryId, Index, Kind, MetricSummary, SizeMetric};
 use hogmap::scan::Terminal;
 use hogmap::treemap::{Layout, NodeRef};
 
@@ -30,7 +30,15 @@ pub fn scan_state(running: bool, cancelled: bool, terminal: Option<Terminal>) ->
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Location {
     pub path: Vec<OsString>,
-    pub members: Option<Vec<OsString>>,
+    pub members: Option<Members>,
+}
+
+/// The siblings of an opened aggregate. The names stay fixed when the map metric changes; the
+/// metric that grouped them tells whether they are still known to be the small ones.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Members {
+    pub names: Vec<OsString>,
+    pub grouped_by: SizeMetric,
 }
 
 impl Location {
@@ -63,16 +71,25 @@ impl Location {
                 })?
                 .0;
         }
-        let members = self.members.as_ref().map(|names| {
+        let members = self.members.as_ref().map(|members| {
             index
                 .entries()
                 .filter(|(_, entry)| {
-                    entry.parent == Some(parent) && names.iter().any(|name| name == entry.name)
+                    entry.parent == Some(parent)
+                        && members.names.iter().any(|name| name == entry.name)
                 })
                 .map(|(id, _)| id)
                 .collect()
         });
         Some((parent, members))
+    }
+
+    /// Whether the opened members are the ones `metric` grouped. After a switch to the other
+    /// metric the same names stay open, but they are no longer known to be its small items.
+    pub fn members_grouped_by(&self, metric: SizeMetric) -> bool {
+        self.members
+            .as_ref()
+            .is_some_and(|members| members.grouped_by == metric)
     }
 
     pub fn up(&self) -> Self {
@@ -126,6 +143,62 @@ impl History {
             self.cursor += 1;
         }
     }
+}
+
+/// The selection to keep after the map switches metric. An entry ID stays valid for the same
+/// snapshot. An aggregate is only identified by its parent, so it survives only when the new
+/// layout groups exactly the same members under that parent. Each metric orders members by its
+/// own weights, so the comparison ignores order.
+pub fn retained_selection(
+    selected: Option<NodeRef>,
+    before: Option<&Layout>,
+    after: Option<&Layout>,
+) -> Option<NodeRef> {
+    let node = selected?;
+    if matches!(node, NodeRef::Entry(_)) {
+        return Some(node);
+    }
+    let members = |layout: &Layout| {
+        layout
+            .placed
+            .iter()
+            .find(|cell| cell.node == node)
+            .map(|cell| {
+                let mut members = cell.members.clone();
+                members.sort_unstable();
+                members
+            })
+    };
+    let unchanged = before
+        .and_then(members)
+        .zip(after.and_then(members))
+        .is_some_and(|(before, after)| before == after);
+    unchanged.then_some(node)
+}
+
+pub fn other_metric(metric: SizeMetric) -> SizeMetric {
+    match metric {
+        SizeMetric::Logical => SizeMetric::Allocated,
+        SizeMetric::Allocated => SizeMetric::Logical,
+    }
+}
+
+/// The selected metric's totals overflowed. `other_available` is true only when the other
+/// metric's own summary query succeeded; both metrics can overflow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetricOverflow {
+    pub metric: SizeMetric,
+    pub other_available: bool,
+}
+
+/// Totals of the metric the map shows. An overflow is reported for that metric instead of being
+/// replaced by zero or by the other metric's totals.
+pub fn metric_totals(index: &Index, metric: SizeMetric) -> Result<MetricSummary, MetricOverflow> {
+    // `summary_for` reports only `SizeOverflow`; every error therefore means an overflow.
+    index.summary_for(metric).map_err(|_| MetricOverflow {
+        metric,
+        other_available: index.summary_for(other_metric(metric)).is_ok(),
+    })
 }
 
 /// The renderer paints descendants after parents; hit testing follows that same order.

@@ -500,7 +500,13 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
         let _ = context.as_ref().expect("synthetic context").run_ui(
             eframe::egui::RawInput::default(),
             |ui| {
-                prepared_cells = Some(paint::prepare(ui, index, &layout, None));
+                prepared_cells = Some(paint::prepare(
+                    ui,
+                    index,
+                    &layout,
+                    None,
+                    hogmap::index::SizeMetric::Logical,
+                ));
             },
         );
         println!(

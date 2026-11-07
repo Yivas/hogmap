@@ -16,11 +16,11 @@ The engine reads directory metadata, never file contents. The header shows queri
 
 ## What the application will do
 
-The current prototype combines a nested logical-byte treemap with the Windows directory scanner. Free/not-yet-scanned map blocks, snapshots, export and alternate view modes are not implemented. A separate privileged NTFS engine and a portable ZIP remain later work, after the prototype has been checked.
+The current prototype combines a nested treemap, weighed by logical bytes or by observed allocated bytes chosen in View, with the Windows directory scanner. Free/not-yet-scanned map blocks, snapshots, export and alternate view modes are not implemented. A separate privileged NTFS engine and a portable ZIP remain later work, after the prototype has been checked.
 
 There is no delete, move or clean action, telemetry or account. The scanner skips observed reparse/cloud/recall entries rather than following them. Real cloud-provider behavior and concurrent path replacement remain unverified; metadata-only intent is not a guarantee against provider fetch. Selected network paths or mapped drives can cause Windows filesystem I/O to a server. The window is not elevated; privileged NTFS work and its isolated worker are not implemented.
 
-The current implementation and its limits are documented in the [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md). The renderer draws only known unique logical bytes, not free or unattributed volume space. [Development and checks](./development.md#run-the-window) explains how to start a scan or sample and read its colors.
+The current implementation and its limits are documented in the [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md). The renderer draws only known unique logical or observed allocated bytes, not free or unattributed volume space. [Development and checks](./development.md#run-the-window) explains how to start a scan or sample and read its colors.
 
 ## Support and security
 

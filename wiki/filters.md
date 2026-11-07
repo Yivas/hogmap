@@ -12,7 +12,7 @@ The core can evaluate a filter against one file's name and optional logical size
 
 `*.jpg;>1mb` requires both a JPG name and a logical size strictly larger than 1048576 bytes. A file exactly that size does not pass.
 
-The legacy suffixes `kb`, `mb`, `gb` and `tb` use powers of 1024. They do not mean decimal SI units. This first implementation always compares **logical bytes**, not allocated or recoverable storage.
+The legacy suffixes `kb`, `mb`, `gb` and `tb` use powers of 1024. They do not mean decimal SI units. This first implementation always compares **logical bytes**, not allocated or recoverable storage. That stays true when the map shows allocated size; the line under the Highlight field then says that highlighting uses logical size, and counts and totals do not change.
 
 ## Combine names and exclusions
 

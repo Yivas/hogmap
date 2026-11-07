@@ -4,9 +4,9 @@ mod logic;
 use std::ffi::OsStr;
 
 use hogmap::filter::Match;
-use hogmap::index::{Index, Kind, Sizes, State};
+use hogmap::index::{Index, Kind, SizeMetric, Sizes, State};
 use hogmap::treemap::{self, LayoutParams, NodeRef, Rect};
-use logic::{HighlightFilter, History, Location, fitting_prefix, hit_test};
+use logic::{HighlightFilter, History, Location, Members, fitting_prefix, hit_test};
 
 fn fixture() -> (Index, hogmap::index::EntryId, hogmap::index::EntryId) {
     let mut index = Index::new("sample".into()).unwrap();
@@ -96,11 +96,17 @@ fn history_branches_and_resolves_names_in_a_new_snapshot() {
 fn aggregate_history_keeps_members_and_up_returns_to_parent() {
     let (index, directory, file) = fixture();
     let mut location = Location::directory(&index, directory);
-    location.members = Some(vec!["photo.jpg".into()]);
+    location.members = Some(Members {
+        names: vec!["photo.jpg".into()],
+        grouped_by: SizeMetric::Logical,
+    });
     assert_eq!(
         location.resolve(&index),
         Some((directory, Some(vec![file])))
     );
+    // A metric switch keeps the same names open but no longer calls them that metric's small items.
+    assert!(location.members_grouped_by(SizeMetric::Logical));
+    assert!(!location.members_grouped_by(SizeMetric::Allocated));
     assert_eq!(location.up(), Location::directory(&index, directory));
     assert!(
         Location {
@@ -110,6 +116,151 @@ fn aggregate_history_keeps_members_and_up_returns_to_parent() {
         .resolve(&index)
         .is_none()
     );
+}
+
+#[test]
+fn a_metric_switch_keeps_entries_but_only_aggregates_with_the_same_members() {
+    let mut index = Index::new("sample".into()).unwrap();
+    let root = index.root();
+    let file = |index: &mut Index, parent, name: &str, logical, allocated| {
+        index
+            .insert(
+                parent,
+                name.into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(logical),
+                    allocated: Some(allocated),
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap()
+    };
+    // Logically "big.bin" is large and the "small" files are grouped; by allocation it is the
+    // reverse. The "uniform" folder weighs the same in both metrics.
+    let big = file(&mut index, root, "big.bin", 1_000_000, 100);
+    for number in 0..3 {
+        file(
+            &mut index,
+            root,
+            &format!("small_{number}.bin"),
+            100,
+            1_000_000,
+        );
+    }
+    let uniform = index
+        .insert(
+            root,
+            "uniform".into(),
+            Kind::Directory,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    file(&mut index, uniform, "large.bin", 1_000_000, 1_000_000);
+    for number in 0..3 {
+        file(&mut index, uniform, &format!("tiny_{number}.bin"), 100, 100);
+    }
+    // Both small files stay grouped in either metric, but each metric sorts them the other way.
+    let swapped = index
+        .insert(
+            root,
+            "swapped".into(),
+            Kind::Directory,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    file(&mut index, swapped, "large.bin", 1_000_000, 1_000_000);
+    file(&mut index, swapped, "a.bin", 100, 200);
+    file(&mut index, swapped, "b.bin", 200, 100);
+    index.set_state(root, State::Complete).unwrap();
+    let rect = Rect::new(0.0, 0.0, 1000.0, 1000.0);
+    let params = LayoutParams {
+        min_pixel_area: 5000.0,
+        header_height: 0.0,
+    };
+    let logical =
+        treemap::layout_with_metric(&index, root, rect, params, SizeMetric::Logical).unwrap();
+    let allocated =
+        treemap::layout_with_metric(&index, root, rect, params, SizeMetric::Allocated).unwrap();
+
+    let changed = NodeRef::Aggregate { parent: root };
+    let same = NodeRef::Aggregate { parent: uniform };
+    let reordered = NodeRef::Aggregate { parent: swapped };
+    let members = |layout: &treemap::Layout, node| {
+        layout
+            .placed
+            .iter()
+            .find(|cell| cell.node == node)
+            .map(|cell| cell.members.clone())
+            .unwrap_or_else(|| panic!("missing {node:?}"))
+    };
+    for node in [changed, same, reordered] {
+        members(&logical, node);
+        members(&allocated, node);
+    }
+    let (mut before, mut after) = (members(&logical, reordered), members(&allocated, reordered));
+    assert_ne!(before, after, "the fixture must reorder the group");
+    before.sort();
+    after.sort();
+    assert_eq!(before, after);
+    // The same members in another order are still the same group.
+    assert_eq!(
+        logic::retained_selection(Some(reordered), Some(&logical), Some(&allocated)),
+        Some(reordered)
+    );
+    // Same parent, different members: the selection would point at another group.
+    assert_eq!(
+        logic::retained_selection(Some(changed), Some(&logical), Some(&allocated)),
+        None
+    );
+    assert_eq!(
+        logic::retained_selection(Some(same), Some(&logical), Some(&allocated)),
+        Some(same)
+    );
+    // An entry stays selected even when the new metric places it inside an aggregate.
+    assert_eq!(
+        logic::retained_selection(Some(NodeRef::Entry(big)), Some(&logical), Some(&allocated)),
+        Some(NodeRef::Entry(big))
+    );
+    // Without a new layout (it failed), no aggregate can be confirmed.
+    assert_eq!(
+        logic::retained_selection(Some(same), Some(&logical), None),
+        None
+    );
+}
+
+#[test]
+fn an_overflowed_metric_offers_the_other_only_when_its_totals_exist() {
+    let mut index = Index::new("sample".into()).unwrap();
+    for (name, logical, allocated) in [("max.bin", 10, u64::MAX), ("one.bin", 20, 1)] {
+        index
+            .insert(
+                index.root(),
+                name.into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(logical),
+                    allocated: Some(allocated),
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        logic::metric_totals(&index, SizeMetric::Logical)
+            .unwrap()
+            .known_bytes,
+        30
+    );
+    let overflow = logic::metric_totals(&index, SizeMetric::Allocated).unwrap_err();
+    assert_eq!(overflow.metric, SizeMetric::Allocated);
+    assert!(overflow.other_available);
 }
 
 #[test]

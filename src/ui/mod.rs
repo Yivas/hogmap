@@ -11,16 +11,16 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, Modifiers};
 use hogmap::filter::Match;
-use hogmap::index::{EntryId, Index};
+use hogmap::index::{EntryId, Index, SizeMetric};
 use hogmap::scan::{
     DEFAULT_CHANNEL_CAPACITY, ScanCancellation, ScanGeneration, ScanReceiver, ScanReducer,
     Terminal, event_channel,
 };
 use hogmap::scan_win::{ScanOptions, ScanReport, run_win_scan_with_options};
 use hogmap::synthetic::{SyntheticSpec, run_synthetic};
-use hogmap::treemap::{self, Layout, LayoutParams, NodeRef, Rect};
+use hogmap::treemap::{self, Layout, LayoutError, LayoutParams, NodeRef, Rect};
 use hogmap::volume::{self, volume_root_for};
-use logic::{HighlightFilter, History, Location};
+use logic::{HighlightFilter, History, Location, Members};
 use theme::Theme;
 
 const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
@@ -36,21 +36,51 @@ enum ScanRequest {
 
 type PreparedScan = Result<(PathBuf, dialog::DriveChoice), String>;
 
+/// What a map was built for. The metric is part of the key, so geometry and labels built for one
+/// metric are never shown, even partly, while the other one is selected.
+#[derive(Debug, PartialEq)]
+struct ViewKey {
+    version: u64,
+    location: Location,
+    rect: Rect,
+    metric: SizeMetric,
+}
+
 struct Cache {
+    key: ViewKey,
     layout: Layout,
     cells: Vec<paint::Cell>,
     matches: Vec<Match>,
     match_counts: (usize, usize),
-    version: u64,
-    location: Location,
     location_label: String,
-    rect: Rect,
+}
+
+/// A map that could not be laid out for `key`. It stays apart from scan errors, so the scan keeps
+/// its lifecycle and choosing a metric that works clears it; it is not retried until the key
+/// changes.
+struct LayoutFailure {
+    key: ViewKey,
+    message: String,
 }
 
 /// The indexed name of an entry; the map and the status line use the same label for a location.
 fn entry_name(index: &Index, id: EntryId) -> String {
     index.get(id).map_or_else(String::new, |entry| {
         entry.name.to_string_lossy().into_owned()
+    })
+}
+
+/// The caption of an opened aggregate's members as resolved in this snapshot. They are called
+/// small only while the map uses the metric that grouped them.
+fn subset_caption(
+    location: &Location,
+    members: Option<&[EntryId]>,
+    metric: SizeMetric,
+) -> Option<text::Subset> {
+    let members = members.filter(|members| !members.is_empty())?;
+    Some(text::Subset {
+        members: members.len(),
+        small: location.members_grouped_by(metric),
     })
 }
 
@@ -80,7 +110,11 @@ pub struct HogMap {
     filter_focused: bool,
     filter: HighlightFilter,
     filter_changed: bool,
+    /// The size the map weighs. Chosen in View for this session only: it survives a rescan but is
+    /// never saved.
+    metric: SizeMetric,
     cache: Option<Cache>,
+    layout_failure: Option<LayoutFailure>,
     last_layout: Option<Instant>,
     error: Option<String>,
     about: bool,
@@ -124,7 +158,9 @@ impl HogMap {
             filter_focused: false,
             filter: HighlightFilter::default(),
             filter_changed: false,
+            metric: SizeMetric::Logical,
             cache: None,
+            layout_failure: None,
             last_layout: None,
             error: None,
             about: false,
@@ -365,6 +401,7 @@ impl HogMap {
         self.history = History::default();
         self.selected = None;
         self.cache = None;
+        self.layout_failure = None;
         self.last_layout = None;
         // A panic in the replaced producer is this scan's only report; do not hide it.
         if !previous_failed {
@@ -422,6 +459,14 @@ impl HogMap {
         }
     }
 
+    /// A layout failure of the selected metric. One left by the other metric is not reported while
+    /// the map is being rebuilt after a switch.
+    fn current_layout_failure(&self) -> Option<&LayoutFailure> {
+        self.layout_failure
+            .as_ref()
+            .filter(|failure| failure.key.metric == self.metric)
+    }
+
     fn navigate(&mut self, location: Location) {
         self.history.visit(location);
         self.selected = None;
@@ -442,33 +487,35 @@ impl HogMap {
         let Some(index) = self.reducer.index() else {
             return;
         };
-        let location =
-            match node {
-                NodeRef::Entry(id) => {
-                    if index
-                        .get(id)
-                        .is_none_or(|entry| entry.kind != hogmap::index::Kind::Directory)
-                    {
-                        return;
-                    }
-                    Location::directory(index, id)
+        let location = match node {
+            NodeRef::Entry(id) => {
+                if index
+                    .get(id)
+                    .is_none_or(|entry| entry.kind != hogmap::index::Kind::Directory)
+                {
+                    return;
                 }
-                NodeRef::Aggregate { parent } => {
-                    let Some(cell) = self.cache.as_ref().and_then(|cache| {
-                        cache.layout.placed.iter().find(|cell| cell.node == node)
-                    }) else {
-                        return;
-                    };
-                    let mut location = Location::directory(index, parent);
-                    location.members = Some(
-                        cell.members
-                            .iter()
-                            .filter_map(|id| index.get(*id).map(|entry| entry.name.to_os_string()))
-                            .collect(),
-                    );
-                    location
-                }
-            };
+                Location::directory(index, id)
+            }
+            NodeRef::Aggregate { parent } => {
+                let Some(cache) = self.cache.as_ref() else {
+                    return;
+                };
+                let Some(cell) = cache.layout.placed.iter().find(|cell| cell.node == node) else {
+                    return;
+                };
+                let mut location = Location::directory(index, parent);
+                location.members = Some(Members {
+                    names: cell
+                        .members
+                        .iter()
+                        .filter_map(|id| index.get(*id).map(|entry| entry.name.to_os_string()))
+                        .collect(),
+                    grouped_by: cache.key.metric,
+                });
+                location
+            }
+        };
         self.navigate(location);
     }
 
@@ -559,6 +606,15 @@ impl HogMap {
                     }
                     if ui.button(text::HOME).clicked() {
                         self.navigate(Location::default());
+                        ui.close();
+                    }
+                    ui.separator();
+                    // The map pass later in this frame rebuilds for the new metric before it draws.
+                    let mut metric = self.metric;
+                    ui.selectable_value(&mut metric, SizeMetric::Logical, text::METRIC_LOGICAL);
+                    ui.selectable_value(&mut metric, SizeMetric::Allocated, text::METRIC_ALLOCATED);
+                    if metric != self.metric {
+                        self.metric = metric;
                         ui.close();
                     }
                     ui.separator();
@@ -723,9 +779,19 @@ impl HogMap {
                             .truncate(),
                     )
                     .on_hover_text(error);
+                } else if let Some(failure) = self.current_layout_failure() {
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(&failure.message)
+                                .small()
+                                .color(error_color),
+                        )
+                        .truncate(),
+                    )
+                    .on_hover_text(&failure.message);
                 } else {
                     ui.label(
-                        egui::RichText::new(text::MAP_METRIC)
+                        egui::RichText::new(text::map_metric(self.metric))
                             .small()
                             .color(Theme::current(ui.ctx()).palette().secondary_text),
                     );
@@ -764,11 +830,24 @@ impl HogMap {
                     }
                     _ => lifecycle,
                 };
-                if let Some(index) = self.reducer.index()
-                    && let Ok(summary) = index.summary()
-                {
+                if let Some(index) = self.reducer.index() {
+                    let totals = logic::metric_totals(index, self.metric);
                     let location = match &self.cache {
-                        Some(cache) => cache.location_label.clone(),
+                        Some(cache) if cache.key.metric == self.metric => {
+                            cache.location_label.clone()
+                        }
+                        // A metric chosen in this frame is laid out after the status is drawn;
+                        // caption the members for the new metric instead of repeating the old one.
+                        Some(_) => {
+                            let current = self.history.current();
+                            let (root, members) =
+                                current.resolve(index).unwrap_or((index.root(), None));
+                            text::location(
+                                &entry_name(index, root),
+                                &current.path,
+                                subset_caption(&current, members.as_deref(), self.metric),
+                            )
+                        }
                         None => text::location(
                             &entry_name(index, index.root()),
                             &self.history.current().path,
@@ -776,7 +855,7 @@ impl HogMap {
                         ),
                     };
                     let mut detail =
-                        text::status(lifecycle, &location, summary, self.reducer.diagnostics());
+                        text::status(lifecycle, &location, &totals, self.reducer.diagnostics());
                     if let Some(report) = &self.scan_report {
                         detail.push('\n');
                         detail.push_str(&text::scan_report(report));
@@ -785,10 +864,14 @@ impl HogMap {
                         detail.push('\n');
                         detail.push_str(error);
                     }
+                    if let Some(failure) = self.current_layout_failure() {
+                        detail.push('\n');
+                        detail.push_str(&failure.message);
+                    }
                     let master = text::master_status(
                         master,
                         self.reducer.progress().records as usize,
-                        summary.known_logical_bytes,
+                        &totals,
                         self.scan_elapsed,
                     );
                     let accessible = format!("{master}\n{detail}");
@@ -798,12 +881,8 @@ impl HogMap {
                     });
                     status.on_hover_text(&detail);
                     ui.horizontal(|ui| {
-                        ui.strong(if summary.complete {
-                            text::COMPLETE_METADATA
-                        } else {
-                            text::INCOMPLETE_METADATA
-                        })
-                        .on_hover_text(&detail);
+                        ui.strong(text::completeness(&totals))
+                            .on_hover_text(&detail);
                         ui.separator();
                         ui.add(egui::Label::new(location).truncate())
                             .on_hover_text(detail);
@@ -873,7 +952,7 @@ impl HogMap {
                             }
                         });
                     let capacity = self.volume.as_ref().map_or_else(
-                        || text::UNKNOWN_CAPACITY.into(),
+                        || text::drive_capacity(None, None),
                         |volume| text::drive_capacity(volume.free_bytes, volume.total_bytes),
                     );
                     let capacity_width = ui
@@ -933,14 +1012,26 @@ impl HogMap {
         if rect.width <= 1.0 || rect.height <= 1.0 {
             return;
         }
-        let location = self.history.current();
-        let dirty = self.cache.as_ref().is_none_or(|cache| {
-            cache.version != self.version || cache.location != location || cache.rect != rect
-        });
+        let key = ViewKey {
+            version: self.version,
+            location: self.history.current(),
+            rect,
+            metric: self.metric,
+        };
+        let shown = self
+            .cache
+            .as_ref()
+            .map(|cache| &cache.key)
+            .or(self.layout_failure.as_ref().map(|failure| &failure.key));
+        let dirty = shown != Some(&key);
+        // The scan throttle limits growth updates; it never keeps the previous metric's cells on
+        // screen once the other metric is chosen, so an explicit switch rebuilds at once.
+        let switched = shown.is_some_and(|shown| shown.metric != key.metric);
         let due = self
             .last_layout
             .is_none_or(|last| last.elapsed() >= LAYOUT_INTERVAL);
-        if dirty && (self.receiver.is_none() || due) {
+        if dirty && (self.receiver.is_none() || due || switched) {
+            let location = &key.location;
             // Resolve components against this generation; a missing path during rescan shows the
             // root temporarily, without replacing the history entry before its parent arrives.
             let (root, members) = location.resolve(index).unwrap_or((index.root(), None));
@@ -954,34 +1045,66 @@ impl HogMap {
                 header_height: 20.0,
             };
             let subset = members.as_deref().filter(|members| !members.is_empty());
-            let subset_members = subset.map(<[EntryId]>::len);
-            let location_label =
-                text::location(&entry_name(index, root), &location.path, subset_members);
+            let caption = subset_caption(location, subset, self.metric);
+            let location_label = text::location(&entry_name(index, root), &location.path, caption);
             let result = match subset {
-                Some(members) => treemap::layout_members(index, root, members, rect, params),
-                None => treemap::layout(index, root, rect, params),
+                Some(members) => treemap::layout_members_with_metric(
+                    index,
+                    root,
+                    members,
+                    rect,
+                    params,
+                    self.metric,
+                ),
+                None => treemap::layout_with_metric(index, root, rect, params, self.metric),
             };
+            // A single map is cached: the previous one is dropped once this one replaces it, and
+            // only its highlight results can carry over.
+            let previous = self.cache.take();
+            self.layout_failure = None;
+            self.last_layout = Some(Instant::now());
+            if switched {
+                self.selected = logic::retained_selection(
+                    self.selected,
+                    previous.as_ref().map(|cache| &cache.layout),
+                    result.as_ref().ok(),
+                );
+            }
             match result {
                 Ok(layout) => {
-                    let cells = paint::prepare(ui, index, &layout, subset_members);
-                    let matches = self.filter.matches(index);
-                    let match_counts = logic::match_counts(index, &matches);
+                    let cells = paint::prepare(ui, index, &layout, caption, self.metric);
+                    // Highlight decisions depend on the snapshot and the filter, not on the
+                    // metric or the location, so they are reused while both are unchanged.
+                    let (matches, match_counts) = match previous {
+                        Some(previous)
+                            if previous.key.version == key.version && !self.filter_changed =>
+                        {
+                            (previous.matches, previous.match_counts)
+                        }
+                        _ => {
+                            let matches = self.filter.matches(index);
+                            let counts = logic::match_counts(index, &matches);
+                            (matches, counts)
+                        }
+                    };
                     self.cache = Some(Cache {
+                        key,
                         layout,
                         cells,
                         matches,
                         match_counts,
-                        version: self.version,
-                        location,
                         location_label,
-                        rect,
                     });
-                    self.last_layout = Some(Instant::now());
                     self.filter_changed = false;
                 }
                 Err(error) => {
-                    self.error = Some(format!("{}: {error:?}", text::LAYOUT_ERROR));
-                    self.cache = None;
+                    // The other metric is offered only when its own totals did not overflow.
+                    let other_available = error == LayoutError::SizeOverflow
+                        && index.summary_for(logic::other_metric(self.metric)).is_ok();
+                    self.layout_failure = Some(LayoutFailure {
+                        message: text::layout_error(self.metric, error, other_available),
+                        key,
+                    });
                 }
             }
         }
@@ -992,7 +1115,18 @@ impl HogMap {
             cache.match_counts = logic::match_counts(index, &cache.matches);
             self.filter_changed = false;
         }
-        let Some(cache) = &self.cache else { return };
+        let Some(cache) = &self.cache else {
+            if let Some(failure) = &self.layout_failure {
+                ui.painter().text(
+                    area.center(),
+                    egui::Align2::CENTER_CENTER,
+                    &failure.message,
+                    egui::FontId::proportional(13.0),
+                    palette.message,
+                );
+            }
+            return;
+        };
         // The cell controls below cover the map, so its own response is not hovered; ask whether
         // the pointer is over the map layer instead.
         let pointed = ui
@@ -1013,7 +1147,7 @@ impl HogMap {
             ui.painter().text(
                 area.center(),
                 egui::Align2::CENTER_CENTER,
-                text::EMPTY,
+                text::empty_map(cache.key.metric),
                 egui::FontId::proportional(13.0),
                 palette.message,
             );
@@ -1125,11 +1259,12 @@ impl eframe::App for HogMap {
             }
         }
         if self.about {
+            let about = text::about(self.metric);
             egui::Window::new(text::ABOUT)
                 .open(&mut self.about)
                 .resizable(false)
                 .show(&context, |ui| {
-                    ui.label(text::ABOUT_BODY);
+                    ui.label(about);
                 });
         }
     }
@@ -1215,20 +1350,165 @@ mod tests {
         assert!(app.scan_root.is_none());
     }
 
-    #[test]
-    fn rescan_replaces_snapshot_navigation_selection_header_and_report() {
-        let context = egui::Context::default();
+    fn finished_sample(context: &egui::Context) -> HogMap {
         let mut app = HogMap::with_context(context.clone());
         app.request_scan(ScanRequest::Sample);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            app.drain(&context);
+            app.drain(context);
             if app.reducer.terminal().is_some() && app.producer.is_none() {
                 break;
             }
             assert!(Instant::now() < deadline);
             thread::yield_now();
         }
+        app
+    }
+
+    /// One headless pass of the map; no native window or GL context is created.
+    fn draw_map(context: &egui::Context, app: &mut HogMap) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = context.run_ui(input, |ui| app.map(ui));
+    }
+
+    #[test]
+    fn switching_metric_relays_out_at_once_while_scan_updates_stay_throttled() {
+        let context = egui::Context::default();
+        let mut app = finished_sample(&context);
+        draw_map(&context, &mut app);
+        let logical = app.cache.as_ref().unwrap();
+        assert_eq!(logical.key.metric, SizeMetric::Logical);
+        let logical_layout = logical.layout.clone();
+        let built = logical.key.version;
+
+        // Events still arriving: growth waits for the layout interval.
+        let (_sender, receiver) = event_channel(1);
+        app.receiver = Some(receiver);
+        app.last_layout = Some(Instant::now());
+        app.version += 1;
+        draw_map(&context, &mut app);
+        assert_eq!(app.cache.as_ref().unwrap().key.version, built);
+
+        app.metric = SizeMetric::Allocated;
+        draw_map(&context, &mut app);
+        let cache = app.cache.as_ref().unwrap();
+        assert_eq!(cache.key.metric, SizeMetric::Allocated);
+        assert_eq!(cache.key.version, app.version);
+        let index = app.reducer.index().unwrap();
+        let expected = treemap::layout_with_metric(
+            index,
+            index.root(),
+            cache.key.rect,
+            LayoutParams {
+                min_pixel_area: 400.0,
+                header_height: 20.0,
+            },
+            SizeMetric::Allocated,
+        )
+        .unwrap();
+        assert_eq!(cache.layout, expected);
+        assert_ne!(cache.layout, logical_layout);
+        assert!(
+            cache
+                .cells
+                .iter()
+                .all(|cell| cell.tooltip.contains("observed allocated")),
+            "no cell keeps a logical label"
+        );
+    }
+
+    #[test]
+    fn opened_members_survive_a_metric_switch_with_a_neutral_caption() {
+        let context = egui::Context::default();
+        let mut app = finished_sample(&context);
+        draw_map(&context, &mut app);
+        let placed = &app.cache.as_ref().unwrap().layout.placed;
+        let aggregate = placed
+            .iter()
+            .find(|cell| matches!(cell.node, NodeRef::Aggregate { .. }))
+            .cloned()
+            .expect("the sample groups small items");
+        let NodeRef::Aggregate { parent } = aggregate.node else {
+            unreachable!()
+        };
+        let count = aggregate.members.len();
+        app.zoom(aggregate.node);
+        let opened = app.history.current();
+        draw_map(&context, &mut app);
+        let small = format!("· {count} small item");
+        let label = &app.cache.as_ref().unwrap().location_label;
+        assert!(label.contains(&small));
+
+        app.metric = SizeMetric::Allocated;
+        draw_map(&context, &mut app);
+        assert_eq!(app.history.current(), opened);
+        let cache = app.cache.as_ref().unwrap();
+        assert!(
+            cache
+                .location_label
+                .contains(&format!("· {count} grouped item"))
+        );
+        assert_eq!(cache.layout.placed[0].node, NodeRef::Entry(parent));
+        let index = app.reducer.index().unwrap();
+        let expected = treemap::layout_members_with_metric(
+            index,
+            parent,
+            &aggregate.members,
+            cache.key.rect,
+            LayoutParams {
+                min_pixel_area: 1.0,
+                header_height: 20.0,
+            },
+            SizeMetric::Allocated,
+        )
+        .unwrap();
+        assert_eq!(cache.layout.known_sum, expected.known_sum);
+        assert_ne!(cache.layout.known_sum, aggregate.known_sum);
+
+        app.metric = SizeMetric::Logical;
+        draw_map(&context, &mut app);
+        let label = &app.cache.as_ref().unwrap().location_label;
+        assert!(label.contains(&small), "the grouping metric is shown again");
+    }
+
+    #[test]
+    fn the_metric_choice_is_not_saved() {
+        #[derive(Default)]
+        struct MemoryStorage(std::collections::HashMap<String, String>);
+
+        impl eframe::Storage for MemoryStorage {
+            fn get_string(&self, key: &str) -> Option<String> {
+                self.0.get(key).cloned()
+            }
+
+            fn set_string(&mut self, key: &str, value: String) {
+                self.0.insert(key.to_owned(), value);
+            }
+
+            fn remove_string(&mut self, key: &str) {
+                self.0.remove(key);
+            }
+
+            fn flush(&mut self) {}
+        }
+
+        let mut app = HogMap::with_context(egui::Context::default());
+        app.metric = SizeMetric::Allocated;
+        let mut storage = MemoryStorage::default();
+        eframe::App::save(&mut app, &mut storage);
+        assert_eq!(storage.0.keys().collect::<Vec<_>>(), ["theme"]);
+    }
+
+    #[test]
+    fn rescan_replaces_snapshot_navigation_selection_header_and_report() {
+        let context = egui::Context::default();
+        let mut app = finished_sample(&context);
         assert_eq!(app.reducer.diagnostics().directory_failures, 2);
         assert!(
             app.error.is_none(),
@@ -1249,6 +1529,7 @@ mod tests {
             total_bytes: Some(2),
             capacity: None,
         });
+        app.metric = SizeMetric::Allocated;
         app.rescan();
         app.drain(&context);
         assert_ne!(app.reducer.generation(), generation);
@@ -1260,5 +1541,10 @@ mod tests {
         assert!(app.scan_report.is_none());
         assert!(app.volume.is_none());
         assert!(app.error.is_none());
+        assert_eq!(
+            app.metric,
+            SizeMetric::Allocated,
+            "the view choice outlives the snapshot"
+        );
     }
 }

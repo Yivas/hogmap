@@ -1,6 +1,6 @@
 # HogMap
 
-A disk-space analyzer in development for Windows 11 that draws a scanned folder or drive as a nested treemap of known logical bytes.
+A disk-space analyzer in development for Windows 11 that draws a scanned folder or drive as a nested treemap of known logical bytes, or of observed allocated bytes chosen in View.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -30,7 +30,7 @@ HogMap is aimed at that question. One scan of a folder or a whole volume, and a 
 
 ## Scope and limits
 
-The target is Windows 11 x64 on the desktop and nothing else: no other operating system, no server, no plugin system, no database, no recovery of deleted files. It is meant to read metadata only and never open file contents, and it will not delete, move or clean anything, which also means it will not free space for you. The current map shows known unique logical bytes, not physical or recoverable space. Free/not-yet-scanned blocks, snapshots, export and alternate view modes are not implemented.
+The target is Windows 11 x64 on the desktop and nothing else: no other operating system, no server, no plugin system, no database, no recovery of deleted files. It is meant to read metadata only and never open file contents, and it will not delete, move or clean anything, which also means it will not free space for you. The current map shows known unique logical bytes by default; View → Allocated size switches it to the allocated sizes Windows reported for each file. Neither is physical or recoverable space, and highlight size conditions stay logical. Free/not-yet-scanned blocks, snapshots, export and alternate view modes are not implemented.
 
 ## Roadmap
 

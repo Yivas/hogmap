@@ -1,6 +1,6 @@
 # Understanding sizes
 
-A size is useful only when its meaning is clear. HogMap keeps three different measurements separate. The Windows scanner supplies directory metadata to the current core, and the map uses known unique logical bytes. The synthetic sample remains a separate in-memory fixture.
+A size is useful only when its meaning is clear. HogMap keeps three different measurements separate. The Windows scanner supplies directory metadata to the current core, and the map uses known unique logical bytes unless View → Allocated size is chosen. The synthetic sample remains a separate in-memory fixture.
 
 ## Logical bytes
 
@@ -18,7 +18,9 @@ The index preserves optional allocated size and file identity, and the core now 
 
 Neither metric is a deduplicated physical total, and **physical attribution is not implemented**. Two separate indicators say whether a reconciliation could be trusted: entries with a known size but no identity, which are charged individually, and identities whose known samples disagree, which are counted once while the first charge is kept and no record is dropped. The primary Windows enumeration provides file identities and allocated sizes; its fallback lacks both, so fallback files are counted individually and allocated size stays unknown. The status tooltip and its accessible label report fallback directory counts after the engine returns.
 
-The treemap can weigh either metric: `layout_with_metric` and `layout_members_with_metric` take the metric, and `layout`/`layout_members` keep the logical path. A hardlink adds no area if its identity has already been charged in the selected metric; the first known size for that metric can arrive on a later link. Every entry remains in the index, and an unknown size in the selected metric gets no area rather than being treated as zero. The window still paints logical bytes: there is no metric selector, and free, not-yet-scanned and gray composition remain unimplemented.
+The treemap can weigh either metric: `layout_with_metric` and `layout_members_with_metric` take the metric, and `layout`/`layout_members` keep the logical path. A hardlink adds no area if its identity has already been charged in the selected metric; the first known size for that metric can arrive on a later link. Every entry remains in the index, and an unknown size in the selected metric gets no area rather than being treated as zero.
+
+In the window, View → Logical size / Allocated size chooses the metric. Logical is the default; the choice lasts for the session, survives a rescan and is not saved. The allocated view is labelled **observed**: it shows the allocation Windows reported per file, not physical attribution or space that deleting would recover. Files from the fallback enumeration have no allocated size, so they get no area in that view and the status counts them as unknown. The synthetic sample's allocated sizes are generated (logical sizes rounded up to 4 KiB), not observed. The status detail reports, for the selected metric, unknown sizes, known-size files without identity and conflicting identities separately; an overflow names its metric instead of showing zero. Highlight size conditions stay logical in both views. Free, not-yet-scanned and gray composition remain unimplemented.
 
 ## Windows used and free space
 
@@ -28,7 +30,7 @@ The volume header shows global filesystem free/total capacity separately from ma
 
 ## Folders with no known bytes
 
-The window gives area to known logical bytes; the library can instead weigh known allocated bytes. A folder with no charged bytes in the selected metric gets no rectangle, including when all its known sizes belong to identities already charged elsewhere. Its entries stay in the index, and any unknown sizes keep their unknown signal rather than becoming zero. Whether such a folder should keep a navigable empty cell is a product decision for the window and is not implemented.
+The window gives area to known logical bytes by default, or to known allocated bytes when that view is chosen. A folder with no charged bytes in the selected metric gets no rectangle, including when all its known sizes belong to identities already charged elsewhere. Its entries stay in the index, and any unknown sizes keep their unknown signal rather than becoming zero. Whether such a folder should keep a navigable empty cell is a product decision for the window and is not implemented.
 
 ## What is verified
 

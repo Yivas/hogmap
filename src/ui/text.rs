@@ -1,11 +1,14 @@
 use std::ffi::OsString;
 
 use hogmap::filter::FilterError;
-use hogmap::index::{State, Summary};
+use hogmap::index::{MetricSummary, SizeMetric, State};
 use hogmap::scan::ScanDiagnostics;
 use hogmap::scan_win::{self, ScanReport};
+use hogmap::treemap::LayoutError;
 use hogmap::volume::{CapacityIssue, CapacityMetadata, CapacitySource};
 use std::time::SystemTime;
+
+use super::logic::MetricOverflow;
 
 pub const TITLE: &str = "HogMap";
 pub const FILE: &str = "File";
@@ -39,8 +42,6 @@ pub const OPTIONS: &str = "Options";
 pub const READY: &str = "Ready";
 pub const NO_SPACE: &str = "No space selected";
 pub const CHOOSE_HINT: &str = "Choose a drive or folder to begin, or explore the synthetic sample.";
-pub const UNKNOWN_CAPACITY: &str = "Total: unknown  ·  Free: unknown";
-pub const MAP_METRIC: &str = "Known unique logical bytes";
 pub const NO_SCAN: &str = "No scan started";
 pub const COMPLETE_METADATA: &str = "Complete metadata";
 pub const INCOMPLETE_METADATA: &str = "Incomplete metadata";
@@ -63,9 +64,10 @@ pub const ZOOM_IN: &str = "Zoom into selection";
 pub const ZOOM_OUT: &str = "Zoom out";
 pub const THEME_DARK: &str = "Dark";
 pub const THEME_LIGHT: &str = "Light";
+pub const METRIC_LOGICAL: &str = "Logical size";
+pub const METRIC_ALLOCATED: &str = "Allocated size";
 pub const HELP: &str = "Help";
 pub const ABOUT: &str = "About HogMap";
-pub const ABOUT_BODY: &str = "Read-only Windows folder and drive scanning. No release yet.\nMap area: known logical bytes, charged once per available file identity.\nZero-size and unknown-size items have no map area.\nVolume free/total capacity is separate from map bytes; physical attribution is not implemented.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters and navigation are not saved.";
 pub const BACK: &str = "Back";
 pub const FORWARD: &str = "Forward";
 pub const UP: &str = "Up";
@@ -75,8 +77,47 @@ pub const FILTER: &str = "Highlight";
 pub const FILTER_HINT: &str = "Name or logical size: *.bin;>1mb";
 pub const SAMPLE: &str = "Synthetic sample";
 pub const WAITING: &str = "Waiting for metadata…";
-pub const EMPTY: &str = "No known logical bytes to draw. Unknown sizes are not zero.";
 pub const PARTIAL: &str = "Partial";
+
+/// The metric inside a sentence. Allocated bytes are what Windows reports per file, so the map
+/// calls them observed: they are not a physical attribution or recoverable space.
+fn metric_bytes(metric: SizeMetric) -> &'static str {
+    match metric {
+        SizeMetric::Logical => "logical",
+        SizeMetric::Allocated => "observed allocated",
+    }
+}
+
+fn metric_title(metric: SizeMetric) -> &'static str {
+    match metric {
+        SizeMetric::Logical => "Logical",
+        SizeMetric::Allocated => "Allocated",
+    }
+}
+
+/// The line under the highlight field. Highlight size conditions stay logical in either view.
+pub fn map_metric(metric: SizeMetric) -> &'static str {
+    match metric {
+        SizeMetric::Logical => "Map: known unique logical bytes",
+        SizeMetric::Allocated => {
+            "Map: known unique observed allocated bytes · Highlight uses logical size"
+        }
+    }
+}
+
+pub fn empty_map(metric: SizeMetric) -> String {
+    format!(
+        "No known {} bytes to draw. Unknown sizes are not zero.",
+        metric_bytes(metric)
+    )
+}
+
+pub fn about(metric: SizeMetric) -> String {
+    format!(
+        "Read-only Windows folder and drive scanning. No release yet.\nMap area now: known unique {} bytes. View switches between logical size (the default) and observed allocated size; each is charged once per available file identity.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas, and separate from map bytes.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
+        metric_bytes(metric)
+    )
+}
 
 pub fn scan_state(state: super::logic::ScanState) -> &'static str {
     match state {
@@ -86,7 +127,47 @@ pub fn scan_state(state: super::logic::ScanState) -> &'static str {
         super::logic::ScanState::Failed => "Failed",
     }
 }
-pub const LAYOUT_ERROR: &str = "Cannot lay out this scan";
+pub const LAYOUT_ERROR: &str = "Cannot lay out this map";
+
+/// `other_available` is true only when the other metric's own summary query succeeded.
+pub fn layout_error(metric: SizeMetric, error: LayoutError, other_available: bool) -> String {
+    let reason = match error {
+        LayoutError::SizeOverflow => "the byte total overflowed",
+        LayoutError::UnknownRoot => "the location is not in this scan",
+        LayoutError::InvalidRect => "the map area is invalid",
+        LayoutError::InvalidParams => "the layout parameters are invalid",
+    };
+    let mut text = format!("{LAYOUT_ERROR} by {} size: {reason}.", metric_bytes(metric));
+    if other_available {
+        text.push_str(&format!(
+            " {} size is available in View.",
+            metric_title(super::logic::other_metric(metric))
+        ));
+    }
+    text
+}
+
+/// The strong label beside the location: coverage of the shown metric, or its overflow.
+pub fn completeness(totals: &Result<MetricSummary, MetricOverflow>) -> String {
+    match totals {
+        Ok(summary) if summary.complete => COMPLETE_METADATA.into(),
+        Ok(_) => INCOMPLETE_METADATA.into(),
+        Err(overflow) => format!("{} totals overflowed", metric_title(overflow.metric)),
+    }
+}
+
+fn overflow_detail(overflow: MetricOverflow) -> String {
+    let other = metric_title(super::logic::other_metric(overflow.metric));
+    let other = if overflow.other_available {
+        format!("{other} size is available in View")
+    } else {
+        format!("{other} totals overflowed too")
+    };
+    format!(
+        "{} byte totals overflowed and are not shown | {other}",
+        metric_title(overflow.metric)
+    )
+}
 pub const START_ERROR: &str = "HogMap could not open its window";
 pub const PRODUCER_ERROR: &str = "Could not start the scan thread";
 pub const PRODUCER_PANIC: &str = "The scan thread stopped unexpectedly";
@@ -200,17 +281,38 @@ pub fn filter_error(error: FilterError) -> &'static str {
     }
 }
 
-/// The dataset root, native path components and, when the map is opened inside an aggregate's
-/// small items, the member count that the map draws.
-pub fn location(root: &str, components: &[OsString], members: Option<usize>) -> String {
+/// An aggregate's members opened as the map. `small` holds while the map uses the metric that
+/// grouped them; after a metric switch the same members are only known to be grouped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Subset {
+    pub members: usize,
+    pub small: bool,
+}
+
+fn subset_count(subset: Subset) -> String {
+    if subset.small {
+        aggregate_name(subset.members)
+    } else {
+        let noun = if subset.members == 1 {
+            "grouped item"
+        } else {
+            "grouped items"
+        };
+        format!("{} {noun}", subset.members)
+    }
+}
+
+/// The dataset root, native path components and, when the map is opened inside an aggregate,
+/// the member count that the map draws.
+pub fn location(root: &str, components: &[OsString], subset: Option<Subset>) -> String {
     let mut text = String::from(root);
     for component in components {
         text.push_str(" / ");
         text.push_str(&component.to_string_lossy());
     }
-    if let Some(members) = members {
+    if let Some(subset) = subset {
         text.push_str(" · ");
-        text.push_str(&aggregate_name(members));
+        text.push_str(&subset_count(subset));
     }
     text
 }
@@ -218,7 +320,7 @@ pub fn location(root: &str, components: &[OsString], members: Option<usize>) -> 
 pub fn status(
     state: &str,
     location: &str,
-    summary: Summary,
+    totals: &Result<MetricSummary, MetricOverflow>,
     diagnostics: &ScanDiagnostics,
 ) -> String {
     let protocol = diagnostics.stale_generation_events
@@ -229,37 +331,59 @@ pub fn status(
         + diagnostics.duplicate_directory_outcomes
         + diagnostics.events_after_terminal
         + u64::from(diagnostics.missing_terminal);
-    let completeness = if summary.complete {
-        "Complete"
-    } else {
-        "Incomplete"
-    };
     let failure = diagnostics
         .last_directory_failure_code
         .map_or_else(String::new, |code| {
             format!(" | {}", directory_failure(code))
         });
-    format!(
-        "{state} | {location} | {} | {} visible logical | {} unique map | {completeness}: {} unknown, {} inaccessible, {} partial | {protocol} protocol diagnostics{failure}",
-        files(summary.files),
-        size(summary.known_logical_bytes, false),
-        size(summary.unique_logical_bytes, false),
-        summary.unknown_size_files,
-        diagnostics.directory_failures,
-        diagnostics.partial_directories
-    )
+    let totals = match totals {
+        Ok(summary) => {
+            let metric = metric_bytes(summary.metric);
+            let completeness = if summary.complete {
+                "Complete"
+            } else {
+                "Incomplete"
+            };
+            let conflicts = if summary.conflicting_identities == 1 {
+                "ID"
+            } else {
+                "IDs"
+            };
+            // Identity gaps are confidence indicators, reported apart from coverage.
+            format!(
+                "{} | {} visible {metric} | {} unique map | {completeness}: {} unknown {metric} sizes, {} inaccessible, {} partial | Identity: {} without ID, {} conflicting {conflicts}",
+                files(summary.files),
+                size(summary.known_bytes, false),
+                size(summary.unique_bytes, false),
+                summary.unknown_size_files,
+                diagnostics.directory_failures,
+                diagnostics.partial_directories,
+                files(summary.identity_missing_files),
+                summary.conflicting_identities
+            )
+        }
+        Err(overflow) => overflow_detail(*overflow),
+    };
+    format!("{state} | {location} | {totals} | {protocol} protocol diagnostics{failure}")
 }
 
 pub fn master_status(
     state: &str,
     entries: usize,
-    bytes: u64,
+    totals: &Result<MetricSummary, MetricOverflow>,
     elapsed: std::time::Duration,
 ) -> String {
     let seconds = elapsed.as_secs();
+    let bytes = match totals {
+        Ok(summary) => format!(
+            "{} known {}",
+            size(summary.known_bytes, false),
+            metric_bytes(summary.metric)
+        ),
+        Err(overflow) => format!("{} total overflowed", metric_title(overflow.metric)),
+    };
     format!(
-        "{state}  ·  {entries} entries seen  ·  {} known logical  ·  {}:{:02} elapsed",
-        size(bytes, false),
+        "{state}  ·  {entries} entries seen  ·  {bytes}  ·  {}:{:02} elapsed",
         seconds / 60,
         seconds % 60
     )
@@ -282,7 +406,7 @@ pub fn capacity_detail(metadata: Option<&CapacityMetadata>, now: SystemTime) -> 
     };
     let source = match metadata.source {
         CapacitySource::WindowsActualGlobalFilesystem => {
-            "Windows GetDiskSpaceInformationW: global filesystem, quotas excluded"
+            "Windows GetDiskSpaceInformationW: global filesystem values, not limited by per-user quotas"
         }
     };
     let age = match now.duration_since(metadata.captured_at) {
@@ -294,6 +418,8 @@ pub fn capacity_detail(metadata: Option<&CapacityMetadata>, now: SystemTime) -> 
                 format!("Queried {} min ago", seconds / 60)
             } else if seconds < 86400 {
                 format!("Queried {} h ago", seconds / 3600)
+            } else if seconds < 2 * 86400 {
+                "Queried 1 day ago".into()
             } else {
                 format!("Queried {} days ago", seconds / 86400)
             }
@@ -332,13 +458,17 @@ pub fn aggregate_name(count: usize) -> String {
     };
     format!("{count} {noun}")
 }
-pub fn aggregate_tooltip(count: usize, size: &str) -> String {
-    format!("{} · {size}\nDouble-click to open", aggregate_name(count))
+pub fn aggregate_tooltip(count: usize, size: &str, metric: SizeMetric) -> String {
+    format!(
+        "{} · {size} known unique {}\nDouble-click to open",
+        aggregate_name(count),
+        metric_bytes(metric)
+    )
 }
 
-/// Keeps the parent's name and marks the map as a subset of its small items.
-pub fn subset_name(name: &str, members: usize) -> String {
-    format!("{name} · {}", aggregate_name(members))
+/// Keeps the parent's name and marks the map as a subset of its members.
+pub fn subset_name(name: &str, subset: Subset) -> String {
+    format!("{name} · {}", subset_count(subset))
 }
 pub fn header(name: &str, size: &str) -> String {
     format!("{name} - {size}")
@@ -346,13 +476,18 @@ pub fn header(name: &str, size: &str) -> String {
 pub fn label(name: &str, size: &str) -> String {
     format!("{name}\n{size}")
 }
-pub fn tooltip(name: &str, size: &str, state: &str) -> String {
-    format!("{name}\nKnown unique logical: {size}\nState: {state}")
+pub fn tooltip(name: &str, size: &str, state: &str, metric: SizeMetric) -> String {
+    format!(
+        "{name}\nKnown unique {}: {size}\nState: {state}",
+        metric_bytes(metric)
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::logic::metric_totals;
     use super::*;
+    use hogmap::index::{FileIdentity, Index, Kind, Sizes};
 
     #[test]
     fn scan_codes_distinguish_safety_skips_from_windows_errors() {
@@ -399,10 +534,10 @@ mod tests {
         let detail = status(
             "Finished",
             "Fixture",
-            hogmap::index::Index::new("Fixture".into())
+            &Ok(hogmap::index::Index::new("Fixture".into())
                 .unwrap()
-                .summary()
-                .unwrap(),
+                .summary_for(SizeMetric::Logical)
+                .unwrap()),
             &ScanDiagnostics {
                 last_directory_failure_code: Some(scan_win::SKIP_CLOUD_CODE),
                 directory_failures: 1,
@@ -412,17 +547,109 @@ mod tests {
         assert!(detail.contains("Not opened: cloud tag or recall attributes"));
     }
 
+    fn fixture(files: &[(&str, Sizes, Option<u128>)]) -> Index {
+        let mut index = Index::new("Fixture".into()).unwrap();
+        let root = index.root();
+        for (name, sizes, identity) in files {
+            index
+                .insert(
+                    root,
+                    (*name).into(),
+                    Kind::File,
+                    *sizes,
+                    identity.map(|file| FileIdentity { volume: 1, file }),
+                    State::Complete,
+                )
+                .unwrap();
+        }
+        index.set_state(root, State::Complete).unwrap();
+        index
+    }
+
+    fn sizes(logical: Option<u64>, allocated: Option<u64>) -> Sizes {
+        Sizes { logical, allocated }
+    }
+
+    #[test]
+    fn status_describes_the_selected_metric_and_never_hides_its_overflow() {
+        let quiet = ScanDiagnostics::default();
+        let index = fixture(&[
+            ("zero.bin", sizes(Some(0), Some(0)), Some(1)),
+            ("first.bin", sizes(Some(100), Some(4096)), Some(2)),
+            ("link.bin", sizes(Some(100), Some(8192)), Some(2)),
+            ("loose.bin", sizes(Some(10), Some(4096)), None),
+            ("fallback.bin", sizes(Some(50), None), None),
+        ]);
+        let allocated = metric_totals(&index, SizeMetric::Allocated);
+        assert_eq!(
+            status("Finished", "Fixture", &allocated, &quiet),
+            "Finished | Fixture | 5 files | 16.0 KiB visible observed allocated | 8.0 KiB unique map | Incomplete: 1 unknown observed allocated sizes, 0 inaccessible, 0 partial | Identity: 1 file without ID, 1 conflicting ID | 0 protocol diagnostics"
+        );
+        assert_eq!(completeness(&allocated), INCOMPLETE_METADATA);
+        let logical = metric_totals(&index, SizeMetric::Logical);
+        assert_eq!(
+            status("Finished", "Fixture", &logical, &quiet),
+            "Finished | Fixture | 5 files | 260 B visible logical | 160 B unique map | Complete: 0 unknown logical sizes, 0 inaccessible, 0 partial | Identity: 2 files without ID, 0 conflicting IDs | 0 protocol diagnostics"
+        );
+        assert_eq!(completeness(&logical), COMPLETE_METADATA);
+
+        let allocated_overflow = fixture(&[
+            ("max.bin", sizes(Some(10), Some(u64::MAX)), None),
+            ("one.bin", sizes(Some(20), Some(1)), None),
+        ]);
+        let totals = metric_totals(&allocated_overflow, SizeMetric::Allocated);
+        assert_eq!(
+            status("Finished", "Fixture", &totals, &quiet),
+            "Finished | Fixture | Allocated byte totals overflowed and are not shown | Logical size is available in View | 0 protocol diagnostics"
+        );
+        assert_eq!(
+            master_status("Ready", 3, &totals, std::time::Duration::from_secs(61)),
+            "Ready  ·  3 entries seen  ·  Allocated total overflowed  ·  1:01 elapsed"
+        );
+
+        let both_overflow = fixture(&[
+            ("max.bin", sizes(Some(u64::MAX), Some(u64::MAX)), None),
+            ("one.bin", sizes(Some(1), Some(1)), None),
+        ]);
+        for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+            let detail = status(
+                "Finished",
+                "Fixture",
+                &metric_totals(&both_overflow, metric),
+                &quiet,
+            );
+            assert!(detail.contains("totals overflowed too"), "{detail}");
+            assert!(!detail.contains("available"), "{detail}");
+        }
+    }
+
     #[test]
     fn location_text_joins_root_path_and_resolved_members() {
         let path = [OsString::from("media"), OsString::from("2024")];
         assert_eq!(location("Sample", &path, None), "Sample / media / 2024");
+        let small = |members| Subset {
+            members,
+            small: true,
+        };
         assert_eq!(
-            location("Sample", &path, Some(1)),
+            location("Sample", &path, Some(small(1))),
             "Sample / media / 2024 · 1 small item"
         );
         assert_eq!(
-            location("Sample", &path, Some(4)),
+            location("Sample", &path, Some(small(4))),
             "Sample / media / 2024 · 4 small items"
+        );
+        // After a metric switch the same members are no longer known to be the small ones.
+        assert_eq!(
+            location(
+                "Sample",
+                &path,
+                Some(Subset {
+                    members: 4,
+                    small: false
+                })
+            ),
+            "Sample / media / 2024 · 4 grouped items"
         );
     }
 }

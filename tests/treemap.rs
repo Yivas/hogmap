@@ -510,6 +510,62 @@ fn layout_charges_a_hardlink_once_at_its_first_entry() {
 }
 
 #[test]
+fn the_allocated_layout_charges_a_hardlink_at_its_first_known_allocated_size() {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let root = index.root();
+    let first = insert_dir(&mut index, root, "First");
+    let second = insert_dir(&mut index, root, "Second");
+    let identity = Some(FileIdentity {
+        volume: 1,
+        file: 43,
+    });
+    let mut link = |parent, name: &str, allocated| {
+        index
+            .insert(
+                parent,
+                name.into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(100),
+                    allocated,
+                },
+                identity,
+                State::Complete,
+            )
+            .unwrap()
+    };
+    let original = link(first, "one.bin", None);
+    let later = link(second, "two.bin", Some(4096));
+    index.set_state(root, State::Complete).unwrap();
+    let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+
+    let logical = layout(&index, root, rect, params(1.0, 0.0)).unwrap();
+    assert_eq!(find(&logical, NodeRef::Entry(original)).known_sum, 100);
+    assert!(
+        logical
+            .placed
+            .iter()
+            .all(|placed| placed.node != NodeRef::Entry(later))
+    );
+
+    // The first link has no allocated size, so the later one carries the allocated charge.
+    let allocated =
+        layout_with_metric(&index, root, rect, params(1.0, 0.0), SizeMetric::Allocated).unwrap();
+    assert_eq!(allocated.known_sum, 4096);
+    assert!(allocated.has_unknown);
+    assert_eq!(find(&allocated, NodeRef::Entry(second)).known_sum, 4096);
+    assert_eq!(find(&allocated, NodeRef::Entry(later)).known_sum, 4096);
+    for absent in [original, first] {
+        assert!(
+            allocated
+                .placed
+                .iter()
+                .all(|placed| placed.node != NodeRef::Entry(absent))
+        );
+    }
+}
+
+#[test]
 fn layout_weighs_the_selected_metric_and_keeps_the_logical_path() {
     let mut index = Index::new("Volume".into()).unwrap();
     let root = index.root();

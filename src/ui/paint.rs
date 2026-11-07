@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Shape, Stroke, StrokeKind};
 use hogmap::filter::Match;
-use hogmap::index::{EntryId, Index, Kind, State};
+use hogmap::index::{EntryId, Index, Kind, SizeMetric, State};
 use hogmap::treemap::{Layout, NodeRef, Placed, Rect};
 
 use super::theme::{DEPTH_TONES, Palette, Tone};
@@ -53,8 +53,15 @@ pub fn rect(rect: Rect) -> egui::Rect {
     )
 }
 
-/// `subset` is the member count being drawn when the map shows an aggregate's members only.
-pub fn prepare(ui: &egui::Ui, index: &Index, layout: &Layout, subset: Option<usize>) -> Vec<Cell> {
+/// `subset` describes the members being drawn when the map shows an aggregate's members only.
+/// `metric` is the one `layout` was weighed by; tooltips and accessible labels name it.
+pub fn prepare(
+    ui: &egui::Ui,
+    index: &Index,
+    layout: &Layout,
+    subset: Option<text::Subset>,
+    metric: SizeMetric,
+) -> Vec<Cell> {
     // The layout places parents before their descendants, so a parent's depth is always known.
     let mut depths: HashMap<EntryId, usize> = HashMap::new();
     layout
@@ -74,8 +81,8 @@ pub fn prepare(ui: &egui::Ui, index: &Index, layout: &Layout, subset: Option<usi
                     depths.insert(id, depth);
                     let name = match subset {
                         // The root cell stays the parent directory; the suffix names the subset.
-                        Some(members) if position == 0 => {
-                            text::subset_name(&entry.name.to_string_lossy(), members)
+                        Some(subset) if position == 0 => {
+                            text::subset_name(&entry.name.to_string_lossy(), subset)
                         }
                         _ => entry.name.to_string_lossy().into_owned(),
                     };
@@ -91,9 +98,9 @@ pub fn prepare(ui: &egui::Ui, index: &Index, layout: &Layout, subset: Option<usi
             let size = text::size(cell.known_sum, cell.has_unknown);
             let state_label = text::state(state);
             let tooltip = if matches!(cell.node, NodeRef::Aggregate { .. }) {
-                text::aggregate_tooltip(cell.members.len(), &size)
+                text::aggregate_tooltip(cell.members.len(), &size, metric)
             } else {
-                text::tooltip(&name, &size, state_label)
+                text::tooltip(&name, &size, state_label, metric)
             };
             let surface = if matches!(state, State::Partial | State::Inaccessible | State::Stale) {
                 Surface::Incomplete {

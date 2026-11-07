@@ -737,6 +737,41 @@ fn conflicting_samples_of_one_identity_keep_the_first_charge_and_count_once() {
 }
 
 #[test]
+fn an_allocated_conflict_leaves_consistent_logical_samples_unmarked() {
+    let identity = Some(FileIdentity {
+        volume: 1,
+        file: 507,
+    });
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    for (name, allocated) in [("first.bin", 4096), ("second.bin", 8192)] {
+        insert_file(
+            &mut index,
+            root,
+            name,
+            Sizes {
+                logical: Some(100),
+                allocated: Some(allocated),
+            },
+            identity,
+        );
+    }
+    index.set_state(root, State::Complete).unwrap();
+
+    let logical = index.summary_for(SizeMetric::Logical).unwrap();
+    assert_eq!(logical.conflicting_identities, 0);
+    assert_eq!((logical.unique_bytes, logical.shared_bytes), (100, 100));
+    let allocated = index.summary_for(SizeMetric::Allocated).unwrap();
+    assert_eq!(allocated.conflicting_identities, 1);
+    assert_eq!(
+        (allocated.unique_bytes, allocated.shared_bytes),
+        (4096, 8192),
+        "the first allocated charge is kept, not the larger sample"
+    );
+    assert!(allocated.complete);
+}
+
+#[test]
 fn unequal_known_samples_are_not_permutation_invariant() {
     let identity = Some(FileIdentity {
         volume: 1,
