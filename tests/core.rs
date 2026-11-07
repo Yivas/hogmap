@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 
 use hogmap::filter::{Filter, FilterError, MAX_CONDITIONS, MAX_EXPRESSION_BYTES, Match};
-use hogmap::index::{FileIdentity, Index, IndexError, Kind, Sizes, State};
+use hogmap::index::{EntryId, FileIdentity, Index, IndexError, Kind, SizeMetric, Sizes, State};
 
 #[test]
 fn filters_follow_the_documented_name_size_and_combination_rules() {
@@ -495,4 +495,381 @@ fn non_unicode_windows_names_are_preserved_and_not_silently_excluded() {
     let filter = Filter::parse("*.jpg;>1mb").unwrap();
     assert_eq!(filter.evaluate(&name, None), Match::Unknown);
     assert_eq!(filter.evaluate(&name, Some(0)), Match::No);
+}
+
+fn insert_file(
+    index: &mut Index,
+    parent: EntryId,
+    name: &str,
+    sizes: Sizes,
+    identity: Option<FileIdentity>,
+) -> EntryId {
+    index
+        .insert(
+            parent,
+            name.into(),
+            Kind::File,
+            sizes,
+            identity,
+            State::Complete,
+        )
+        .unwrap()
+}
+
+#[test]
+fn each_metric_charges_the_first_known_size_of_a_shared_identity() {
+    let identity = Some(FileIdentity {
+        volume: 1,
+        file: 501,
+    });
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    insert_file(
+        &mut index,
+        root,
+        "first.bin",
+        Sizes {
+            logical: Some(1000),
+            allocated: None,
+        },
+        identity,
+    );
+    insert_file(
+        &mut index,
+        root,
+        "second.bin",
+        Sizes {
+            logical: Some(1000),
+            allocated: Some(4096),
+        },
+        identity,
+    );
+    index.set_state(root, State::Complete).unwrap();
+
+    let logical = index.summary_for(SizeMetric::Logical).unwrap();
+    assert_eq!(logical.metric, SizeMetric::Logical);
+    assert_eq!(logical.files, 2);
+    assert_eq!(logical.known_bytes, 2000);
+    assert_eq!(logical.unique_bytes, 1000);
+    assert_eq!(logical.shared_bytes, 1000);
+    assert_eq!(logical.unknown_size_files, 0);
+    assert_eq!(logical.conflicting_identities, 0);
+    assert!(logical.complete);
+
+    // The allocated charge waits for its own first known sample, on the second entry.
+    let allocated = index.summary_for(SizeMetric::Allocated).unwrap();
+    assert_eq!(allocated.metric, SizeMetric::Allocated);
+    assert_eq!(allocated.known_bytes, 4096);
+    assert_eq!(allocated.unique_bytes, 4096);
+    assert_eq!(allocated.shared_bytes, 0);
+    assert_eq!(allocated.unknown_size_files, 1);
+    assert_eq!(allocated.conflicting_identities, 0);
+    assert!(!allocated.complete);
+}
+
+#[test]
+fn an_unknown_logical_size_does_not_skip_the_allocated_charge() {
+    let identity = Some(FileIdentity {
+        volume: 1,
+        file: 502,
+    });
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    insert_file(
+        &mut index,
+        root,
+        "first.bin",
+        Sizes {
+            logical: None,
+            allocated: Some(8192),
+        },
+        identity,
+    );
+    insert_file(
+        &mut index,
+        root,
+        "second.bin",
+        Sizes {
+            logical: Some(500),
+            allocated: Some(8192),
+        },
+        identity,
+    );
+    index.set_state(root, State::Complete).unwrap();
+
+    let logical = index.summary_for(SizeMetric::Logical).unwrap();
+    assert_eq!(logical.known_bytes, 500);
+    assert_eq!(logical.unique_bytes, 500);
+    assert_eq!(logical.shared_bytes, 0);
+    assert_eq!(logical.unknown_size_files, 1);
+    assert!(!logical.complete);
+
+    let allocated = index.summary_for(SizeMetric::Allocated).unwrap();
+    assert_eq!(allocated.known_bytes, 16_384);
+    assert_eq!(allocated.unique_bytes, 8192);
+    assert_eq!(allocated.shared_bytes, 8192);
+    assert_eq!(allocated.unknown_size_files, 0);
+    assert_eq!(allocated.conflicting_identities, 0);
+    assert!(allocated.complete);
+
+    // `summary()` keeps the legacy logical answer for the same index.
+    let legacy = index.summary().unwrap();
+    assert_eq!(legacy.known_logical_bytes, logical.known_bytes);
+    assert_eq!(legacy.unique_logical_bytes, logical.unique_bytes);
+    assert_eq!(legacy.shared_logical_bytes, logical.shared_bytes);
+    assert_eq!(legacy.complete, logical.complete);
+}
+
+#[test]
+fn a_known_zero_size_consumes_the_identity_charge_unlike_an_unknown_size() {
+    let identity = Some(FileIdentity {
+        volume: 1,
+        file: 503,
+    });
+    let mut zero_first = Index::new("Synthetic".into()).unwrap();
+    let root = zero_first.root();
+    insert_file(
+        &mut zero_first,
+        root,
+        "zero.bin",
+        Sizes {
+            logical: Some(0),
+            allocated: None,
+        },
+        identity,
+    );
+    insert_file(
+        &mut zero_first,
+        root,
+        "later.bin",
+        Sizes {
+            logical: Some(500),
+            allocated: None,
+        },
+        identity,
+    );
+    zero_first.set_state(root, State::Complete).unwrap();
+    let logical = zero_first.summary_for(SizeMetric::Logical).unwrap();
+    assert_eq!(logical.known_bytes, 500);
+    assert_eq!(
+        logical.unique_bytes, 0,
+        "the known zero was the first charge"
+    );
+    assert_eq!(logical.shared_bytes, 500);
+    assert_eq!(logical.unknown_size_files, 0);
+    assert_eq!(
+        logical.conflicting_identities, 1,
+        "zero and 500 are unequal known samples of one identity"
+    );
+
+    let mut unknown_first = Index::new("Synthetic".into()).unwrap();
+    let root = unknown_first.root();
+    insert_file(
+        &mut unknown_first,
+        root,
+        "unknown.bin",
+        Sizes::default(),
+        identity,
+    );
+    insert_file(
+        &mut unknown_first,
+        root,
+        "later.bin",
+        Sizes {
+            logical: Some(500),
+            allocated: None,
+        },
+        identity,
+    );
+    unknown_first.set_state(root, State::Complete).unwrap();
+    let logical = unknown_first.summary_for(SizeMetric::Logical).unwrap();
+    assert_eq!(logical.unique_bytes, 500);
+    assert_eq!(logical.shared_bytes, 0);
+    assert_eq!(logical.unknown_size_files, 1);
+    assert_eq!(logical.conflicting_identities, 0);
+}
+
+#[test]
+fn conflicting_samples_of_one_identity_keep_the_first_charge_and_count_once() {
+    let repeated = FileIdentity {
+        volume: 1,
+        file: 504,
+    };
+    let other = FileIdentity {
+        volume: 1,
+        file: 505,
+    };
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    for (name, bytes, identity) in [
+        ("first.bin", 100, repeated),
+        ("second.bin", 300, repeated),
+        ("third.bin", 300, repeated),
+        ("fourth.bin", 7, other),
+        ("fifth.bin", 9, other),
+    ] {
+        insert_file(
+            &mut index,
+            root,
+            name,
+            Sizes {
+                logical: Some(bytes),
+                allocated: None,
+            },
+            Some(identity),
+        );
+    }
+    index.set_state(root, State::Complete).unwrap();
+
+    let logical = index.summary_for(SizeMetric::Logical).unwrap();
+    assert_eq!(logical.known_bytes, 100 + 300 + 300 + 7 + 9);
+    assert_eq!(logical.unique_bytes, 100 + 7, "the first charge is kept");
+    assert_eq!(logical.shared_bytes, 300 + 300 + 9);
+    assert_eq!(
+        logical.conflicting_identities, 2,
+        "one per identity, not one per disagreeing sample"
+    );
+    assert!(
+        logical.complete,
+        "a conflict is not an unknown size or an incomplete entry state"
+    );
+    assert_eq!(index.len(), 6, "no record is dropped");
+}
+
+#[test]
+fn unequal_known_samples_are_not_permutation_invariant() {
+    let identity = Some(FileIdentity {
+        volume: 1,
+        file: 506,
+    });
+    for (first, second, unique, shared) in [(100, 300, 100, 300), (300, 100, 300, 100)] {
+        let mut index = Index::new("Synthetic".into()).unwrap();
+        let root = index.root();
+        for (name, bytes) in [("first.bin", first), ("second.bin", second)] {
+            insert_file(
+                &mut index,
+                root,
+                name,
+                Sizes {
+                    logical: Some(bytes),
+                    allocated: None,
+                },
+                identity,
+            );
+        }
+        index.set_state(root, State::Complete).unwrap();
+        let logical = index.summary_for(SizeMetric::Logical).unwrap();
+        assert_eq!(logical.unique_bytes, unique, "order {first} then {second}");
+        assert_eq!(logical.shared_bytes, shared, "order {first} then {second}");
+        assert_eq!(logical.conflicting_identities, 1);
+    }
+}
+
+#[test]
+fn known_sizes_without_identity_are_charged_individually_and_reported() {
+    let mut index = Index::new("Synthetic".into()).unwrap();
+    let root = index.root();
+    insert_file(
+        &mut index,
+        root,
+        "a.bin",
+        Sizes {
+            logical: Some(7),
+            allocated: Some(4096),
+        },
+        None,
+    );
+    insert_file(
+        &mut index,
+        root,
+        "b.bin",
+        Sizes {
+            logical: Some(7),
+            allocated: None,
+        },
+        None,
+    );
+    insert_file(&mut index, root, "c.bin", Sizes::default(), None);
+    index.set_state(root, State::Complete).unwrap();
+
+    let logical = index.summary_for(SizeMetric::Logical).unwrap();
+    assert_eq!(logical.unique_bytes, 14);
+    assert_eq!(logical.shared_bytes, 0);
+    assert_eq!(logical.identity_missing_files, 2);
+    assert_eq!(logical.unknown_size_files, 1);
+
+    let allocated = index.summary_for(SizeMetric::Allocated).unwrap();
+    assert_eq!(allocated.unique_bytes, 4096);
+    assert_eq!(allocated.shared_bytes, 0);
+    assert_eq!(allocated.identity_missing_files, 1);
+    assert_eq!(allocated.unknown_size_files, 2);
+}
+
+#[test]
+fn overflow_of_one_metric_does_not_poison_the_other() {
+    let mut logical_overflow = Index::new("Synthetic".into()).unwrap();
+    let root = logical_overflow.root();
+    insert_file(
+        &mut logical_overflow,
+        root,
+        "max.bin",
+        Sizes {
+            logical: Some(u64::MAX),
+            allocated: Some(10),
+        },
+        None,
+    );
+    insert_file(
+        &mut logical_overflow,
+        root,
+        "one.bin",
+        Sizes {
+            logical: Some(1),
+            allocated: Some(20),
+        },
+        None,
+    );
+    logical_overflow.set_state(root, State::Complete).unwrap();
+    assert_eq!(logical_overflow.summary(), Err(IndexError::SizeOverflow));
+    assert_eq!(
+        logical_overflow.summary_for(SizeMetric::Logical),
+        Err(IndexError::SizeOverflow)
+    );
+    let allocated = logical_overflow.summary_for(SizeMetric::Allocated).unwrap();
+    assert_eq!(allocated.known_bytes, 30);
+    assert_eq!(allocated.unique_bytes, 30);
+    assert!(allocated.complete);
+    assert_eq!(logical_overflow.len(), 3, "inserted records are kept");
+
+    let mut allocated_overflow = Index::new("Synthetic".into()).unwrap();
+    let root = allocated_overflow.root();
+    insert_file(
+        &mut allocated_overflow,
+        root,
+        "max.bin",
+        Sizes {
+            logical: Some(10),
+            allocated: Some(u64::MAX),
+        },
+        None,
+    );
+    insert_file(
+        &mut allocated_overflow,
+        root,
+        "one.bin",
+        Sizes {
+            logical: Some(20),
+            allocated: Some(1),
+        },
+        None,
+    );
+    allocated_overflow.set_state(root, State::Complete).unwrap();
+    let logical = allocated_overflow.summary().unwrap();
+    assert_eq!(logical.known_logical_bytes, 30);
+    assert!(logical.complete);
+    assert_eq!(
+        allocated_overflow.summary_for(SizeMetric::Allocated),
+        Err(IndexError::SizeOverflow)
+    );
+    assert_eq!(allocated_overflow.len(), 3);
 }

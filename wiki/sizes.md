@@ -14,7 +14,11 @@ The index summary reports visible logical bytes (`known_logical_bytes`), bytes c
 
 Allocated storage can differ from logical length because of compression, sparse regions, additional streams and filesystem allocation rules. Multiple hardlink names can also refer to the same physical file.
 
-The index preserves optional allocated size and file identity, but **physical attribution is not implemented yet**. `known_logical_bytes` counts every visible file entry, hardlinks included. `unique_logical_bytes` charges a file identity once, at its first entry with a known size, and `shared_logical_bytes` holds the later names, so the visible and unique totals stay distinguishable. Neither is a deduplicated physical total, and neither may be labelled recoverable space. The primary Windows enumeration provides file identities and allocated sizes; its fallback lacks both, so fallback files are counted individually and allocated size stays unknown. The status tooltip and its accessible label report fallback directory counts after the engine returns. The treemap layout uses the unique charge: a later hardlink has no rectangle, although its entry remains in the index.
+The index preserves optional allocated size and file identity, and the core now aggregates **observed allocated bytes** as a metric of its own, independently of logical bytes. In each metric a file identity is charged once, at its first entry with a known size for that metric, and later names add shared bytes. A known logical size does not consume the allocated charge, and an unknown logical size does not skip a known allocated size. `Some(0)` is a known size; `None` is unknown and is never treated as zero.
+
+Neither metric is a deduplicated physical total, and **physical attribution is not implemented**. Two separate indicators say whether a reconciliation could be trusted: entries with a known size but no identity, which are charged individually, and identities whose known samples disagree, which are counted once while the first charge is kept and no record is dropped. The primary Windows enumeration provides file identities and allocated sizes; its fallback lacks both, so fallback files are counted individually and allocated size stays unknown. The status tooltip and its accessible label report fallback directory counts after the engine returns.
+
+The treemap can weigh either metric: `layout_with_metric` and `layout_members_with_metric` take the metric, and `layout`/`layout_members` keep the logical path. A hardlink adds no area if its identity has already been charged in the selected metric; the first known size for that metric can arrive on a later link. Every entry remains in the index, and an unknown size in the selected metric gets no area rather than being treated as zero. The window still paints logical bytes: there is no metric selector, and free, not-yet-scanned and gray composition remain unimplemented.
 
 ## Windows used and free space
 
@@ -24,10 +28,10 @@ The volume header shows global filesystem free/total capacity separately from ma
 
 ## Folders with no known bytes
 
-The layout can only give area to known logical bytes. A folder whose content is entirely unknown sizes, inaccessible items or later hardlink names has no charged bytes, so the current layout gives it no rectangle. Its entries stay in the index and its subtree keeps reporting unknown content, so nothing is presented as zero. Whether such a folder should keep a navigable empty cell is a product decision for the window and is not implemented.
+The window gives area to known logical bytes; the library can instead weigh known allocated bytes. A folder with no charged bytes in the selected metric gets no rectangle, including when all its known sizes belong to identities already charged elsewhere. Its entries stay in the index, and any unknown sizes keep their unknown signal rather than becoming zero. Whether such a folder should keep a navigable empty cell is a product decision for the window and is not implemented.
 
 ## What is verified
 
-The public API tests cover known versus unknown sizes, zero-byte files, logical hardlink entries and overflow using synthetic metadata. Windows engine tests also scan small temporary fixtures with known lengths and hardlinks. They do not establish whole-volume reconciliation, compressed/sparse/ADS attribution or recoverable-space totals.
+The public API tests cover known versus unknown sizes, zero-byte files, logical and allocated hardlink charges, missing identities, conflicting samples, per-metric overflow and different logical/allocated geometry using synthetic metadata. Windows engine tests also scan small temporary fixtures with known lengths and hardlinks. They do not establish whole-volume reconciliation, compressed/sparse/ADS attribution or recoverable-space totals.
 
 For the exact data model, read the [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md). To see how logical sizes affect a query, continue with [filters](./filters.md).

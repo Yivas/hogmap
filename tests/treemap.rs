@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 use std::f32::consts::PI;
 
-use hogmap::index::{EntryId, FileIdentity, Index, Kind, Sizes, State};
-use hogmap::treemap::{Layout, LayoutError, LayoutParams, NodeRef, Placed, Rect, layout};
+use hogmap::index::{EntryId, FileIdentity, Index, Kind, SizeMetric, Sizes, State};
+use hogmap::treemap::{
+    Layout, LayoutError, LayoutParams, NodeRef, Placed, Rect, layout, layout_members_with_metric,
+    layout_with_metric,
+};
 
 fn params(min_pixel_area: f32, header_height: f32) -> LayoutParams {
     LayoutParams {
@@ -34,6 +37,19 @@ fn insert_file(index: &mut Index, parent: EntryId, name: &str, bytes: Option<u64
                 logical: bytes,
                 allocated: bytes,
             },
+            None,
+            State::Complete,
+        )
+        .unwrap()
+}
+
+fn insert_sized_file(index: &mut Index, parent: EntryId, name: &str, sizes: Sizes) -> EntryId {
+    index
+        .insert(
+            parent,
+            name.into(),
+            Kind::File,
+            sizes,
             None,
             State::Complete,
         )
@@ -491,4 +507,135 @@ fn layout_charges_a_hardlink_once_at_its_first_entry() {
             .iter()
             .all(|placed| placed.node != NodeRef::Entry(second))
     );
+}
+
+#[test]
+fn layout_weighs_the_selected_metric_and_keeps_the_logical_path() {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let root = index.root();
+    let big = insert_sized_file(
+        &mut index,
+        root,
+        "big.bin",
+        Sizes {
+            logical: Some(1_000_000),
+            allocated: Some(100),
+        },
+    );
+    let smalls: Vec<EntryId> = (0..3)
+        .map(|number| {
+            insert_sized_file(
+                &mut index,
+                root,
+                &format!("small_{number}.bin"),
+                Sizes {
+                    logical: Some(100),
+                    allocated: Some(1_000_000),
+                },
+            )
+        })
+        .collect();
+    index.set_state(root, State::Complete).unwrap();
+    let rect = Rect::new(0.0, 0.0, 1000.0, 1000.0);
+
+    let logical =
+        layout_with_metric(&index, root, rect, params(5000.0, 0.0), SizeMetric::Logical).unwrap();
+    assert_eq!(
+        logical,
+        layout(&index, root, rect, params(5000.0, 0.0)).unwrap()
+    );
+    assert_eq!(logical.known_sum, 1_000_300);
+    let logical_aggregate = find(&logical, NodeRef::Aggregate { parent: root });
+    assert_eq!(logical_aggregate.known_sum, 300);
+    assert_eq!(logical_aggregate.members, smalls);
+    assert_proportional(
+        find(&logical, NodeRef::Entry(big)).rect,
+        logical.content.area(),
+        1_000_000,
+        1_000_300,
+    );
+
+    let allocated = layout_with_metric(
+        &index,
+        root,
+        rect,
+        params(5000.0, 0.0),
+        SizeMetric::Allocated,
+    )
+    .unwrap();
+    assert_eq!(allocated.known_sum, 3_000_100);
+    let allocated_aggregate = find(&allocated, NodeRef::Aggregate { parent: root });
+    assert_eq!(allocated_aggregate.known_sum, 100);
+    assert_eq!(allocated_aggregate.members, vec![big]);
+    for id in &smalls {
+        assert_proportional(
+            find(&allocated, NodeRef::Entry(*id)).rect,
+            allocated.content.area(),
+            1_000_000,
+            3_000_100,
+        );
+    }
+
+    // Opening the logical aggregate's members re-weighs the same IDs by the chosen metric.
+    let logical_detail = layout_members_with_metric(
+        &index,
+        root,
+        &logical_aggregate.members,
+        rect,
+        params(1.0, 0.0),
+        SizeMetric::Logical,
+    )
+    .unwrap();
+    assert_eq!(logical_detail.known_sum, 300);
+    let allocated_detail = layout_members_with_metric(
+        &index,
+        root,
+        &logical_aggregate.members,
+        rect,
+        params(1.0, 0.0),
+        SizeMetric::Allocated,
+    )
+    .unwrap();
+    assert_eq!(allocated_detail.known_sum, 3_000_000);
+    assert_eq!(allocated_detail.placed.len(), 4);
+}
+
+#[test]
+fn an_unknown_size_in_the_selected_metric_has_no_area_but_the_other_metric_places_it() {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let root = index.root();
+    let file = insert_sized_file(
+        &mut index,
+        root,
+        "fallback.bin",
+        Sizes {
+            logical: Some(4096),
+            allocated: None,
+        },
+    );
+    index.set_state(root, State::Complete).unwrap();
+    let rect = Rect::new(0.0, 0.0, 100.0, 100.0);
+
+    let logical = layout(&index, root, rect, params(1.0, 0.0)).unwrap();
+    assert!(!logical.has_unknown);
+    assert_eq!(logical.known_sum, 4096);
+    assert!(
+        logical
+            .placed
+            .iter()
+            .any(|placed| placed.node == NodeRef::Entry(file))
+    );
+
+    let allocated =
+        layout_with_metric(&index, root, rect, params(1.0, 0.0), SizeMetric::Allocated).unwrap();
+    assert!(allocated.has_unknown);
+    assert_eq!(allocated.known_sum, 0);
+    assert!(
+        allocated
+            .placed
+            .iter()
+            .all(|placed| placed.node != NodeRef::Entry(file)),
+        "an unknown allocated size gets no area and is not zero"
+    );
+    assert_eq!(index.get(file).unwrap().sizes.allocated, None);
 }

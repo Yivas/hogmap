@@ -1,5 +1,5 @@
 use crate::name_arena::{NameArena, NameRef};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 
@@ -51,6 +51,31 @@ pub struct Sizes {
     pub allocated: Option<u64>,
 }
 
+/// Which byte count a summary or a layout weighs. `Allocated` is the observed allocation size of
+/// an entry, not recoverable space and not a reconciliation with volume-used bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SizeMetric {
+    Logical,
+    Allocated,
+}
+
+impl SizeMetric {
+    /// Position of this metric in the per-metric totals array.
+    fn slot(self) -> usize {
+        match self {
+            Self::Logical => 0,
+            Self::Allocated => 1,
+        }
+    }
+
+    pub(crate) fn of(self, sizes: Sizes) -> Option<u64> {
+        match self {
+            Self::Logical => sizes.logical,
+            Self::Allocated => sizes.allocated,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Entry<'a> {
     pub parent: Option<EntryId>,
@@ -85,28 +110,56 @@ pub struct Summary {
     pub complete: bool,
 }
 
+/// Totals for one size metric, kept as entries are appended.
+#[derive(Debug, Default)]
+struct MetricTotals {
+    known_bytes: u64,
+    unique_bytes: u64,
+    shared_bytes: u64,
+    unknown_size_files: usize,
+    identity_missing_files: usize,
+    conflicting_identities: usize,
+    overflowed: bool,
+}
+
 /// File totals kept as entries are appended, so `summary()` does not walk them again.
 #[derive(Debug, Default)]
 struct FileTotals {
     files: usize,
-    known_logical_bytes: u64,
-    unique_logical_bytes: u64,
-    shared_logical_bytes: u64,
-    unknown_size_files: usize,
-    overflowed: bool,
+    metrics: [MetricTotals; 2],
+}
+
+/// Totals for one size metric. `complete` covers entry states and known sizes of this metric only:
+/// it does not prove consistent identities or an exclusive physical attribution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetricSummary {
+    pub metric: SizeMetric,
+    pub files: usize,
+    /// Sum of every visible file entry with a known size for this metric, hardlinks included.
+    pub known_bytes: u64,
+    /// Bytes charged once per file identity; identity-less files count individually.
+    pub unique_bytes: u64,
+    /// Bytes of later entries that reused an already charged identity.
+    pub shared_bytes: u64,
+    pub unknown_size_files: usize,
+    /// Known-size entries of this metric without an identity, counted individually.
+    pub identity_missing_files: usize,
+    /// Identities whose known samples for this metric disagree; each identity counts once.
+    pub conflicting_identities: usize,
+    pub complete: bool,
 }
 
 /// Append-only metadata snapshot. IDs identify entries, not physical files.
 ///
-/// The index keeps one entry per charged file identity and a count of incomplete entries to
-/// answer `summary()` in constant time; that set is the memory cost of hardlink accounting.
+/// The index keeps one accounting row per file identity and a count of incomplete entries to
+/// answer `summary()` in constant time; that table is the memory cost of hardlink accounting.
 #[derive(Debug)]
 pub struct Index {
     entries: Vec<StoredEntry>,
     names: NameArena,
     identities: Vec<StoredIdentity>,
     totals: FileTotals,
-    charged_identities: HashSet<StoredIdentity>,
+    identity_charges: HashMap<StoredIdentity, IdentityCharge>,
     incomplete_entries: usize,
 }
 
@@ -127,7 +180,7 @@ impl Index {
             names,
             identities: Vec::new(),
             totals: FileTotals::default(),
-            charged_identities: HashSet::new(),
+            identity_charges: HashMap::new(),
             incomplete_entries: 1,
         })
     }
@@ -141,8 +194,8 @@ impl Index {
             name_capacity_bytes: self.names.capacity(),
             name_boundary_capacity_bytes: self.names.boundary_capacity_bytes(),
             identity_bytes: self.identities.capacity() * std::mem::size_of::<StoredIdentity>(),
-            charged_identity_bytes: hash_bytes::<StoredIdentity>(
-                self.charged_identities.capacity(),
+            charged_identity_bytes: hash_bytes::<(StoredIdentity, IdentityCharge)>(
+                self.identity_charges.capacity(),
             ),
         }
     }
@@ -206,31 +259,48 @@ impl Index {
             return;
         }
         self.totals.files += 1;
-        let Some(bytes) = entry.sizes.logical else {
-            self.totals.unknown_size_files += 1;
+        // Each metric charges independently: an unknown logical size must not skip a known
+        // allocated size, and one metric's overflow must not hide the other's totals.
+        self.account_metric(SizeMetric::Logical, entry.sizes.logical, entry.identity);
+        self.account_metric(SizeMetric::Allocated, entry.sizes.allocated, entry.identity);
+    }
+
+    fn account_metric(
+        &mut self,
+        metric: SizeMetric,
+        size: Option<u64>,
+        identity: Option<FileIdentity>,
+    ) {
+        let totals = &mut self.totals.metrics[metric.slot()];
+        let Some(bytes) = size else {
+            totals.unknown_size_files += 1;
             return;
         };
-        accumulate(
-            &mut self.totals.known_logical_bytes,
-            bytes,
-            &mut self.totals.overflowed,
-        );
-        let first_charge = match entry.identity {
-            Some(identity) => self.charged_identities.insert(identity.into()),
-            None => true,
+        accumulate(&mut totals.known_bytes, bytes, &mut totals.overflowed);
+        let Some(identity) = identity else {
+            // Without an identity the size cannot be deduplicated, so it is charged on its own
+            // and reported as a separate confidence gap.
+            totals.identity_missing_files += 1;
+            accumulate(&mut totals.unique_bytes, bytes, &mut totals.overflowed);
+            return;
         };
-        if first_charge {
-            accumulate(
-                &mut self.totals.unique_logical_bytes,
-                bytes,
-                &mut self.totals.overflowed,
-            );
-        } else {
-            accumulate(
-                &mut self.totals.shared_logical_bytes,
-                bytes,
-                &mut self.totals.overflowed,
-            );
+        let sample = self
+            .identity_charges
+            .entry(identity.into())
+            .or_default()
+            .for_metric_mut(metric);
+        match sample.first {
+            None => {
+                sample.first = Some(bytes);
+                accumulate(&mut totals.unique_bytes, bytes, &mut totals.overflowed);
+            }
+            Some(first) => {
+                if first != bytes && !sample.conflicted {
+                    sample.conflicted = true;
+                    totals.conflicting_identities += 1;
+                }
+                accumulate(&mut totals.shared_bytes, bytes, &mut totals.overflowed);
+            }
         }
     }
 
@@ -298,16 +368,34 @@ impl Index {
     /// at the first entry with that identity and a known size; no physical total is inferred.
     /// The totals are maintained on insertion, so this call does not walk the index again.
     pub fn summary(&self) -> Result<Summary, IndexError> {
-        if self.totals.overflowed {
+        let totals = self.summary_for(SizeMetric::Logical)?;
+        Ok(Summary {
+            files: totals.files,
+            known_logical_bytes: totals.known_bytes,
+            unique_logical_bytes: totals.unique_bytes,
+            shared_logical_bytes: totals.shared_bytes,
+            unknown_size_files: totals.unknown_size_files,
+            complete: totals.complete,
+        })
+    }
+
+    /// Totals for one metric, maintained on insertion. Overflow of the requested metric returns
+    /// `SizeOverflow`; the other metric keeps its own totals and overflow state.
+    pub fn summary_for(&self, metric: SizeMetric) -> Result<MetricSummary, IndexError> {
+        let totals = &self.totals.metrics[metric.slot()];
+        if totals.overflowed {
             return Err(IndexError::SizeOverflow);
         }
-        Ok(Summary {
+        Ok(MetricSummary {
+            metric,
             files: self.totals.files,
-            known_logical_bytes: self.totals.known_logical_bytes,
-            unique_logical_bytes: self.totals.unique_logical_bytes,
-            shared_logical_bytes: self.totals.shared_logical_bytes,
-            unknown_size_files: self.totals.unknown_size_files,
-            complete: self.incomplete_entries == 0 && self.totals.unknown_size_files == 0,
+            known_bytes: totals.known_bytes,
+            unique_bytes: totals.unique_bytes,
+            shared_bytes: totals.shared_bytes,
+            unknown_size_files: totals.unknown_size_files,
+            identity_missing_files: totals.identity_missing_files,
+            conflicting_identities: totals.conflicting_identities,
+            complete: self.incomplete_entries == 0 && totals.unknown_size_files == 0,
         })
     }
 }
@@ -381,6 +469,32 @@ impl From<FileIdentity> for StoredIdentity {
         }
     }
 }
+
+/// First charge and conflict state of one file identity for one metric.
+#[derive(Clone, Copy, Debug, Default)]
+struct MetricCharge {
+    /// First known sample, including `Some(0)`; `None` means this metric has not charged yet.
+    first: Option<u64>,
+    /// A later known sample of the same identity disagreed with the first one.
+    conflicted: bool,
+}
+
+/// One accounting row per file identity. Both metrics share the key but charge independently.
+#[derive(Clone, Copy, Debug, Default)]
+struct IdentityCharge {
+    logical: MetricCharge,
+    allocated: MetricCharge,
+}
+
+impl IdentityCharge {
+    fn for_metric_mut(&mut self, metric: SizeMetric) -> &mut MetricCharge {
+        match metric {
+            SizeMetric::Logical => &mut self.logical,
+            SizeMetric::Allocated => &mut self.allocated,
+        }
+    }
+}
+
 impl From<StoredIdentity> for FileIdentity {
     fn from(id: StoredIdentity) -> Self {
         Self {

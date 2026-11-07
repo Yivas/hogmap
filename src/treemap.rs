@@ -1,10 +1,11 @@
 //! Pure squarified layout over an [`Index`].
 //!
 //! Geometry is independent from the renderer: the input is an index subtree and
-//! a rectangle, the output is placed cells. Weights are integer logical bytes.
-//! A file identity is charged once, at its first entry with a known size, so a
-//! hardlink never contributes its bytes twice. Unknown sizes get no area and
-//! are reported through `has_unknown`.
+//! a rectangle, the output is placed cells. Weights are integer bytes of the
+//! selected [`SizeMetric`]; `layout` and `layout_members` keep the logical path.
+//! A file identity is charged once, at its first entry with a known size for
+//! that metric, so a hardlink never contributes its bytes twice. Unknown sizes
+//! get no area and are reported through `has_unknown`.
 //!
 //! Volume composition (free and unattributed space) is deliberately absent:
 //! it needs volume capacity data that this module does not receive.
@@ -12,7 +13,7 @@
 use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 
-use crate::index::{Entry, EntryId, FileIdentity, Index, Kind, State};
+use crate::index::{Entry, EntryId, FileIdentity, Index, Kind, SizeMetric, State};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -93,16 +94,29 @@ pub enum LayoutError {
     SizeOverflow,
 }
 
+/// Lays out a subtree by logical bytes, the compatible path for existing consumers.
 pub fn layout(
     index: &Index,
     root: EntryId,
     rect: Rect,
     params: LayoutParams,
 ) -> Result<Layout, LayoutError> {
-    layout_selection(index, root, None, rect, params)
+    layout_with_metric(index, root, rect, params, SizeMetric::Logical)
 }
 
-/// Lays out selected siblings, keeping their original IDs and descendant trees.
+/// Lays out a subtree by `metric`. Unknown sizes of that metric get no area and set
+/// `has_unknown`; they are never treated as zero.
+pub fn layout_with_metric(
+    index: &Index,
+    root: EntryId,
+    rect: Rect,
+    params: LayoutParams,
+    metric: SizeMetric,
+) -> Result<Layout, LayoutError> {
+    layout_selection(index, root, None, rect, params, metric)
+}
+
+/// Lays out selected siblings by logical bytes, keeping their original IDs and descendant trees.
 /// Use the members of a placed aggregate to open its contents without unrelated siblings.
 pub fn layout_members(
     index: &Index,
@@ -110,6 +124,18 @@ pub fn layout_members(
     members: &[EntryId],
     rect: Rect,
     params: LayoutParams,
+) -> Result<Layout, LayoutError> {
+    layout_members_with_metric(index, parent, members, rect, params, SizeMetric::Logical)
+}
+
+/// Lays out selected siblings by `metric`. Membership rules match `layout_members`.
+pub fn layout_members_with_metric(
+    index: &Index,
+    parent: EntryId,
+    members: &[EntryId],
+    rect: Rect,
+    params: LayoutParams,
+    metric: SizeMetric,
 ) -> Result<Layout, LayoutError> {
     let mut seen = HashSet::new();
     if members.is_empty()
@@ -122,7 +148,7 @@ pub fn layout_members(
     {
         return Err(LayoutError::UnknownRoot);
     }
-    layout_selection(index, parent, Some(members), rect, params)
+    layout_selection(index, parent, Some(members), rect, params, metric)
 }
 
 fn layout_selection(
@@ -131,6 +157,7 @@ fn layout_selection(
     members: Option<&[EntryId]>,
     rect: Rect,
     params: LayoutParams,
+    metric: SizeMetric,
 ) -> Result<Layout, LayoutError> {
     validate_rect(rect)?;
     if !params.min_pixel_area.is_finite() || params.min_pixel_area <= 0.0 {
@@ -141,7 +168,7 @@ fn layout_selection(
     }
     let root_entry = index.get(root).ok_or(LayoutError::UnknownRoot)?;
     let mut children = children_map(index);
-    let totals = subtree_totals(index)?;
+    let totals = subtree_totals(index, metric)?;
     let root_totals = if let Some(members) = members {
         children[root.position()] = members.to_vec();
         let mut selected = Totals::default();
@@ -297,14 +324,14 @@ struct Totals {
     has_unknown: bool,
 }
 
-fn subtree_totals(index: &Index) -> Result<Vec<Totals>, LayoutError> {
+fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, LayoutError> {
     let mut seen_identities: HashSet<FileIdentity> = HashSet::new();
     let mut totals = vec![Totals::default(); index.len()];
     for (id, entry) in index.entries() {
         let mut known_sum = 0_u64;
         let mut has_unknown = entry.state != State::Complete;
         if entry.kind == Kind::File {
-            match entry.sizes.logical {
+            match metric.of(entry.sizes) {
                 Some(bytes) => {
                     let charge = match entry.identity {
                         Some(identity) if !seen_identities.insert(identity) => 0,

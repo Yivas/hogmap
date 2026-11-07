@@ -7,7 +7,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use hogmap::index::{FileIdentity, Kind, Sizes, State};
+use hogmap::index::{FileIdentity, Kind, SizeMetric, Sizes, State};
 use hogmap::scan::{
     Batch, DirectoryOutcome, NodeKey, ScanEvent, ScanEventKind, ScanRecord, ScanSender,
 };
@@ -289,6 +289,36 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     println!("inaccessible_directories={inaccessible}");
     println!("partial_directories={partial}");
     println!("summary_complete={}", u8::from(summary.complete));
+    // Both metric summaries are constant-time; they exercise the independent accounting and
+    // report its confidence indicators without adding retained data to the workload.
+    let logical_metric = index
+        .summary_for(SizeMetric::Logical)
+        .map_err(|_| "summary_overflow")?;
+    let allocated_metric = index
+        .summary_for(SizeMetric::Allocated)
+        .map_err(|_| "summary_overflow")?;
+    println!(
+        "logical_identity_missing_files={}",
+        logical_metric.identity_missing_files
+    );
+    println!(
+        "logical_conflicting_identities={}",
+        logical_metric.conflicting_identities
+    );
+    println!("allocated_known_bytes={}", allocated_metric.known_bytes);
+    println!("allocated_unique_bytes={}", allocated_metric.unique_bytes);
+    println!(
+        "allocated_unknown_size_files={}",
+        allocated_metric.unknown_size_files
+    );
+    println!(
+        "allocated_identity_missing_files={}",
+        allocated_metric.identity_missing_files
+    );
+    println!(
+        "allocated_conflicting_identities={}",
+        allocated_metric.conflicting_identities
+    );
     println!(
         "entry_struct_size_bytes={}",
         index.memory_estimate().entry_bytes / index.len()
