@@ -1258,7 +1258,8 @@ mod platform {
                     logical: u64::try_from(entry.EndOfFile).ok(),
                     allocated: u64::try_from(entry.AllocationSize).ok(),
                 },
-                identity: Some(FileIdentity {
+                // MS-FSCC requires ignoring FileId=0 when 128-bit IDs are unsupported.
+                identity: (entry.FileId.Identifier != [0; 16]).then(|| FileIdentity {
                     volume: u64::from(volume),
                     file: u128::from_le_bytes(entry.FileId.Identifier),
                 }),
@@ -1527,6 +1528,106 @@ mod platform {
             );
             assert_eq!(skip_code(FILE_ATTRIBUTE_DIRECTORY, 0), None);
         }
+        #[test]
+        fn unsupported_zero_file_ids_keep_sizes_and_charge_files_individually() {
+            use crate::index::{Index, SizeMetric, State};
+
+            let volume = 0xFEDC_BA98;
+            let hardlink_id = (1_u128 << 100) | 42;
+            let distinct_id = (2_u128 << 100) | 42;
+            // Both unsupported-ID files have equal known sizes, including a known-zero case.
+            for (logical, allocated, expected_logical, expected_allocated) in [
+                (7, 4096, (47, 36), (32768, 24576)),
+                (0, 0, (33, 22), (24576, 16384)),
+            ] {
+                let mut index = Index::new(OsString::from("fixture")).unwrap();
+                index.set_state(index.root(), State::Complete).unwrap();
+                for (name, file_id, logical, allocated) in [
+                    (vec![97, 0xD800], 0, logical, allocated),
+                    (vec![98], 0, logical, allocated),
+                    (vec![99], hardlink_id, 11, 8192),
+                    (vec![100], hardlink_id, 11, 8192),
+                    (vec![101], distinct_id, 11, 8192),
+                ] {
+                    let header = offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
+                    let bytes = size_of::<FILE_ID_EXTD_DIR_INFO>().max(header + name.len() * 2);
+                    let mut buffer = vec![0_u64; bytes.div_ceil(8)];
+                    // SAFETY: initialized u64 storage has the binding's required alignment
+                    // and room for the fixed header. Field writes preserve initialized padding.
+                    unsafe {
+                        let entry = &mut *buffer.as_mut_ptr().cast::<FILE_ID_EXTD_DIR_INFO>();
+                        entry.EndOfFile = logical;
+                        entry.AllocationSize = allocated;
+                        entry.FileNameLength = (name.len() * 2) as u32;
+                        entry.FileAttributes = FILE_ATTRIBUTE_NORMAL;
+                        entry.FileId.Identifier = file_id.to_le_bytes();
+                    }
+                    // SAFETY: the fixed-header borrow ended and the full UTF-16 tail fits
+                    // in the aligned allocation; the separate name allocation cannot overlap.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            name.as_ptr(),
+                            buffer.as_mut_ptr().cast::<u8>().add(header).cast::<u16>(),
+                            name.len(),
+                        );
+                    }
+                    let mut records = 0;
+                    parse_buffer(&buffer, volume, |child| {
+                        records += 1;
+                        assert_eq!(child.name, name);
+                        assert_eq!(child.attributes, FILE_ATTRIBUTE_NORMAL);
+                        assert_eq!(child.tag, 0);
+                        assert_eq!(child.sizes.logical, Some(logical as u64));
+                        assert_eq!(child.sizes.allocated, Some(allocated as u64));
+                        index
+                            .insert(
+                                index.root(),
+                                OsString::from_wide(&child.name),
+                                Kind::File,
+                                child.sizes,
+                                child.identity,
+                                State::Complete,
+                            )
+                            .unwrap();
+                        true
+                    })
+                    .unwrap();
+                    assert_eq!(records, 1);
+                }
+                assert_eq!(index.entries().count(), 6);
+                for (metric, (known, unique), shared) in [
+                    (SizeMetric::Logical, expected_logical, 11),
+                    (SizeMetric::Allocated, expected_allocated, 8192),
+                ] {
+                    let summary = index.summary_for(metric).unwrap();
+                    assert_eq!(summary.files, 5);
+                    assert_eq!(summary.known_bytes, known);
+                    assert_eq!(summary.conflicting_identities, 0);
+                    assert_eq!(summary.unique_bytes, unique, "{summary:?}");
+                    assert_eq!(summary.shared_bytes, shared);
+                    assert_eq!(summary.identity_missing_files, 2);
+                    assert_eq!(summary.unknown_size_files, 0);
+                    assert!(summary.complete);
+                }
+                let entries: Vec<_> = index.entries().skip(1).map(|(_, entry)| entry).collect();
+                for entry in &entries {
+                    assert_eq!(entry.kind, Kind::File);
+                    assert_eq!(entry.state, State::Complete);
+                }
+                assert_eq!(entries[0].identity, None);
+                assert_eq!(entries[1].identity, None);
+                for (position, file) in [(2, hardlink_id), (3, hardlink_id), (4, distinct_id)] {
+                    assert_eq!(
+                        entries[position].identity,
+                        Some(FileIdentity {
+                            volume: u64::from(volume),
+                            file,
+                        })
+                    );
+                }
+            }
+        }
+
         #[test]
         fn malformed_directory_offsets_and_names_are_rejected() {
             let mut buffer = vec![0_u64; 32];
