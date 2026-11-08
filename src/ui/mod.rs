@@ -840,10 +840,9 @@ impl HogMap {
                         // caption the members for the new metric instead of repeating the old one.
                         Some(_) => {
                             let current = self.history.current();
-                            let (root, members) =
-                                current.resolve(index).unwrap_or((index.root(), None));
+                            let members = current.resolve(index).and_then(|(_, members)| members);
                             text::location(
-                                &entry_name(index, root),
+                                &entry_name(index, index.root()),
                                 &current.path,
                                 subset_caption(&current, members.as_deref(), self.metric),
                             )
@@ -1046,7 +1045,8 @@ impl HogMap {
             };
             let subset = members.as_deref().filter(|members| !members.is_empty());
             let caption = subset_caption(location, subset, self.metric);
-            let location_label = text::location(&entry_name(index, root), &location.path, caption);
+            let location_label =
+                text::location(&entry_name(index, index.root()), &location.path, caption);
             let result = match subset {
                 Some(members) => treemap::layout_members_with_metric(
                     index,
@@ -1375,6 +1375,40 @@ mod tests {
             ..Default::default()
         };
         let _ = context.run_ui(input, |ui| app.map(ui));
+    }
+
+    #[test]
+    fn a_nested_folder_label_starts_at_the_dataset_root_in_both_metrics() {
+        let context = egui::Context::default();
+        let mut app = finished_sample(&context);
+        let index = app.reducer.index().unwrap();
+        let root = index.root();
+        // A folder two levels down, so the current folder differs from the dataset root.
+        let (nested, parent) = index
+            .entries()
+            .find_map(|(id, entry)| {
+                let parent = entry.parent.filter(|parent| *parent != root)?;
+                let grandparent = index.get(parent)?.parent;
+                (entry.kind == hogmap::index::Kind::Directory && grandparent == Some(root))
+                    .then_some((id, parent))
+            })
+            .expect("the sample nests folders");
+        let expected = format!(
+            "{} / {} / {}",
+            entry_name(index, root),
+            entry_name(index, parent),
+            entry_name(index, nested)
+        );
+        let location = Location::directory(index, nested);
+        app.navigate(location.clone());
+        for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+            app.metric = metric;
+            draw_map(&context, &mut app);
+            let cache = app.cache.as_ref().unwrap();
+            assert_eq!((&cache.key.location, cache.key.metric), (&location, metric));
+            assert_eq!(cache.layout.placed[0].node, NodeRef::Entry(nested));
+            assert_eq!(cache.location_label, expected);
+        }
     }
 
     #[test]
