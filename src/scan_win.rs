@@ -1479,6 +1479,463 @@ mod platform {
         }
 
         #[test]
+        fn native_allocation_modes_preserve_scanner_records_and_stream_lengths() {
+            use crate::index::{SizeMetric, State};
+            use crate::scan::ScanReducer;
+            use std::fs::{File, OpenOptions};
+            use std::io::{Seek, SeekFrom, Write};
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+            use windows_sys::Win32::System::IO::DeviceIoControl;
+            use windows_sys::Win32::System::Ioctl::{FSCTL_SET_COMPRESSION, FSCTL_SET_SPARSE};
+
+            struct Fixture(PathBuf);
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    if let Err(error) = std::fs::remove_dir_all(&self.0) {
+                        eprintln!(
+                            "allocation_fixture_cleanup_error={:?}",
+                            error.raw_os_error()
+                        );
+                        assert!(thread::panicking(), "owned fixture cleanup failed");
+                    } else {
+                        println!("allocation_fixture_cleanup=1");
+                    }
+                }
+            }
+            fn code(error: std::io::Error) -> u32 {
+                error.raw_os_error().unwrap_or(-1) as u32
+            }
+            fn set_compression(file: &File, format: u16) -> Result<(), u32> {
+                let mut returned = 0;
+                // SAFETY: this is a live owned fixture file, not a volume; the synchronous
+                // request reads one USHORT and returns no payload. No pointer outlives the call.
+                if unsafe {
+                    DeviceIoControl(
+                        file.as_raw_handle(),
+                        FSCTL_SET_COMPRESSION,
+                        (&format as *const u16).cast(),
+                        size_of::<u16>() as u32,
+                        null_mut(),
+                        0,
+                        &mut returned,
+                        null_mut(),
+                    )
+                } == 0
+                {
+                    Err(unsafe { GetLastError() })
+                } else {
+                    Ok(())
+                }
+            }
+            fn set_sparse(file: &File) -> Result<(), u32> {
+                let mut returned = 0;
+                // SAFETY: live owned fixture file and synchronous request. The documented
+                // null input means SetSparse=TRUE; a nonnull bytes-returned output is provided.
+                if unsafe {
+                    DeviceIoControl(
+                        file.as_raw_handle(),
+                        FSCTL_SET_SPARSE,
+                        null(),
+                        0,
+                        null_mut(),
+                        0,
+                        &mut returned,
+                        null_mut(),
+                    )
+                } == 0
+                {
+                    Err(unsafe { GetLastError() })
+                } else {
+                    Ok(())
+                }
+            }
+            fn activated(case: usize, result: Result<(), u32>) -> bool {
+                match result {
+                    Ok(()) => true,
+                    Err(error) => {
+                        println!("allocation_case={case} mode_omitted=1 error={error}");
+                        assert!(
+                            matches!(
+                                error,
+                                ERROR_INVALID_FUNCTION
+                                    | ERROR_NOT_SUPPORTED
+                                    | ERROR_INVALID_PARAMETER
+                                    | ERROR_INVALID_NAME
+                            ),
+                            "unexpected fixture activation error {error}"
+                        );
+                        false
+                    }
+                }
+            }
+            fn create(path: &Path) -> File {
+                let file = OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .create_new(true)
+                    .open(path)
+                    .map_err(code)
+                    .expect("create owned fixture file");
+                let attributes = file.metadata().map_err(code).unwrap().file_attributes();
+                assert_eq!(skip_code(attributes, 0), None);
+                assert_eq!(attributes & FILE_ATTRIBUTE_SPARSE_FILE, 0);
+                // Compression may be inherited. Only the new empty file is normalized.
+                if attributes & FILE_ATTRIBUTE_COMPRESSED != 0 {
+                    set_compression(&file, COMPRESSION_FORMAT_NONE)
+                        .expect("clear inherited compression on owned fixture file");
+                }
+                file
+            }
+            struct Observation {
+                logical: u64,
+                allocation: u64,
+                compressed_size: u64,
+                attributes: u32,
+            }
+            fn observe(path: &Path) -> Result<Observation, u32> {
+                let file = OpenOptions::new()
+                    .access_mode(FILE_READ_ATTRIBUTES)
+                    .open(path)
+                    .map_err(code)?;
+                let mut standard = FILE_STANDARD_INFO::default();
+                // SAFETY: live metadata-only handle and exact binding-defined writable output.
+                if unsafe {
+                    GetFileInformationByHandleEx(
+                        file.as_raw_handle(),
+                        FileStandardInfo,
+                        (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                        size_of::<FILE_STANDARD_INFO>() as u32,
+                    )
+                } == 0
+                {
+                    return Err(unsafe { GetLastError() });
+                }
+                assert!(!standard.Directory);
+                let attributes = file.metadata().map_err(code)?.file_attributes();
+                let path = extended_path(path).map_err(|error| error.code)?;
+                let mut high = 0;
+                // SAFETY: terminated fixture/default-or-named-stream path and writable high
+                // DWORD. Clear last error to disambiguate a successful INVALID_FILE_SIZE result.
+                let (low, error) = unsafe {
+                    SetLastError(0);
+                    let low = GetCompressedFileSizeW(path.as_ptr(), &mut high);
+                    (low, GetLastError())
+                };
+                if low == INVALID_FILE_SIZE && error != 0 {
+                    return Err(error);
+                }
+                Ok(Observation {
+                    logical: u64::try_from(standard.EndOfFile).unwrap(),
+                    allocation: u64::try_from(standard.AllocationSize).unwrap(),
+                    compressed_size: (u64::from(high) << 32) | u64::from(low),
+                    attributes,
+                })
+            }
+
+            // Independent same-field oracle: fresh native enumeration, never parse_buffer,
+            // child, reducer or scanner output. Cross-API probes below remain observations only.
+            fn raw_directory_allocations(path: &Path, names: &[&str; 4]) -> Result<[i64; 4], u32> {
+                let file = OpenOptions::new()
+                    .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .custom_flags(
+                        FILE_FLAG_BACKUP_SEMANTICS
+                            | FILE_FLAG_OPEN_REPARSE_POINT
+                            | FILE_FLAG_OPEN_NO_RECALL,
+                    )
+                    .open(path)
+                    .map_err(code)?;
+                let mut buffer = vec![0_u64; 8192];
+                let bytes = buffer.len() * size_of::<u64>();
+                let header = offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
+                let mut values = [0_i64; 4];
+                let mut seen = [false; 4];
+                let mut records = 0;
+                // Four owned files and dot entries need only a tiny bounded listing.
+                for _ in 0..8 {
+                    buffer.fill(0);
+                    // SAFETY: live metadata directory handle and initialized 8-byte-aligned
+                    // writable buffer. This fresh handle has its own enumeration cursor.
+                    if unsafe {
+                        GetFileInformationByHandleEx(
+                            file.as_raw_handle(),
+                            FileIdExtdDirectoryInfo,
+                            buffer.as_mut_ptr().cast(),
+                            bytes as u32,
+                        )
+                    } == 0
+                    {
+                        let error = unsafe { GetLastError() };
+                        if error == ERROR_NO_MORE_FILES && seen.iter().all(|value| *value) {
+                            return Ok(values);
+                        }
+                        return Err(if error == ERROR_NO_MORE_FILES {
+                            ERROR_INVALID_DATA
+                        } else {
+                            error
+                        });
+                    }
+                    let mut offset = 0_usize;
+                    loop {
+                        records += 1;
+                        if records > 16
+                            || !offset.is_multiple_of(8)
+                            || offset
+                                .checked_add(size_of::<FILE_ID_EXTD_DIR_INFO>())
+                                .is_none_or(|end| end > bytes)
+                        {
+                            return Err(ERROR_INVALID_DATA);
+                        }
+                        // SAFETY: offset alignment and full binding-defined header checked.
+                        let entry = unsafe {
+                            &*buffer
+                                .as_ptr()
+                                .cast::<u8>()
+                                .add(offset)
+                                .cast::<FILE_ID_EXTD_DIR_INFO>()
+                        };
+                        let name_bytes = entry.FileNameLength as usize;
+                        let next = entry.NextEntryOffset as usize;
+                        let end = offset
+                            .checked_add(header)
+                            .and_then(|start| start.checked_add(name_bytes))
+                            .ok_or(ERROR_INVALID_DATA)?;
+                        if !name_bytes.is_multiple_of(2)
+                            || name_bytes > 510
+                            || end > bytes
+                            || (next != 0
+                                && (!next.is_multiple_of(8)
+                                    || next < header + name_bytes
+                                    || offset.checked_add(next).is_none_or(|next| next >= bytes)))
+                        {
+                            return Err(ERROR_INVALID_DATA);
+                        }
+                        // SAFETY: complete UTF-16 tail is in bounds and naturally aligned.
+                        let name = unsafe {
+                            std::slice::from_raw_parts(
+                                buffer
+                                    .as_ptr()
+                                    .cast::<u8>()
+                                    .add(offset + header)
+                                    .cast::<u16>(),
+                                name_bytes / 2,
+                            )
+                        };
+                        if name != [46] && name != [46, 46] {
+                            let name = OsString::from_wide(name);
+                            let position = names
+                                .iter()
+                                .position(|expected| name == OsStr::new(expected))
+                                .ok_or(ERROR_INVALID_DATA)?;
+                            if seen[position] {
+                                return Err(ERROR_INVALID_DATA);
+                            }
+                            seen[position] = true;
+                            values[position] = entry.AllocationSize;
+                        }
+                        if next == 0 {
+                            break;
+                        }
+                        offset += next;
+                    }
+                }
+                Err(ERROR_INVALID_DATA)
+            }
+
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            let unique = NEXT.fetch_add(1, Ordering::Relaxed);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "hogmap-allocation-test-{}-{unique}-{nanos}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path)
+                .map_err(code)
+                .expect("create unique owned directory");
+            let fixture = Fixture(path.clone());
+            let names = ["normal.bin", "compressed.bin", "sparse.bin", "streams.bin"];
+            let paths = names.map(|name| path.join(name));
+            const MIB: usize = 1 << 20;
+            // Deterministic data is written only during fixture construction, never read back.
+            let normal: Vec<u8> = (0..MIB).map(|n| ((n * 37 + n / 251) % 256) as u8).collect();
+            {
+                let mut file = create(&paths[0]);
+                file.write_all(&normal).map_err(code).unwrap();
+                file.sync_all().map_err(code).unwrap();
+            }
+            let compressed_active = {
+                let mut file = create(&paths[1]);
+                let active = activated(1, set_compression(&file, COMPRESSION_FORMAT_DEFAULT));
+                file.write_all(&vec![0; MIB]).map_err(code).unwrap();
+                file.sync_all().map_err(code).unwrap();
+                active
+            };
+            let sparse_active = {
+                let mut file = create(&paths[2]);
+                let active = activated(2, set_sparse(&file));
+                file.set_len(MIB as u64).map_err(code).unwrap();
+                file.seek(SeekFrom::Start(512 << 10)).map_err(code).unwrap();
+                file.write_all(&normal[..4096]).map_err(code).unwrap();
+                file.sync_all().map_err(code).unwrap();
+                active
+            };
+            create(&paths[3]).sync_all().map_err(code).unwrap();
+            let stream_path = path.join("streams.bin:fixture:$DATA");
+            let named_active = match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&stream_path)
+            {
+                Ok(mut file) => {
+                    // The named stream has its own compression state, independent of default.
+                    let attributes = file.metadata().map_err(code).unwrap().file_attributes();
+                    if attributes & FILE_ATTRIBUTE_COMPRESSED != 0 {
+                        set_compression(&file, COMPRESSION_FORMAT_NONE).unwrap();
+                    }
+                    file.write_all(&normal[..65536]).map_err(code).unwrap();
+                    file.sync_all().map_err(code).unwrap();
+                    true
+                }
+                Err(error) => activated(3, Err(code(error))),
+            };
+            let observations = paths.each_ref().map(|path| observe(path).unwrap());
+            let raw_allocations = match raw_directory_allocations(&path, &names) {
+                Ok(values) => Some(values),
+                Err(error) if fallback_allowed(error) => {
+                    println!("allocation_oracle_omitted=1 error={error}");
+                    None
+                }
+                Err(error) => panic!("independent directory oracle failed: {error}"),
+            };
+            assert_eq!(observations[0].attributes & FILE_ATTRIBUTE_COMPRESSED, 0);
+            assert_eq!(
+                observations[1].attributes & FILE_ATTRIBUTE_COMPRESSED != 0,
+                compressed_active
+            );
+            assert_eq!(
+                observations[2].attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0,
+                sparse_active
+            );
+            if named_active {
+                let named = observe(&stream_path).unwrap();
+                assert_eq!(named.logical, 65536);
+                assert_eq!(
+                    named.attributes & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE),
+                    0
+                );
+                assert_eq!(named.compressed_size, named.logical);
+                println!(
+                    "allocation_named_stream logical={} standard_allocation={} compressed_size={}",
+                    named.logical, named.allocation, named.compressed_size
+                );
+            }
+            let generation = ScanGeneration::new(902);
+            // Four children bound the complete run to fewer than sixteen envelopes, so this
+            // synchronous producer cannot fill the channel before the reducer starts draining.
+            let (sender, receiver) = crate::scan::event_channel(16);
+            let (outcome, report) = run_scan(
+                generation,
+                path.clone(),
+                sender,
+                &ScanCancellation::new(),
+                ScanOptions {
+                    workers: 1,
+                    ..ScanOptions::default()
+                },
+                None,
+                false,
+            );
+            assert_eq!(outcome, ProducerOutcome::Finished);
+            let mut reducer = ScanReducer::new(generation);
+            reducer.drain(&receiver, 4096);
+            assert_eq!(reducer.terminal(), Some(Terminal::Finished));
+            assert_eq!(reducer.diagnostics().invalid_records, 0);
+            assert_eq!(reducer.diagnostics().directory_failures, 0);
+            assert_eq!(reducer.diagnostics().unknown_parent_records, 0);
+            assert_eq!(report.cloud_skips, 0);
+            assert_eq!(report.reparse_skips, 0);
+            let index = reducer.index().unwrap();
+            assert_eq!(index.entries().count(), 5);
+            for (case, observation) in observations.iter().enumerate() {
+                let entry = index
+                    .entries()
+                    .map(|(_, entry)| entry)
+                    .find(|entry| entry.name == OsStr::new(names[case]))
+                    .expect("fixture record preserved");
+                assert_eq!(entry.kind, Kind::File);
+                assert_eq!(entry.state, State::Complete);
+                assert_eq!(observation.logical, if case == 3 { 0 } else { MIB as u64 });
+                assert_eq!(entry.sizes.logical, Some(observation.logical));
+                if report.fallback_directories == 0 {
+                    let raw = raw_allocations
+                        .as_ref()
+                        .expect("primary path requires the raw oracle")[case];
+                    assert_eq!(
+                        entry.sizes.allocated,
+                        u64::try_from(raw).ok(),
+                        "native allocation value fidelity, case={case}"
+                    );
+                } else {
+                    assert_eq!(entry.sizes.allocated, None);
+                    assert_eq!(entry.identity, None);
+                }
+                if observation.attributes & (FILE_ATTRIBUTE_COMPRESSED | FILE_ATTRIBUTE_SPARSE_FILE)
+                    == 0
+                {
+                    // GetCompressedFileSizeW documents file length for an ordinary stream,
+                    // not equality with either allocation API for compressed/sparse streams.
+                    assert_eq!(observation.compressed_size, observation.logical);
+                }
+                println!(
+                    "allocation_case={case} logical={} scanner_allocation={:?} raw_directory_allocation={:?} standard_allocation={} compressed_size={} compressed={} sparse={} fallback={}",
+                    observation.logical,
+                    entry.sizes.allocated,
+                    raw_allocations.as_ref().map(|values| values[case]),
+                    observation.allocation,
+                    observation.compressed_size,
+                    observation.attributes & FILE_ATTRIBUTE_COMPRESSED != 0,
+                    observation.attributes & FILE_ATTRIBUTE_SPARSE_FILE != 0,
+                    report.fallback_directories
+                );
+            }
+            let allocated = index.summary_for(SizeMetric::Allocated).unwrap();
+            assert_eq!(allocated.files, 4);
+            let unknown_allocations = if report.fallback_directories == 0 {
+                raw_allocations
+                    .unwrap()
+                    .iter()
+                    .filter(|value| **value < 0)
+                    .count()
+            } else {
+                4
+            };
+            assert_eq!(allocated.complete, unknown_allocations == 0);
+            assert_eq!(allocated.unknown_size_files, unknown_allocations);
+            // A passing portable test can have explicit capability omissions. Only this output
+            // establishes whether all requested modes and the primary path were exercised.
+            println!(
+                "allocation_verification_complete={} fallback={} last_fallback_code={:?}",
+                u8::from(
+                    compressed_active
+                        && sparse_active
+                        && named_active
+                        && report.fallback_directories == 0
+                        && unknown_allocations == 0
+                ),
+                report.fallback_directories,
+                report.last_fallback_code
+            );
+            drop(fixture);
+            assert!(!path.try_exists().unwrap());
+        }
+
+        #[test]
         fn extended_paths_preserve_drive_unc_long_and_native_names() {
             let text = |path: &str| {
                 OsString::from_wide(
