@@ -543,7 +543,7 @@ mod platform {
 
     struct ObservedState {
         facts: ScanOriginObservations,
-        capture: Option<crate::volume::OriginCapture>,
+        capture: Option<Arc<crate::volume::OriginCapture>>,
     }
 
     impl Shared<'_> {
@@ -933,10 +933,12 @@ mod platform {
         }
         if let Some(observed) = shared.observed {
             use crate::volume::{ObservedContinuity, OriginIssue};
-            let mut state = observed
+            let finished_at = std::time::SystemTime::now();
+            let capture = observed
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.facts.enumeration_finished_at = Some(std::time::SystemTime::now());
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .capture
+                .clone();
             let mut omitted = if cancel.is_cancelled() {
                 Some(OriginIssue::Cancelled)
             } else if terminal != Terminal::Finished || shared.stopping() {
@@ -951,10 +953,9 @@ mod platform {
                     code: error.code,
                 });
             }
-            if let Some(reason) = omitted {
-                state.facts.after = Err(reason);
-                state.facts.validation = Err(reason);
-            } else if let Some(capture) = state.capture.as_ref() {
+            let (after, validation) = if let Some(reason) = omitted {
+                (Err(reason), Err(reason))
+            } else if let Some(capture) = capture.as_ref() {
                 let validation = capture.validate(&|| shared.stopping());
                 let after = match (validation.directory_identity, validation.normalized_path) {
                     (
@@ -965,12 +966,17 @@ mod platform {
                     (_, Ok(ObservedContinuity::Changed)) => Err(OriginIssue::NamespaceChanged),
                     (Err(error), _) | (_, Err(error)) => Err(error),
                 };
-                state.facts.validation = Ok(validation);
-                state.facts.after = after;
+                (after, Ok(validation))
             } else {
-                state.facts.after = Err(OriginIssue::RootNotCaptured);
-                state.facts.validation = Err(OriginIssue::RootNotCaptured);
-            }
+                (
+                    Err(OriginIssue::RootNotCaptured),
+                    Err(OriginIssue::RootNotCaptured),
+                )
+            };
+            let mut state = observed.lock().unwrap_or_else(|p| p.into_inner());
+            state.facts.enumeration_finished_at = Some(finished_at);
+            state.facts.after = after;
+            state.facts.validation = validation;
         }
         // All scoped workers have joined. Cancellation never suppresses the one terminal attempt.
         let sent = send_terminal(&shared.sender, generation, terminal);
@@ -1004,6 +1010,7 @@ mod platform {
             return false;
         };
         let mut local = Frontier::new(shared.mft_order, shared.options.local_stack_capacity);
+        let mut observation_buffer = shared.observed.map(|_| vec![0_u16; 32768]);
         loop {
             if shared.stopping() {
                 shared.wake.notify();
@@ -1064,7 +1071,7 @@ mod platform {
                 key: work.key,
             };
             metrics(|m| m.directories += 1);
-            let result = enumerate(&work, shared, &mut local);
+            let result = enumerate(&work, shared, &mut local, observation_buffer.as_deref_mut());
             if !shared.stopping() {
                 let _ = shared.directory_outcome(work.key, result.err().map(|error| error.code));
             }
@@ -1217,6 +1224,7 @@ mod platform {
         work: &ActiveWork,
         shared: &Shared<'_>,
         local: &mut Frontier,
+        observation_buffer: Option<&mut [u16]>,
     ) -> Result<(), ScanError> {
         if work.key == NodeKey::new(0) {
             check_path(&work.path, shared)?;
@@ -1310,30 +1318,39 @@ mod platform {
                 code: ERROR_DIRECTORY,
             });
         }
-        if let Some(observed) = shared.observed {
+        if let (Some(observed), Some(buffer)) = (shared.observed, observation_buffer) {
             use std::os::windows::io::BorrowedHandle;
             // SAFETY: DirectoryHandle owns this live handle for the entire observation call.
             let borrowed = unsafe { BorrowedHandle::borrow_raw(handle.0) };
-            let mut state = observed
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if work.key == NodeKey::new(0) {
+            let capture = if work.key == NodeKey::new(0) {
+                // No child can be published before this root capture and before sample finish.
                 let (root, capture) =
                     crate::volume::capture_origin(borrowed, &|| shared.stopping());
-                state.facts.root = Ok(root);
-                state.facts.before = capture
+                let before = capture
                     .as_ref()
                     .map_err(|error| *error)
                     .and_then(|capture| capture.capacity(&|| shared.stopping()));
-                state.capture = capture.ok();
-            }
-            let ObservedState { facts, capture } = &mut *state;
-            crate::volume::observe_namespace(
-                capture.as_ref(),
-                borrowed,
-                &mut facts.directories,
-                &|| shared.stopping(),
-            );
+                let capture = capture.ok().map(Arc::new);
+                let mut state = observed
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.facts.root = Ok(root);
+                state.facts.before = before;
+                state.capture = capture.clone();
+                capture
+            } else {
+                observed
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .capture
+                    .clone()
+            };
+            let observation =
+                crate::volume::observe_namespace(capture.as_deref(), borrowed, buffer, &|| {
+                    shared.stopping()
+                });
+            let mut state = observed.lock().unwrap_or_else(|p| p.into_inner());
+            crate::volume::record_namespace_result(&mut state.facts.directories, observation);
         }
         // u64 storage guarantees 8-byte alignment; 64 KiB bounds one enumeration response.
         let mut buffer = vec![0_u64; 8192];

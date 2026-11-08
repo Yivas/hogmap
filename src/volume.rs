@@ -121,6 +121,13 @@ pub struct OriginValidation {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct DirectoryNamespaceObservations {
     pub opened_directories: u64,
+    /// FileIdInfo comparisons with the captured root's serial64, never a GUID proof.
+    pub serial64_same: u64,
+    pub serial64_different: u64,
+    pub serial64_unavailable: u64,
+    /// GUID fallback attempts, including failures/cancellation before completion.
+    pub guid_on_serial_mismatch: u64,
+    pub guid_on_serial_unavailable: u64,
     pub same_guid_name: u64,
     /// Different GUID names may be aliases; this is not a foreign-volume count.
     pub different_guid_name_unproven: u64,
@@ -149,7 +156,9 @@ pub fn seek_penalty_for(_path: &Path) -> Option<bool> {
 }
 
 #[cfg(windows)]
-pub(crate) use platform::{OriginCapture, capture_origin, filesystem_for, observe_namespace};
+pub(crate) use platform::{
+    OriginCapture, capture_origin, filesystem_for, observe_namespace, record_namespace_result,
+};
 #[cfg(windows)]
 pub use platform::{list_drives, seek_penalty_for, volume_root_for};
 
@@ -297,8 +306,14 @@ mod platform {
         handle: BorrowedHandle<'_>,
         cancelled: &impl Fn() -> bool,
     ) -> Result<GuidPath, OriginIssue> {
+        final_path_in(handle, &mut vec![0_u16; 32768], cancelled)
+    }
+    fn final_path_in(
+        handle: BorrowedHandle<'_>,
+        buffer: &mut [u16],
+        cancelled: &impl Fn() -> bool,
+    ) -> Result<GuidPath, OriginIssue> {
         running(cancelled)?;
-        let mut buffer = vec![0_u16; 32768];
         // SAFETY: live borrowed handle and bounded writable UTF-16 output, normalized GUID mode.
         let length = unsafe {
             GetFinalPathNameByHandleW(
@@ -314,8 +329,7 @@ mod platform {
         if length >= buffer.len() {
             return Err(OriginIssue::InvalidFinalPath);
         }
-        buffer.truncate(length);
-        guid_path(buffer)
+        guid_path(buffer[..length].to_vec())
     }
     fn safe_directory(
         handle: BorrowedHandle<'_>,
@@ -541,32 +555,65 @@ mod platform {
             }
         }
     }
+    pub(crate) struct NamespaceObservation {
+        serial: Result<bool, OriginIssue>,
+        guid: Option<Result<bool, OriginIssue>>,
+    }
+    fn serial_relation(
+        expected: OriginIdentity,
+        read: Result<OriginIdentity, OriginIssue>,
+    ) -> Result<bool, OriginIssue> {
+        read.map(|value| value.serial == expected.serial)
+    }
     pub(crate) fn observe_namespace(
         capture: Option<&OriginCapture>,
         handle: BorrowedHandle<'_>,
-        counts: &mut DirectoryNamespaceObservations,
+        buffer: &mut [u16],
         cancelled: &impl Fn() -> bool,
-    ) {
-        let observation = capture
+    ) -> NamespaceObservation {
+        let serial = capture
             .ok_or(OriginIssue::RootNotCaptured)
             .and_then(|capture| {
-                final_path(handle, cancelled).map(|path| path.root == capture.path.root)
+                serial_relation(capture.directory_identity, identity(handle, cancelled))
             });
-        record_namespace_result(counts, observation);
+        let guid = (serial != Ok(true)).then(|| {
+            capture
+                .ok_or(OriginIssue::RootNotCaptured)
+                .and_then(|capture| {
+                    final_path_in(handle, buffer, cancelled)
+                        .map(|path| path.root == capture.path.root)
+                })
+        });
+        NamespaceObservation { serial, guid }
     }
-    fn record_namespace_result(
+    pub(crate) fn record_namespace_result(
         counts: &mut DirectoryNamespaceObservations,
-        observation: Result<bool, OriginIssue>,
+        observation: NamespaceObservation,
     ) {
         // One pending item is added for this traversal open under the same mutex.
         // This sole resolution consumes it; early safety/cancellation returns leave it pending.
         counts.not_queried -= 1;
-        match observation {
-            Ok(true) => counts.same_guid_name += 1,
-            Ok(false) => counts.different_guid_name_unproven += 1,
+        match observation.serial {
+            Ok(true) => counts.serial64_same += 1,
+            Ok(false) => counts.serial64_different += 1,
             Err(error) => {
-                counts.unavailable += 1;
+                counts.serial64_unavailable += 1;
                 counts.last_issue = Some(error);
+            }
+        }
+        if let Some(guid) = observation.guid {
+            if observation.serial == Ok(false) {
+                counts.guid_on_serial_mismatch += 1;
+            } else {
+                counts.guid_on_serial_unavailable += 1;
+            }
+            match guid {
+                Ok(true) => counts.same_guid_name += 1,
+                Ok(false) => counts.different_guid_name_unproven += 1,
+                Err(error) => {
+                    counts.unavailable += 1;
+                    counts.last_issue = Some(error);
+                }
             }
         }
     }
@@ -894,7 +941,12 @@ mod platform {
                 Ok(ObservedContinuity::UnchangedAtEndpoints)
             );
             assert_eq!(observations.directories.opened_directories, 3);
-            assert_eq!(observations.directories.same_guid_name, 3);
+            assert_eq!(observations.directories.serial64_same, 3);
+            assert_eq!(observations.directories.serial64_different, 0);
+            assert_eq!(observations.directories.serial64_unavailable, 0);
+            assert_eq!(observations.directories.guid_on_serial_mismatch, 0);
+            assert_eq!(observations.directories.guid_on_serial_unavailable, 0);
+            assert_eq!(observations.directories.same_guid_name, 0);
             assert_eq!(observations.directories.unavailable, 0);
             assert_eq!(observations.directories.not_queried, 0);
             assert_eq!(observations.directories.different_guid_name_unproven, 0);
@@ -997,7 +1049,7 @@ mod platform {
             drop(fixture);
             assert!(!path.exists());
             println!(
-                "origin_native policy_parity=1 folder=1 whole_volume_metadata_only=1 by_handle_flags=1 guid_capacity_begin=1 guid_capacity_end=1 namespaces_same=3 identity_endpoints_unchanged=1 generation=1 cancelled_without_end_query=1 failed_without_end_query=1 missing_root_preserved=1 cleanup=1"
+                "origin_native policy_parity=1 folder=1 whole_volume_metadata_only=1 by_handle_flags=1 guid_capacity_begin=1 guid_capacity_end=1 serial64_same=3 serial64_different=0 serial64_unavailable=0 guid_fallbacks=0 identity_endpoints_unchanged=1 generation=1 cancelled_without_end_query=1 failed_without_end_query=1 missing_root_preserved=1 cleanup=1"
             );
         }
 
@@ -1048,8 +1100,37 @@ mod platform {
                 not_queried: 2,
                 ..Default::default()
             };
-            record_namespace_result(&mut counts, Ok(false));
-            record_namespace_result(&mut counts, Err(issue(OriginQuery::FinalPath, 5)));
+            assert_eq!(
+                serial_relation(directory, zero),
+                Err(OriginIssue::MissingFileIdentity)
+            );
+            assert_eq!(
+                serial_relation(directory, denied),
+                Err(issue(OriginQuery::FileIdentity, 5))
+            );
+            assert_eq!(serial_relation(directory, Ok(different)), Ok(true));
+            info.VolumeSerialNumber ^= 1_u64 << 63;
+            let serial = serial_relation(directory, identity_result(Ok(info)));
+            assert_eq!(serial, Ok(false));
+            record_namespace_result(
+                &mut counts,
+                NamespaceObservation {
+                    serial,
+                    guid: Some(Ok(false)),
+                },
+            );
+            record_namespace_result(
+                &mut counts,
+                NamespaceObservation {
+                    serial: zero.map(|_| true),
+                    guid: Some(Err(issue(OriginQuery::FinalPath, 5))),
+                },
+            );
+            assert_eq!(counts.serial64_same, 0);
+            assert_eq!(counts.serial64_different, 1);
+            assert_eq!(counts.serial64_unavailable, 1);
+            assert_eq!(counts.guid_on_serial_mismatch, 1);
+            assert_eq!(counts.guid_on_serial_unavailable, 1);
             assert_eq!(counts.same_guid_name, 0);
             assert_eq!(counts.different_guid_name_unproven, 1);
             assert_eq!(counts.unavailable, 1);

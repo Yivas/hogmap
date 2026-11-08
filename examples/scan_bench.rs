@@ -30,7 +30,9 @@ use hogmap::scan::{
     DEFAULT_CHANNEL_CAPACITY, ScanCancellation, ScanGeneration, ScanReducer, Terminal,
     event_channel,
 };
-use hogmap::scan_win::{ScanOptions, run_win_scan_with_options};
+use hogmap::scan_win::{
+    ScanOptions, run_win_scan_observed_with_options, run_win_scan_with_options,
+};
 use hogmap::volume::{list_drives, volume_root_for};
 
 const DRAIN_BUDGET: Duration = Duration::from_millis(4);
@@ -44,6 +46,7 @@ struct Arguments {
     hold_for_sample: bool,
     time_limit: Option<Duration>,
     synthetic_million: bool,
+    observed: bool,
 }
 
 fn arguments() -> Result<Arguments, &'static str> {
@@ -60,6 +63,7 @@ fn arguments() -> Result<Arguments, &'static str> {
         hold_for_sample: false,
         time_limit: None,
         synthetic_million,
+        observed: env::var_os("HOGMAP_BENCH_OBSERVED").is_some_and(|value| value == "1"),
     };
     let mut workers_seen = false;
     while let Some(argument) = args.next() {
@@ -135,15 +139,30 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     let producer = thread::Builder::new()
         .name("hogmap-scan-bench".into())
         .spawn(move || {
-            let result = if args.synthetic_million {
+            let (result, observations) = if args.synthetic_million {
                 (
-                    synthetic_million(generation, sender, &flag),
-                    hogmap::scan_win::ScanReport::default(),
+                    (
+                        synthetic_million(generation, sender, &flag),
+                        hogmap::scan_win::ScanReport::default(),
+                    ),
+                    None,
                 )
+            } else if args.observed {
+                let result = run_win_scan_observed_with_options(
+                    generation,
+                    args.root,
+                    sender,
+                    &flag,
+                    args.options,
+                );
+                ((result.outcome, result.report), Some(result.observations))
             } else {
-                run_win_scan_with_options(generation, args.root, sender, &flag, args.options)
+                (
+                    run_win_scan_with_options(generation, args.root, sender, &flag, args.options),
+                    None,
+                )
             };
-            (result, Instant::now())
+            (result, observations, Instant::now())
         })
         .map_err(|_| "producer_start_failed")?;
     let mut first_batch = None;
@@ -205,7 +224,7 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
         }
     }
     let ingested = Instant::now();
-    let ((outcome, report), producer_finished) =
+    let ((outcome, report), observations, producer_finished) =
         producer.join().map_err(|_| "producer_panicked")?;
     let elapsed = started.elapsed();
     let _ = stop_timer.send(());
@@ -225,6 +244,32 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
             inaccessible += u64::from(entry.state == State::Inaccessible);
             partial += u64::from(entry.state == State::Partial);
         }
+    }
+    println!("observed={}", u8::from(observations.is_some()));
+    if let Some(observations) = observations {
+        let counts = observations.directories;
+        println!("origin_opened={}", counts.opened_directories);
+        println!("origin_serial64_same={}", counts.serial64_same);
+        println!("origin_serial64_different={}", counts.serial64_different);
+        println!(
+            "origin_serial64_unavailable={}",
+            counts.serial64_unavailable
+        );
+        println!(
+            "origin_guid_on_serial_mismatch={}",
+            counts.guid_on_serial_mismatch
+        );
+        println!(
+            "origin_guid_on_serial_unavailable={}",
+            counts.guid_on_serial_unavailable
+        );
+        println!("origin_guid_same={}", counts.same_guid_name);
+        println!(
+            "origin_guid_different_unproven={}",
+            counts.different_guid_name_unproven
+        );
+        println!("origin_unavailable={}", counts.unavailable);
+        println!("origin_not_queried={}", counts.not_queried);
     }
     println!("elapsed_ms={:.3}", elapsed.as_secs_f64() * 1000.0);
     println!(
