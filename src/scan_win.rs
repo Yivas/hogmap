@@ -125,6 +125,61 @@ pub struct ScanReport {
     pub terminal_ns: Option<u64>,
 }
 
+/// Owned sidecar facts. Diagnostics remain counts/timings only; this contains no paths.
+#[derive(Debug)]
+pub struct ObservedScanResult {
+    pub outcome: ProducerOutcome,
+    pub report: ScanReport,
+    pub observations: ScanOriginObservations,
+}
+
+#[derive(Debug)]
+pub struct ScanOriginObservations {
+    pub generation: ScanGeneration,
+    pub started_at: std::time::SystemTime,
+    /// Workers have joined; supplementary completion queries happen after this boundary.
+    pub enumeration_finished_at: Option<std::time::SystemTime>,
+    pub root: Result<crate::volume::RootObservation, crate::volume::OriginIssue>,
+    pub directories: crate::volume::DirectoryNamespaceObservations,
+    /// Bound to the actual root handle's candidate volume, before root enumeration.
+    pub before: Result<crate::volume::OriginCapacitySample, crate::volume::OriginIssue>,
+    pub after: Result<crate::volume::OriginCapacitySample, crate::volume::OriginIssue>,
+    pub validation: Result<crate::volume::OriginValidation, crate::volume::OriginIssue>,
+}
+impl ScanOriginObservations {
+    fn new(generation: ScanGeneration) -> Self {
+        use crate::volume::OriginIssue;
+        Self {
+            generation,
+            started_at: std::time::SystemTime::now(),
+            enumeration_finished_at: None,
+            root: Err(OriginIssue::RootNotCaptured),
+            directories: Default::default(),
+            before: Err(OriginIssue::RootNotCaptured),
+            after: Err(OriginIssue::ScanNotFinished),
+            validation: Err(OriginIssue::ScanNotFinished),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+pub fn run_win_scan_observed_with_options(
+    generation: ScanGeneration,
+    root: PathBuf,
+    sender: ScanSender,
+    cancel: &ScanCancellation,
+    options: ScanOptions,
+) -> ObservedScanResult {
+    let (outcome, report) = run_win_scan_with_options(generation, root, sender, cancel, options);
+    let mut observations = ScanOriginObservations::new(generation);
+    observations.root = Err(crate::volume::OriginIssue::UnsupportedPlatform);
+    ObservedScanResult {
+        outcome,
+        report,
+        observations,
+    }
+}
+
 pub fn run_win_scan(
     generation: ScanGeneration,
     root: PathBuf,
@@ -160,7 +215,7 @@ pub fn run_win_scan_with_options(
 #[cfg(windows)]
 pub(crate) use platform::extended_path;
 #[cfg(windows)]
-pub use platform::run_win_scan_with_options;
+pub use platform::{run_win_scan_observed_with_options, run_win_scan_with_options};
 
 #[cfg(windows)]
 mod platform {
@@ -483,6 +538,12 @@ mod platform {
         pending_memory: Arc<PendingMemory>,
         idle_workers: AtomicUsize,
         mft_order: bool,
+        observed: Option<&'a Mutex<ObservedState>>,
+    }
+
+    struct ObservedState {
+        facts: ScanOriginObservations,
+        capture: Option<crate::volume::OriginCapture>,
     }
 
     impl Shared<'_> {
@@ -643,6 +704,44 @@ mod platform {
         )
     }
 
+    /// Observation preserves the legacy device hint, worker policy and NTFS MFT frontier.
+    pub fn run_win_scan_observed_with_options(
+        generation: ScanGeneration,
+        root: PathBuf,
+        sender: ScanSender,
+        cancel: &ScanCancellation,
+        options: ScanOptions,
+    ) -> ObservedScanResult {
+        let observed = Mutex::new(ObservedState {
+            facts: ScanOriginObservations::new(generation),
+            capture: None,
+        });
+        let seek_penalty = crate::volume::seek_penalty_for(&root);
+        let mft_order = seek_penalty == Some(true)
+            && mft_order_for(
+                seek_penalty,
+                crate::volume::filesystem_for(&root).as_deref(),
+            );
+        let (outcome, report) = run_scan_inner(
+            generation,
+            root,
+            sender,
+            cancel,
+            options,
+            (seek_penalty, mft_order),
+            Some(&observed),
+        );
+        let facts = observed
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .facts;
+        ObservedScanResult {
+            outcome,
+            report,
+            observations: facts,
+        }
+    }
+
     fn run_scan(
         generation: ScanGeneration,
         root: PathBuf,
@@ -652,6 +751,27 @@ mod platform {
         seek_penalty: Option<bool>,
         mft_order: bool,
     ) -> (ProducerOutcome, ScanReport) {
+        run_scan_inner(
+            generation,
+            root,
+            sender,
+            cancel,
+            options,
+            (seek_penalty, mft_order),
+            None,
+        )
+    }
+
+    fn run_scan_inner(
+        generation: ScanGeneration,
+        root: PathBuf,
+        sender: ScanSender,
+        cancel: &ScanCancellation,
+        options: ScanOptions,
+        policy: (Option<bool>, bool),
+        observed: Option<&Mutex<ObservedState>>,
+    ) -> (ProducerOutcome, ScanReport) {
+        let (seek_penalty, mft_order) = policy;
         let available = thread::available_parallelism().map_or(1, usize::from);
         let options = ScanOptions {
             workers: if options.workers == 0 {
@@ -733,6 +853,7 @@ mod platform {
             pending_memory,
             idle_workers: AtomicUsize::new(0),
             mft_order,
+            observed,
         };
         cancel.register(&shared.wake);
         let root_sent = shared.record(ScanRecord {
@@ -808,6 +929,47 @@ mod platform {
             // Final counters are essential, unlike periodic coalescable progress.
             if !shared.stopping() {
                 let _ = shared.send(ScanEventKind::Progress(output.progress));
+            }
+        }
+        if let Some(observed) = shared.observed {
+            use crate::volume::{ObservedContinuity, OriginIssue};
+            let mut state = observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.facts.enumeration_finished_at = Some(std::time::SystemTime::now());
+            let mut omitted = if cancel.is_cancelled() {
+                Some(OriginIssue::Cancelled)
+            } else if terminal != Terminal::Finished || shared.stopping() {
+                Some(OriginIssue::ScanNotFinished)
+            } else {
+                None
+            };
+            let mode = omitted.is_none().then(crate::volume::ErrorModeGuard::new);
+            if let Some(Err(error)) = &mode {
+                omitted = Some(OriginIssue::QueryFailed {
+                    query: crate::volume::OriginQuery::ErrorMode,
+                    code: error.code,
+                });
+            }
+            if let Some(reason) = omitted {
+                state.facts.after = Err(reason);
+                state.facts.validation = Err(reason);
+            } else if let Some(capture) = state.capture.as_ref() {
+                let validation = capture.validate(&|| shared.stopping());
+                let after = match (validation.directory_identity, validation.normalized_path) {
+                    (
+                        Ok(ObservedContinuity::UnchangedAtEndpoints),
+                        Ok(ObservedContinuity::UnchangedAtEndpoints),
+                    ) => capture.capacity(&|| shared.stopping()),
+                    (Ok(ObservedContinuity::Changed), _) => Err(OriginIssue::IdentityChanged),
+                    (_, Ok(ObservedContinuity::Changed)) => Err(OriginIssue::NamespaceChanged),
+                    (Err(error), _) | (_, Err(error)) => Err(error),
+                };
+                state.facts.validation = Ok(validation);
+                state.facts.after = after;
+            } else {
+                state.facts.after = Err(OriginIssue::RootNotCaptured);
+                state.facts.validation = Err(OriginIssue::RootNotCaptured);
             }
         }
         // All scoped workers have joined. Cancellation never suppresses the one terminal attempt.
@@ -1091,6 +1253,13 @@ mod platform {
             return Err(error);
         }
         let handle = DirectoryHandle(handle);
+        if let Some(observed) = shared.observed {
+            let mut state = observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.facts.directories.opened_directories += 1;
+            state.facts.directories.not_queried += 1;
+        }
         let mut information = BY_HANDLE_FILE_INFORMATION::default();
         if shared.stopping() {
             return Ok(());
@@ -1140,6 +1309,31 @@ mod platform {
             return Err(ScanError {
                 code: ERROR_DIRECTORY,
             });
+        }
+        if let Some(observed) = shared.observed {
+            use std::os::windows::io::BorrowedHandle;
+            // SAFETY: DirectoryHandle owns this live handle for the entire observation call.
+            let borrowed = unsafe { BorrowedHandle::borrow_raw(handle.0) };
+            let mut state = observed
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if work.key == NodeKey::new(0) {
+                let (root, capture) =
+                    crate::volume::capture_origin(borrowed, &|| shared.stopping());
+                state.facts.root = Ok(root);
+                state.facts.before = capture
+                    .as_ref()
+                    .map_err(|error| *error)
+                    .and_then(|capture| capture.capacity(&|| shared.stopping()));
+                state.capture = capture.ok();
+            }
+            let ObservedState { facts, capture } = &mut *state;
+            crate::volume::observe_namespace(
+                capture.as_ref(),
+                borrowed,
+                &mut facts.directories,
+                &|| shared.stopping(),
+            );
         }
         // u64 storage guarantees 8-byte alignment; 64 KiB bounds one enumeration response.
         let mut buffer = vec![0_u64; 8192];
