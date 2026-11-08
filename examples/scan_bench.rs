@@ -98,6 +98,128 @@ fn optional_count(value: Option<impl std::fmt::Display>) -> String {
     value.map_or_else(|| "unknown".into(), |value| value.to_string())
 }
 
+fn wall_offset_ms(start: std::time::SystemTime, time: std::time::SystemTime) -> i128 {
+    match time.duration_since(start) {
+        Ok(duration) => duration.as_millis() as i128,
+        Err(error) => -(error.duration().as_millis() as i128),
+    }
+}
+
+fn difference(
+    sample: Result<hogmap::volume::OriginCapacitySample, hogmap::volume::OriginIssue>,
+    allocated: Option<u64>,
+) -> Result<i128, String> {
+    let sample = sample.map_err(|issue| format!("origin:{issue:?}"))?;
+    if let Some(issue) = sample.metadata.issue {
+        return Err(format!("capacity:{issue:?}"));
+    }
+    let (total, free) = sample
+        .total_bytes
+        .zip(sample.free_bytes)
+        .ok_or("capacity_unknown")?;
+    if free > total {
+        return Err("incoherent_capacity".into());
+    }
+    let allocated = allocated.ok_or("allocated_overflow")?;
+    // Three u64 inputs fit in i128, preserving a negative discrepancy rather than clipping it.
+    Ok(i128::from(total) - i128::from(free) - i128::from(allocated))
+}
+
+fn print_origin_diagnostics(
+    observations: &hogmap::scan_win::ScanOriginObservations,
+    filesystem: Option<&str>,
+    allocated: Option<u64>,
+) {
+    let filesystem = match filesystem.map(str::to_ascii_uppercase).as_deref() {
+        Some("NTFS") => "NTFS",
+        Some("REFS") => "ReFS",
+        Some("FAT") => "FAT",
+        Some("FAT32") => "FAT32",
+        Some("EXFAT") => "exFAT",
+        _ => "unknown",
+    };
+    println!("observed_listed_filesystem_type={filesystem}");
+    println!("observed_filesystem_source=pre_scan_listing");
+    match &observations.root {
+        Ok(root) => {
+            println!("origin_root_scope={:?}", root.scope);
+            println!("origin_root_scope_issue={:?}", root.scope_issue);
+            println!(
+                "origin_root_capture_offset_ms={}",
+                wall_offset_ms(observations.started_at, root.captured_at)
+            );
+        }
+        Err(issue) => {
+            println!("origin_root_scope=Unknown");
+            println!("origin_root_scope_issue={issue:?}");
+            println!("origin_root_capture_offset_ms=unknown");
+        }
+    }
+    println!(
+        "origin_enumeration_finished_offset_ms={}",
+        optional_count(
+            observations
+                .enumeration_finished_at
+                .map(|time| wall_offset_ms(observations.started_at, time))
+        )
+    );
+    match observations.validation {
+        Ok(validation) => {
+            println!(
+                "origin_validation_identity={:?}",
+                validation.directory_identity
+            );
+            println!("origin_validation_path={:?}", validation.normalized_path);
+        }
+        Err(issue) => {
+            println!("origin_validation_identity=unknown:{issue:?}");
+            println!("origin_validation_path=unknown:{issue:?}");
+        }
+    }
+    println!(
+        "observed_allocated_overflow={}",
+        u8::from(allocated.is_none())
+    );
+    for (name, sample) in [
+        ("before", observations.before),
+        ("after", observations.after),
+    ] {
+        match sample {
+            Ok(sample) => {
+                println!(
+                    "origin_{name}_total_bytes={}",
+                    optional_count(sample.total_bytes)
+                );
+                println!(
+                    "origin_{name}_free_bytes={}",
+                    optional_count(sample.free_bytes)
+                );
+                println!("origin_{name}_capacity_issue={:?}", sample.metadata.issue);
+                println!(
+                    "origin_{name}_capture_offset_ms={}",
+                    wall_offset_ms(observations.started_at, sample.metadata.captured_at)
+                );
+            }
+            Err(issue) => {
+                println!("origin_{name}_total_bytes=unknown");
+                println!("origin_{name}_free_bytes=unknown");
+                println!("origin_{name}_capacity_issue=origin:{issue:?}");
+                println!("origin_{name}_capture_offset_ms=unknown");
+            }
+        }
+        match difference(sample, allocated) {
+            Ok(value) => {
+                println!("observed_d_{name}_bytes={value}");
+                println!("observed_d_{name}_issue=none");
+            }
+            Err(issue) => {
+                println!("observed_d_{name}_bytes=unknown");
+                println!("observed_d_{name}_issue={issue}");
+            }
+        }
+    }
+}
+
 fn run(args: Arguments) -> Result<bool, &'static str> {
     // Query capacity outside the scan timing; never print roots, labels or filesystem names.
     let volume_root = if args.synthetic_million {
@@ -246,7 +368,7 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
         }
     }
     println!("observed={}", u8::from(observations.is_some()));
-    if let Some(observations) = observations {
+    if let Some(observations) = observations.as_ref() {
         let counts = observations.directories;
         println!("origin_opened={}", counts.opened_directories);
         println!("origin_serial64_same={}", counts.serial64_same);
@@ -339,9 +461,22 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     let logical_metric = index
         .summary_for(SizeMetric::Logical)
         .map_err(|_| "summary_overflow")?;
-    let allocated_metric = index
-        .summary_for(SizeMetric::Allocated)
-        .map_err(|_| "summary_overflow")?;
+    let allocated_metric = index.summary_for(SizeMetric::Allocated);
+    if let Some(observations) = observations.as_ref() {
+        print_origin_diagnostics(
+            observations,
+            volume
+                .as_ref()
+                .and_then(|volume| volume.filesystem.as_deref()),
+            allocated_metric
+                .as_ref()
+                .ok()
+                .map(|metric| metric.unique_bytes),
+        );
+    }
+    if observations.is_none() && allocated_metric.is_err() {
+        return Err("summary_overflow");
+    }
     println!(
         "logical_identity_missing_files={}",
         logical_metric.identity_missing_files
@@ -350,20 +485,32 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
         "logical_conflicting_identities={}",
         logical_metric.conflicting_identities
     );
-    println!("allocated_known_bytes={}", allocated_metric.known_bytes);
-    println!("allocated_unique_bytes={}", allocated_metric.unique_bytes);
-    println!(
-        "allocated_unknown_size_files={}",
-        allocated_metric.unknown_size_files
-    );
-    println!(
-        "allocated_identity_missing_files={}",
-        allocated_metric.identity_missing_files
-    );
-    println!(
-        "allocated_conflicting_identities={}",
-        allocated_metric.conflicting_identities
-    );
+    if let Ok(allocated_metric) = allocated_metric {
+        println!("allocated_known_bytes={}", allocated_metric.known_bytes);
+        println!("allocated_unique_bytes={}", allocated_metric.unique_bytes);
+        println!(
+            "allocated_unknown_size_files={}",
+            allocated_metric.unknown_size_files
+        );
+        println!(
+            "allocated_identity_missing_files={}",
+            allocated_metric.identity_missing_files
+        );
+        println!(
+            "allocated_conflicting_identities={}",
+            allocated_metric.conflicting_identities
+        );
+    } else {
+        for field in [
+            "allocated_known_bytes",
+            "allocated_unique_bytes",
+            "allocated_unknown_size_files",
+            "allocated_identity_missing_files",
+            "allocated_conflicting_identities",
+        ] {
+            println!("{field}=unknown");
+        }
+    }
     println!(
         "entry_struct_size_bytes={}",
         index.memory_estimate().entry_bytes / index.len()
