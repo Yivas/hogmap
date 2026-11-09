@@ -1815,6 +1815,395 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::scan::{ScanEvent, ScanReducer};
+        use std::collections::BTreeMap;
+        use windows_sys::Win32::Foundation::{ERROR_PATH_NOT_FOUND, GetLastError};
+
+        // Keep FFI oracles inside the existing audited boundary, but exercise only the public
+        // scanner API. Neither oracle uses the scanner's path conversion or enumeration parser.
+        struct OwnedTree(PathBuf);
+        impl OwnedTree {
+            fn new() -> Self {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = std::env::temp_dir()
+                    .join(format!("hogmap-boundary-{}-{nanos}", std::process::id()));
+                std::fs::create_dir(&path).unwrap();
+                Self(path)
+            }
+        }
+        impl Drop for OwnedTree {
+            fn drop(&mut self) {
+                let result = std::fs::remove_dir_all(fixture_extended(&self.0));
+                if let Err(error) = result {
+                    eprintln!("boundary_fixture_cleanup_error={:?}", error.raw_os_error());
+                    assert!(thread::panicking(), "owned tree cleanup failed");
+                }
+            }
+        }
+        fn fixture_extended(path: &Path) -> PathBuf {
+            let mut name = OsString::from(r"\\?\");
+            name.push(path);
+            PathBuf::from(name)
+        }
+        type ListedTree = BTreeMap<PathBuf, (Kind, Option<u64>)>;
+
+        fn find_basic_walk(root: &Path) -> ListedTree {
+            struct FindHandle(HANDLE);
+            impl Drop for FindHandle {
+                fn drop(&mut self) {
+                    // SAFETY: this guard owns a successful FindFirstFileExW search handle.
+                    unsafe {
+                        FindClose(self.0);
+                    }
+                }
+            }
+            let mut pending = vec![PathBuf::new()];
+            let mut entries = BTreeMap::new();
+            while let Some(relative) = pending.pop() {
+                let pattern: Vec<u16> = fixture_extended(&root.join(&relative))
+                    .join("*")
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                let mut found = WIN32_FIND_DATAW::default();
+                // SAFETY: terminated wildcard and exact writable binding output; no contents.
+                let handle = unsafe {
+                    FindFirstFileExW(
+                        pattern.as_ptr(),
+                        FindExInfoBasic,
+                        (&mut found as *mut WIN32_FIND_DATAW).cast(),
+                        FindExSearchNameMatch,
+                        null(),
+                        0,
+                    )
+                };
+                assert_ne!(handle, INVALID_HANDLE_VALUE, "oracle open: {}", unsafe {
+                    GetLastError()
+                });
+                let _handle = FindHandle(handle);
+                loop {
+                    let end = found.cFileName.iter().position(|unit| *unit == 0).unwrap();
+                    let name = OsString::from_wide(&found.cFileName[..end]);
+                    if name != "." && name != ".." {
+                        assert_eq!(found.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT, 0);
+                        let child = relative.join(name);
+                        let directory = found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+                        let logical = (!directory).then_some(
+                            (u64::from(found.nFileSizeHigh) << 32) | u64::from(found.nFileSizeLow),
+                        );
+                        assert!(
+                            entries
+                                .insert(
+                                    child.clone(),
+                                    (
+                                        if directory {
+                                            Kind::Directory
+                                        } else {
+                                            Kind::File
+                                        },
+                                        logical
+                                    )
+                                )
+                                .is_none()
+                        );
+                        if directory {
+                            pending.push(child);
+                        }
+                    }
+                    // SAFETY: live search handle and writable binding output.
+                    if unsafe { FindNextFileW(handle, &mut found) } == 0 {
+                        assert_eq!(unsafe { GetLastError() }, ERROR_NO_MORE_FILES);
+                        break;
+                    }
+                }
+            }
+            entries
+        }
+
+        fn scan_owned_tree(
+            root: PathBuf,
+            sender: ScanSender,
+            receiver: crate::scan::ScanReceiver,
+            mut inspect: impl FnMut(&ScanEvent),
+        ) -> (ScanReducer, ScanReport) {
+            let generation = ScanGeneration::new(960);
+            let worker = thread::spawn(move || {
+                crate::scan_win::run_win_scan_with_options(
+                    generation,
+                    root,
+                    sender,
+                    &ScanCancellation::new(),
+                    ScanOptions {
+                        workers: 1,
+                        ..ScanOptions::default()
+                    },
+                )
+            });
+            let mut events = Vec::new();
+            loop {
+                match receiver.recv_timeout(Duration::from_secs(10)) {
+                    Ok(event) => {
+                        inspect(&event);
+                        events.push(event);
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(error) => {
+                        drop(receiver); // Release backpressure before joining on a failed test.
+                        panic!("owned scan did not finish: {error}");
+                    }
+                }
+            }
+            let (outcome, report) = worker.join().unwrap();
+            assert_eq!(outcome, ProducerOutcome::Finished);
+            assert_eq!(events.iter().filter(|event| event.is_terminal()).count(), 1);
+            let mut reducer = ScanReducer::new(generation);
+            let (sender, receiver) = crate::scan::event_channel(1);
+            for event in events {
+                sender.send(event).unwrap();
+                reducer.drain(&receiver, 4096);
+            }
+            assert_eq!(reducer.terminal(), Some(Terminal::Finished));
+            assert_eq!(reducer.diagnostics().unknown_parent_records, 0);
+            assert_eq!(reducer.diagnostics().invalid_records, 0);
+            (reducer, report)
+        }
+
+        fn indexed_tree(reducer: &ScanReducer) -> ListedTree {
+            let index = reducer.index().unwrap();
+            let mut paths = BTreeMap::new();
+            let mut entries = BTreeMap::new();
+            for (id, entry) in index.entries() {
+                let path = if let Some(parent) = entry.parent {
+                    let parent: &PathBuf = paths.get(&parent).expect("parent before child");
+                    parent.join(entry.name)
+                } else {
+                    PathBuf::new()
+                };
+                if entry.parent.is_some() {
+                    entries.insert(
+                        path.clone(),
+                        (
+                            entry.kind,
+                            if entry.kind == Kind::File {
+                                entry.sizes.logical
+                            } else {
+                                None
+                            },
+                        ),
+                    );
+                }
+                paths.insert(id, path);
+            }
+            entries
+        }
+
+        #[test]
+        fn owned_tree_counts_names_and_lengths_agree_with_find_basic_walk() {
+            let fixture = OwnedTree::new();
+            std::fs::create_dir_all(fixture.0.join("nested/雪-😀/empty")).unwrap();
+            std::fs::create_dir(fixture.0.join("empty")).unwrap();
+            std::fs::write(fixture.0.join("nested/雪-😀/known"), [1; 11]).unwrap();
+            std::fs::write(fixture.0.join("first"), [2; 7]).unwrap();
+            std::fs::hard_link(fixture.0.join("first"), fixture.0.join("second")).unwrap();
+            for number in 0..96 {
+                std::fs::write(
+                    fixture.0.join(format!("sibling-{number:03}")),
+                    vec![0; number],
+                )
+                .unwrap();
+            }
+            let expected = find_basic_walk(&fixture.0);
+            assert_eq!(
+                expected
+                    .values()
+                    .filter(|(kind, _)| *kind == Kind::Directory)
+                    .count(),
+                4
+            );
+            assert_eq!(
+                expected
+                    .values()
+                    .filter(|(kind, _)| *kind == Kind::File)
+                    .count(),
+                99
+            );
+            let (sender, receiver) = crate::scan::event_channel(1);
+            let (reducer, report) = scan_owned_tree(fixture.0.clone(), sender, receiver, |_| {});
+            assert_eq!(
+                report.fallback_directories, 0,
+                "primary path must be exercised"
+            );
+            assert_eq!(indexed_tree(&reducer), expected);
+            let summary = reducer.index().unwrap().summary().unwrap();
+            assert_eq!(summary.files, 99);
+            assert_eq!(summary.known_logical_bytes, 4585);
+            assert!(summary.complete);
+            assert_eq!(reducer.diagnostics().directory_failures, 0);
+        }
+
+        #[test]
+        fn concurrent_owned_changes_preserve_listed_sizes_and_report_vanished_directory() {
+            use std::sync::mpsc;
+            let fixture = OwnedTree::new();
+            std::fs::create_dir(fixture.0.join("vanishing")).unwrap();
+            std::fs::write(fixture.0.join("removed"), [0; 7]).unwrap();
+            std::fs::write(fixture.0.join("stable"), [0; 11]).unwrap();
+            let (sender, receiver) = crate::scan::event_channel(1);
+            let gated = Arc::new(AtomicBool::new(true));
+            let gate = gated.clone();
+            let gate_failed = Arc::new(AtomicBool::new(false));
+            let wake_failed = gate_failed.clone();
+            let (ack, released) = mpsc::channel();
+            let released = Mutex::new(released);
+            sender.set_waker(move || {
+                if !gate.load(Ordering::SeqCst) {
+                    return;
+                }
+                let released = released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !gate.load(Ordering::SeqCst) {
+                    return;
+                }
+                // Drop can invoke this waker again during unwind: report ACK failure to the
+                // test instead of panicking here and risking a second panic from destruction.
+                if released.recv_timeout(Duration::from_secs(10)).is_err() {
+                    wake_failed.store(true, Ordering::SeqCst);
+                    gate.store(false, Ordering::SeqCst);
+                }
+            });
+            let mut vanished = None;
+            let mut failure = None;
+            let mut changed = false;
+            let mut listed = BTreeMap::new();
+            let mut seen = std::collections::HashSet::new();
+            let (reducer, _) = scan_owned_tree(fixture.0.clone(), sender, receiver, |event| {
+                if let ScanEventKind::Batch(batch) = &event.event {
+                    for record in batch.records() {
+                        if let Some(parent) = record.parent {
+                            assert!(seen.contains(&parent));
+                        }
+                        assert!(seen.insert(record.key));
+                        if record.kind == Kind::File {
+                            let expected = match record.name.to_str().unwrap() {
+                                "stable" => 11,
+                                "removed" => 7,
+                                "created" => 13,
+                                other => panic!("unexpected owned file {other}"),
+                            };
+                            assert!(record.sizes.logical.is_none_or(|value| value == expected));
+                            listed.insert(record.name.clone(), record.sizes);
+                        }
+                        if record.name == "vanishing" {
+                            vanished = Some(record.key);
+                        }
+                    }
+                    if vanished.is_some() && !changed {
+                        // The public transport waker holds this single producer at publication,
+                        // before it can open the discovered directory. No timing sleeps needed.
+                        std::fs::remove_dir(fixture.0.join("vanishing")).unwrap();
+                        std::fs::remove_file(fixture.0.join("removed")).unwrap();
+                        std::fs::write(fixture.0.join("created"), [0; 13]).unwrap();
+                        std::fs::create_dir(fixture.0.join("new-directory")).unwrap();
+                        std::fs::remove_dir(fixture.0.join("new-directory")).unwrap();
+                        let wide: Vec<_> = fixture_extended(&fixture.0.join("vanishing"))
+                            .as_os_str()
+                            .encode_wide()
+                            .chain(Some(0))
+                            .collect();
+                        // SAFETY: terminated owned missing directory path, metadata only.
+                        assert_eq!(
+                            unsafe { GetFileAttributesW(wide.as_ptr()) },
+                            INVALID_FILE_ATTRIBUTES
+                        );
+                        failure = Some(unsafe { GetLastError() });
+                        assert!(matches!(
+                            failure,
+                            Some(ERROR_FILE_NOT_FOUND | ERROR_PATH_NOT_FOUND)
+                        ));
+                        changed = true;
+                    }
+                    for outcome in batch.outcomes() {
+                        if Some(outcome.key) == vanished {
+                            assert_eq!(outcome.code, failure);
+                            assert!(
+                                outcome.code.is_some(),
+                                "vanished directory is not empty success"
+                            );
+                        }
+                    }
+                }
+                if gated.load(Ordering::SeqCst) {
+                    if changed {
+                        gated.store(false, Ordering::SeqCst);
+                    }
+                    ack.send(()).unwrap();
+                }
+            });
+            assert!(
+                !gate_failed.load(Ordering::SeqCst),
+                "publication gate ACK timed out or disconnected"
+            );
+            assert!(changed);
+            assert_eq!(reducer.diagnostics().directory_failures, 1);
+            assert_eq!(reducer.diagnostics().last_directory_failure_code, failure);
+            assert!(!reducer.index().unwrap().summary().unwrap().complete);
+            for (_, entry) in reducer.index().unwrap().entries() {
+                if entry.kind == Kind::File {
+                    assert_eq!(Some(&entry.sizes), listed.get(entry.name));
+                }
+                if entry.name == "vanishing" {
+                    assert_eq!(entry.state, crate::index::State::Inaccessible);
+                }
+            }
+        }
+
+        #[test]
+        fn owned_long_paths_scan_from_plain_and_extended_roots() {
+            let fixture = OwnedTree::new();
+            let mut deepest = fixture.0.clone();
+            for level in 0..8 {
+                deepest.push(format!("level-{level}-{}", "x".repeat(32)));
+                std::fs::create_dir(fixture_extended(&deepest)).unwrap();
+            }
+            assert!(deepest.as_os_str().encode_wide().count() > 260);
+            std::fs::create_dir(fixture_extended(&deepest.join("empty"))).unwrap();
+            std::fs::write(fixture_extended(&deepest.join("leaf")), [0; 17]).unwrap();
+            std::fs::write(fixture_extended(&deepest.join("雪-😀")), [0; 5]).unwrap();
+            for (root, directories) in [(&fixture.0, 9), (&deepest, 1)] {
+                for extended in [false, true] {
+                    let path = if extended {
+                        fixture_extended(root)
+                    } else {
+                        root.clone()
+                    };
+                    let (sender, receiver) = crate::scan::event_channel(1);
+                    let (reducer, report) = scan_owned_tree(path, sender, receiver, |_| {});
+                    let entries = indexed_tree(&reducer);
+                    assert_eq!(
+                        entries
+                            .values()
+                            .filter(|(kind, _)| *kind == Kind::Directory)
+                            .count(),
+                        directories
+                    );
+                    assert_eq!(entries, find_basic_walk(root));
+                    let summary = reducer.index().unwrap().summary().unwrap();
+                    assert_eq!(summary.files, 2);
+                    assert_eq!(summary.known_logical_bytes, 22);
+                    assert!(summary.complete);
+                    assert_eq!(report.fallback_directories, 0);
+                    assert_eq!(reducer.diagnostics().directory_failures, 0);
+                }
+            }
+            let root = fixture.0.clone();
+            drop(fixture);
+            assert!(!root.try_exists().unwrap());
+        }
 
         #[test]
         fn conflict_reread_uses_verified_native_hardlink_handles_not_listed_sizes() {
