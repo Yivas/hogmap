@@ -1,3 +1,6 @@
+mod composition;
+#[cfg(test)]
+mod composition_tests;
 mod dialog;
 mod icons;
 mod logic;
@@ -10,13 +13,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, Modifiers};
+use hogmap::composition::{CompositionEvaluation, CompositionView, VolumeEvidence};
 use hogmap::filter::Match;
 use hogmap::index::{EntryId, Index, SizeMetric};
 use hogmap::scan::{
     DEFAULT_CHANNEL_CAPACITY, ScanCancellation, ScanGeneration, ScanReceiver, ScanReducer,
     Terminal, event_channel,
 };
-use hogmap::scan_win::{ScanOptions, ScanReport, run_win_scan_with_options};
+use hogmap::scan_win::{
+    ConflictRereadBatch, ConflictRereadPlan, ConflictRereadReport, ScanOptions,
+    ScanOriginObservations, ScanReport, run_win_scan_observed_with_options,
+};
 use hogmap::synthetic::{SyntheticSpec, run_synthetic};
 use hogmap::treemap::{self, Layout, LayoutError, LayoutParams, NodeRef, Rect};
 use hogmap::volume::{self, volume_root_for};
@@ -36,11 +43,39 @@ enum ScanRequest {
 
 type PreparedScan = Result<(PathBuf, dialog::DriveChoice), String>;
 
+struct ScanCompletion {
+    generation: ScanGeneration,
+    report: Option<ScanReport>,
+    observations: Option<ScanOriginObservations>,
+}
+struct RereadCompletion {
+    generation: ScanGeneration,
+    batch: ConflictRereadBatch,
+}
+enum ConflictResolution {
+    Waiting,
+    NoConflicts,
+    Preparing(ScanGeneration, ConflictRereadPlan),
+    Reading(JoinHandle<RereadCompletion>),
+    Applying(RereadCompletion),
+    Complete(ConflictRereadReport),
+    Unavailable,
+}
+impl ConflictResolution {
+    fn active(&self) -> bool {
+        matches!(
+            self,
+            Self::Preparing(..) | Self::Reading(_) | Self::Applying(_)
+        )
+    }
+}
+
 /// What a map was built for. The metric is part of the key, so geometry and labels built for one
 /// metric are never shown, even partly, while the other one is selected.
 #[derive(Debug, PartialEq)]
 struct ViewKey {
     version: u64,
+    resolution_revision: u64,
     location: Location,
     rect: Rect,
     metric: SizeMetric,
@@ -92,9 +127,14 @@ pub struct HogMap {
     pending_theme: Option<Theme>,
     reducer: ScanReducer,
     receiver: Option<ScanReceiver>,
-    producer: Option<JoinHandle<Option<ScanReport>>>,
-    // At most one retired producer: a replacement cannot start until it has returned.
-    pending_producers: Vec<JoinHandle<Option<ScanReport>>>,
+    producer: Option<JoinHandle<ScanCompletion>>,
+    // A replacement waits for retired scan/reread workers instead of accumulating blocked I/O.
+    pending_producers: Vec<JoinHandle<ScanCompletion>>,
+    pending_rereads: Vec<JoinHandle<RereadCompletion>>,
+    resolution: ConflictResolution,
+    observations: Option<ScanOriginObservations>,
+    volume_evidence: Option<VolumeEvidence>,
+    resolution_revision: u64,
     pending_scan: Option<ScanRequest>,
     preparation: Option<JoinHandle<PreparedScan>>,
     closing: bool,
@@ -143,6 +183,11 @@ impl HogMap {
             receiver: None,
             producer: None,
             pending_producers: Vec::new(),
+            pending_rereads: Vec::new(),
+            resolution: ConflictResolution::Waiting,
+            observations: None,
+            volume_evidence: None,
+            resolution_revision: 0,
             pending_scan: None,
             preparation: None,
             closing: false,
@@ -179,6 +224,11 @@ impl HogMap {
         if let Some(producer) = self.producer.take() {
             self.pending_producers.push(producer);
         }
+        if let ConflictResolution::Reading(worker) =
+            std::mem::replace(&mut self.resolution, ConflictResolution::Unavailable)
+        {
+            self.pending_rereads.push(worker);
+        }
     }
 
     fn request_close(&mut self) {
@@ -200,11 +250,23 @@ impl HogMap {
     fn work_pending(&self) -> bool {
         self.producer.is_some()
             || !self.pending_producers.is_empty()
+            || !self.pending_rereads.is_empty()
+            || self.resolution.active()
             || self.preparation.is_some()
             || self.pending_scan.is_some()
     }
 
     fn poll_pending(&mut self) {
+        let mut position = 0;
+        while position < self.pending_rereads.len() {
+            if self.pending_rereads[position].is_finished() {
+                if self.pending_rereads.swap_remove(position).join().is_err() {
+                    self.error = Some(text::REREAD_PANIC.into());
+                }
+            } else {
+                position += 1;
+            }
+        }
         let mut position = 0;
         while position < self.pending_producers.len() {
             if self.pending_producers[position].is_finished() {
@@ -238,7 +300,11 @@ impl HogMap {
                 self.error = Some(text::PRODUCER_PANIC.into());
             }
         }
-        if !self.pending_producers.is_empty() || self.preparation.is_some() || self.closing {
+        if !self.pending_producers.is_empty()
+            || !self.pending_rereads.is_empty()
+            || self.preparation.is_some()
+            || self.closing
+        {
             return;
         }
         match self.pending_scan.take() {
@@ -281,7 +347,15 @@ impl HogMap {
         }
         if let Some(producer) = self.producer.take() {
             match producer.join() {
-                Ok(report) => self.scan_report = report,
+                Ok(completion) if completion.generation == self.reducer.generation() => {
+                    self.scan_report = completion.report;
+                    self.volume_evidence = completion
+                        .observations
+                        .as_ref()
+                        .map(VolumeEvidence::from_observations);
+                    self.observations = completion.observations;
+                }
+                Ok(_) => {}
                 Err(_) => self.error = Some(text::PRODUCER_PANIC.into()),
             }
         }
@@ -303,14 +377,18 @@ impl HogMap {
         let producer = thread::Builder::new()
             .name("windows-scan".into())
             .spawn(move || {
-                let (_, report) = run_win_scan_with_options(
+                let result = run_win_scan_observed_with_options(
                     generation,
                     scan_root,
                     sender,
                     &flag,
                     ScanOptions::default(),
                 );
-                Some(report)
+                ScanCompletion {
+                    generation,
+                    report: Some(result.report),
+                    observations: Some(result.observations),
+                }
             });
         let producer = match producer {
             Ok(producer) => producer,
@@ -366,7 +444,11 @@ impl HogMap {
                     sender,
                     &flag,
                 );
-                None
+                ScanCompletion {
+                    generation,
+                    report: None,
+                    observations: None,
+                }
             })?;
         self.volume = None;
         self.scan_root = None;
@@ -384,7 +466,7 @@ impl HogMap {
         &mut self,
         generation: ScanGeneration,
         receiver: ScanReceiver,
-        producer: JoinHandle<Option<ScanReport>>,
+        producer: JoinHandle<ScanCompletion>,
         cancellation: ScanCancellation,
         previous_failed: bool,
     ) {
@@ -398,6 +480,10 @@ impl HogMap {
         self.chooser.open = false;
         self.chooser.error = None;
         self.scan_report = None;
+        self.observations = None;
+        self.volume_evidence = None;
+        self.resolution = ConflictResolution::Waiting;
+        self.resolution_revision = 0;
         self.history = History::default();
         self.selected = None;
         self.cache = None;
@@ -411,7 +497,11 @@ impl HogMap {
     }
 
     fn cancel(&mut self) {
-        if !(self.receiver.is_some() || self.preparation.is_some() || self.pending_scan.is_some()) {
+        if !(self.receiver.is_some()
+            || self.preparation.is_some()
+            || self.pending_scan.is_some()
+            || self.resolution.active())
+        {
             return;
         }
         self.cancellation.cancel();
@@ -449,6 +539,7 @@ impl HogMap {
         // The terminal may arrive just before the thread returns its counts-only report.
         // `collect_producer` joins only an already finished thread.
         self.collect_producer();
+        self.advance_resolution();
         self.poll_pending();
         self.chooser.poll_drives(context);
         self.advance_scan();
@@ -457,6 +548,138 @@ impl HogMap {
         } else if self.closing {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+
+    fn advance_resolution(&mut self) {
+        if self.closing || self.pending_scan.is_some() {
+            return;
+        }
+        let state = std::mem::replace(&mut self.resolution, ConflictResolution::Unavailable);
+        self.resolution = match state {
+            ConflictResolution::Waiting
+                if self.observations.is_some()
+                    && self.reducer.terminal() == Some(Terminal::Finished) =>
+            {
+                let index = self.reducer.index().expect("finished observed index");
+                if index.conflicting_identity_count() == 0 {
+                    ConflictResolution::NoConflicts
+                } else if let Some(root) = &self.scan_root {
+                    ConflictResolution::Preparing(
+                        self.reducer.generation(),
+                        ConflictRereadPlan::new(index, root),
+                    )
+                } else {
+                    ConflictResolution::Unavailable
+                }
+            }
+            ConflictResolution::Preparing(generation, mut plan) => {
+                if generation != self.reducer.generation()
+                    || self.reducer.terminal() != Some(Terminal::Finished)
+                {
+                    ConflictResolution::Unavailable
+                } else if plan.prepare(
+                    self.reducer.index().expect("finished index"),
+                    &self.cancellation,
+                    DRAIN_BUDGET,
+                ) {
+                    let cancel = self.cancellation.clone();
+                    match thread::Builder::new()
+                        .name("conflict-reread".into())
+                        .spawn(move || RereadCompletion {
+                            generation,
+                            batch: plan.reread(&cancel),
+                        }) {
+                        Ok(worker) => ConflictResolution::Reading(worker),
+                        Err(error) => {
+                            self.error = Some(format!("{}: {error}", text::REREAD_START_ERROR));
+                            ConflictResolution::Unavailable
+                        }
+                    }
+                } else {
+                    ConflictResolution::Preparing(generation, plan)
+                }
+            }
+            ConflictResolution::Reading(worker) if worker.is_finished() => match worker.join() {
+                Ok(completion) => {
+                    self.accept_reread(completion);
+                    return;
+                }
+                Err(_) => {
+                    self.error = Some(text::REREAD_PANIC.into());
+                    ConflictResolution::Unavailable
+                }
+            },
+            ConflictResolution::Applying(mut completion) => {
+                if !self.reread_is_current(completion.generation) {
+                    ConflictResolution::Unavailable
+                } else {
+                    let index = self
+                        .reducer
+                        .finished_index_mut()
+                        .expect("verified finished generation");
+                    let finished = completion.batch.apply(index, DRAIN_BUDGET);
+                    // Listed filter inputs did not change. Only geometry/labels need rebuilding.
+                    self.resolution_revision = self.resolution_revision.wrapping_add(1);
+                    if finished {
+                        ConflictResolution::Complete(completion.batch.into_report())
+                    } else {
+                        ConflictResolution::Applying(completion)
+                    }
+                }
+            }
+            state => state,
+        };
+    }
+
+    fn reread_is_current(&self, generation: ScanGeneration) -> bool {
+        generation == self.reducer.generation()
+            && self.reducer.terminal() == Some(Terminal::Finished)
+            && !self.closing
+            && self.pending_scan.is_none()
+    }
+
+    fn accept_reread(&mut self, completion: RereadCompletion) -> bool {
+        if !self.reread_is_current(completion.generation) {
+            return false;
+        }
+        self.resolution = ConflictResolution::Applying(completion);
+        true
+    }
+
+    fn resolution_status(&self) -> String {
+        match &self.resolution {
+            ConflictResolution::Waiting if self.scan_root.is_none() => {
+                text::CONFLICT_CHECK_UNAVAILABLE.into()
+            }
+            ConflictResolution::Waiting => text::CONFLICT_CHECK_PENDING.into(),
+            ConflictResolution::NoConflicts => text::NO_CONFLICTS.into(),
+            ConflictResolution::Preparing(_, plan) => {
+                text::preparing_conflicts(plan.candidate_count())
+            }
+            ConflictResolution::Reading(_) => text::RESOLVING_CONFLICTS.into(),
+            ConflictResolution::Applying(_) => text::APPLYING_CONFLICTS.into(),
+            ConflictResolution::Complete(report) => text::conflict_report(report),
+            ConflictResolution::Unavailable => text::CONFLICT_CHECK_UNAVAILABLE.into(),
+        }
+    }
+
+    fn composition(&self) -> CompositionEvaluation {
+        let index = self
+            .reducer
+            .index()
+            .expect("composition requires an available index");
+        hogmap::composition::evaluate(
+            CompositionView {
+                metric: self.metric,
+                unzoomed: self.history.current() == Location::default(),
+                finished: self.reducer.terminal() == Some(Terminal::Finished)
+                    && self.pending_scan.is_none()
+                    && !self.closing,
+            },
+            self.volume_evidence.as_ref(),
+            index.summary_for(SizeMetric::Allocated),
+            index.conflicting_identity_count(),
+        )
     }
 
     /// A layout failure of the selected metric. One left by the other metric is not reported while
@@ -705,7 +928,8 @@ impl HogMap {
                 let can_stop = !self.cancelled
                     && (self.receiver.is_some()
                         || self.preparation.is_some()
-                        || self.pending_scan.is_some());
+                        || self.pending_scan.is_some()
+                        || self.resolution.active());
                 if button(ui, Icon::Stop, can_stop, false, text::STOP_TIP).clicked() {
                     self.cancel();
                 }
@@ -811,10 +1035,17 @@ impl HogMap {
                     self.reducer.terminal(),
                 );
                 let stopping = !self.pending_producers.is_empty()
+                    || !self.pending_rereads.is_empty()
                     || self.closing
                     || (self.cancelled && self.producer.is_some())
                     || (self.preparation.is_some() && self.cancellation.is_cancelled());
-                let lifecycle = if stopping {
+                let lifecycle = if self.resolution.active() && !stopping {
+                    if self.cancelled {
+                        text::STOPPING
+                    } else {
+                        text::RESOLVING_CONFLICTS
+                    }
+                } else if stopping {
                     text::STOPPING
                 } else if self.preparation.is_some() {
                     text::PREPARING_SCAN
@@ -825,7 +1056,9 @@ impl HogMap {
                 };
                 // Ready describes an idle producer, never the completeness of its metadata.
                 let master = match state {
-                    logic::ScanState::Finished if !stopping && self.preparation.is_none() => {
+                    logic::ScanState::Finished
+                        if !stopping && self.preparation.is_none() && !self.resolution.active() =>
+                    {
                         text::READY
                     }
                     _ => lifecycle,
@@ -859,6 +1092,16 @@ impl HogMap {
                         detail.push('\n');
                         detail.push_str(&text::scan_report(report));
                     }
+                    let composition = self.composition();
+                    let composition_status = text::composition_status(&composition);
+                    detail.push('\n');
+                    detail.push_str(&composition_status);
+                    detail.push('\n');
+                    detail.push_str(&self.resolution_status());
+                    if let Some(observations) = &self.observations {
+                        detail.push('\n');
+                        detail.push_str(&text::observation_detail(observations));
+                    }
                     if let Some(error) = &self.error {
                         detail.push('\n');
                         detail.push_str(error);
@@ -873,6 +1116,7 @@ impl HogMap {
                         &totals,
                         self.scan_elapsed,
                     );
+                    let master = format!("{master} · {composition_status}");
                     let accessible = format!("{master}\n{detail}");
                     let status = ui.add(egui::Label::new(master).truncate());
                     status.widget_info(|| {
@@ -992,7 +1236,6 @@ impl HogMap {
 
     fn map(&mut self, ui: &mut egui::Ui) {
         let (area, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
-        let rect = Rect::new(area.min.x, area.min.y, area.width(), area.height());
         let palette = Theme::current(ui.ctx()).palette();
         let Some(index) = self.reducer.index() else {
             ui.painter().text(
@@ -1008,11 +1251,32 @@ impl HogMap {
             );
             return;
         };
+        let evaluation = self.composition();
+        let allocated = index
+            .summary_for(SizeMetric::Allocated)
+            .ok()
+            .and_then(|summary| summary.apparent_bytes().ok())
+            .unwrap_or(0);
+        let (tree_area, volume_cells) =
+            composition::arrange(area, allocated, evaluation.components);
+        composition::draw(
+            ui,
+            palette,
+            &volume_cells,
+            &text::composition_status(&evaluation),
+        );
+        let rect = Rect::new(
+            tree_area.min.x,
+            tree_area.min.y,
+            tree_area.width(),
+            tree_area.height(),
+        );
         if rect.width <= 1.0 || rect.height <= 1.0 {
             return;
         }
         let key = ViewKey {
             version: self.version,
+            resolution_revision: self.resolution_revision,
             location: self.history.current(),
             rect,
             metric: self.metric,
@@ -1098,9 +1362,11 @@ impl HogMap {
                     self.filter_changed = false;
                 }
                 Err(error) => {
-                    // The other metric is offered only when its own totals did not overflow.
+                    // Geometry/context validation is metric-independent. With nonnegative
+                    // weights, every subtotal fits if the whole apparent total fits; no second
+                    // layout is needed to rule out SizeOverflow in the other metric.
                     let other_available = error == LayoutError::SizeOverflow
-                        && index.summary_for(logic::other_metric(self.metric)).is_ok();
+                        && logic::metric_totals(index, logic::other_metric(self.metric)).is_ok();
                     self.layout_failure = Some(LayoutFailure {
                         message: text::layout_error(self.metric, error, other_available),
                         key,
@@ -1145,7 +1411,7 @@ impl HogMap {
         );
         if cache.layout.known_sum == 0 {
             ui.painter().text(
-                area.center(),
+                tree_area.center(),
                 egui::Align2::CENTER_CENTER,
                 text::empty_map(cache.key.metric),
                 egui::FontId::proportional(13.0),
@@ -1316,7 +1582,11 @@ mod tests {
         app.producer = Some(thread::spawn(move || {
             wait.recv().unwrap();
             returned.send(()).unwrap();
-            None
+            ScanCompletion {
+                generation: ScanGeneration::new(0),
+                report: None,
+                observations: None,
+            }
         }));
         let flag = app.cancellation.clone();
         let (sender, receiver) = event_channel(1);

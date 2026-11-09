@@ -67,6 +67,11 @@ fn authoritative_charges_preserve_listings_and_layout_owners_with_signed_deltas(
         index.conflicting_identities().collect::<Vec<_>>(),
         vec![identity]
     );
+    assert_eq!(index.conflicting_identity_count(), 1);
+    assert_eq!(
+        index.conflict_candidates().collect::<Vec<_>>(),
+        vec![(identity, alias)]
+    );
     let result = index
         .apply_authoritative_sizes(
             identity,
@@ -80,6 +85,8 @@ fn authoritative_charges_preserve_listings_and_layout_owners_with_signed_deltas(
     assert_eq!(result.allocated, ChargeResolution::Applied);
     assert!(!result.still_conflicted);
     assert_eq!(index.conflicting_identities().count(), 0);
+    assert_eq!(index.conflicting_identity_count(), 0);
+    assert_eq!(index.conflict_candidates().count(), 0);
     let logical = index.summary_for(SizeMetric::Logical).unwrap();
     assert_eq!(
         (
@@ -115,7 +122,59 @@ fn authoritative_charges_preserve_listings_and_layout_owners_with_signed_deltas(
         .unwrap();
         assert_eq!(
             layout.known_sum,
-            index.summary_for(metric).unwrap().unique_bytes
+            if metric == SizeMetric::Logical {
+                285
+            } else {
+                150
+            }
+        );
+        assert_eq!(
+            layout.known_sum,
+            index.summary_for(metric).unwrap().apparent_bytes().unwrap()
+        );
+        let weight = |id| {
+            layout
+                .placed
+                .iter()
+                .find(|p| p.node == NodeRef::Entry(id))
+                .unwrap()
+                .known_sum
+        };
+        assert_eq!(
+            weight(first),
+            if metric == SizeMetric::Logical {
+                80
+            } else {
+                60
+            }
+        );
+        assert_eq!(
+            weight(alias),
+            if metric == SizeMetric::Logical {
+                200
+            } else {
+                40
+            }
+        );
+        let detail = hogmap::treemap::layout_members_with_metric(
+            &index,
+            index.root(),
+            &[alias],
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            LayoutParams {
+                min_pixel_area: 1.0,
+                header_height: 0.0,
+            },
+            metric,
+        )
+        .unwrap();
+        assert_eq!(
+            detail.known_sum,
+            if metric == SizeMetric::Logical {
+                200
+            } else {
+                40
+            }
         );
         assert!(
             layout
@@ -127,7 +186,7 @@ fn authoritative_charges_preserve_listings_and_layout_owners_with_signed_deltas(
             layout
                 .placed
                 .iter()
-                .all(|p| p.node != NodeRef::Entry(alias))
+                .any(|p| p.node == NodeRef::Entry(alias))
         );
     }
     assert_eq!(
@@ -385,6 +444,8 @@ fn a_cancelled_capped_postpass_opens_no_files_and_reports_every_unresolved_ident
             identity,
         );
     }
+    assert_eq!(index.conflicting_identity_count(), MAX_CONFLICT_REREADS + 1);
+    assert_eq!(index.conflict_candidates().count(), MAX_CONFLICT_REREADS);
     let cancel = ScanCancellation::new();
     cancel.cancel();
     let report = reread_identity_conflicts(&mut index, std::path::Path::new("not-opened"), &cancel);

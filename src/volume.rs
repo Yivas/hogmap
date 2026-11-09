@@ -71,6 +71,7 @@ pub enum OriginIssue {
     UnsupportedNamespace,
     InvalidFinalPath,
     MissingFileIdentity,
+    MissingFilesystem,
     UnsafeDirectory,
     UnprovenVolumeRelation,
     IdentityChanged,
@@ -93,6 +94,14 @@ impl std::fmt::Debug for OriginIdentity {
     }
 }
 
+/// Filesystem name from the enumerated root handle, not a drive-letter lookup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ObservedFilesystem {
+    Ntfs,
+    /// Native output is bounded by the 261-unit filesystem-name buffer.
+    Other(String),
+}
+
 #[derive(Clone, Debug)]
 pub struct RootObservation {
     pub scope: RootScope,
@@ -101,6 +110,7 @@ pub struct RootObservation {
     pub volume_root_identity: Result<OriginIdentity, OriginIssue>,
     /// GetVolumeInformationByHandleW support bits, not evidence of actual sharing or compression.
     pub filesystem_flags: Result<u32, OriginIssue>,
+    pub filesystem: Result<ObservedFilesystem, OriginIssue>,
     pub captured_at: SystemTime,
 }
 
@@ -428,11 +438,12 @@ mod platform {
     ) -> (RootObservation, Result<OriginCapture, OriginIssue>) {
         let safety = safe_directory(handle, cancelled);
         let directory_identity = safety.and_then(|()| identity(handle, cancelled));
-        let flags = (|| {
+        let filesystem = (|| {
             safety?;
             running(cancelled)?;
             let mut flags = 0;
-            // SAFETY: live directory handle; only the flags output is requested.
+            let mut name = [0_u16; 261];
+            // SAFETY: live directory handle and bounded filesystem-name/flags outputs.
             if unsafe {
                 GetVolumeInformationByHandleW(
                     handle.as_raw_handle(),
@@ -441,14 +452,23 @@ mod platform {
                     null_mut(),
                     null_mut(),
                     &mut flags,
-                    null_mut(),
-                    0,
+                    name.as_mut_ptr(),
+                    name.len() as u32,
                 )
             } == 0
             {
                 Err(issue(OriginQuery::Filesystem, ScanError::last().code))
             } else {
-                Ok(flags)
+                let name = text(&name);
+                if name.is_empty() {
+                    return Err(OriginIssue::MissingFilesystem);
+                }
+                let filesystem = if name.eq_ignore_ascii_case("NTFS") {
+                    ObservedFilesystem::Ntfs
+                } else {
+                    ObservedFilesystem::Other(name)
+                };
+                Ok((flags, filesystem))
             }
         })();
         let mut facts = RootObservation {
@@ -456,7 +476,11 @@ mod platform {
             scope_issue: None,
             directory_identity,
             volume_root_identity: Err(OriginIssue::RootNotCaptured),
-            filesystem_flags: flags,
+            filesystem_flags: filesystem
+                .as_ref()
+                .map(|(flags, _)| *flags)
+                .map_err(|issue| *issue),
+            filesystem: filesystem.map(|(_, filesystem)| filesystem),
             captured_at: SystemTime::now(),
         };
         let capture = (|| {
@@ -935,6 +959,9 @@ mod platform {
             assert_eq!(result.report.mft_ordered, legacy_report.mft_ordered);
             let observations = result.observations;
             assert_eq!(observations.generation, generation);
+            let evidence = crate::composition::VolumeEvidence::from_observations(&observations);
+            assert_eq!(evidence.scope, Ok(RootScope::Folder));
+            assert!(evidence.filesystem.is_ok());
             let root = observations.root.unwrap();
             assert_eq!(root.scope, RootScope::Folder);
             assert_eq!(root.scope_issue, None);
@@ -942,6 +969,10 @@ mod platform {
             assert!(
                 root.filesystem_flags.is_ok(),
                 "native by-handle flags must activate here"
+            );
+            assert!(
+                root.filesystem.is_ok(),
+                "native by-handle filesystem type must activate"
             );
             let before = observations.before.unwrap();
             let after = observations.after.unwrap();
@@ -1005,6 +1036,21 @@ mod platform {
                 assert_eq!(whole.scope, RootScope::WholeVolume);
                 assert_eq!(whole.scope_issue, None);
                 assert_eq!(whole.directory_identity, whole.volume_root_identity);
+                let whole_observations = crate::scan_win::ScanOriginObservations {
+                    generation,
+                    started_at: SystemTime::now(),
+                    enumeration_finished_at: None,
+                    root: Ok(whole),
+                    directories: Default::default(),
+                    before: Err(OriginIssue::ScanNotFinished),
+                    after: Err(OriginIssue::ScanNotFinished),
+                    validation: Err(OriginIssue::ScanNotFinished),
+                };
+                assert_eq!(
+                    crate::composition::VolumeEvidence::from_observations(&whole_observations)
+                        .scope,
+                    Ok(RootScope::WholeVolume)
+                );
             }
             let cancelled = ScanCancellation::new();
             cancelled.cancel();
@@ -1083,7 +1129,7 @@ mod platform {
             drop(fixture);
             assert!(!path.exists());
             println!(
-                "origin_native policy_parity=1 folder=1 whole_volume_metadata_only=1 by_handle_flags=1 guid_capacity_begin=1 guid_capacity_end=1 serial64_same=3 serial64_different=0 serial64_unavailable=0 guid_fallbacks=0 identity_endpoints_unchanged=1 generation=1 cancelled_without_end_query=1 failed_without_end_query=1 missing_root_preserved=1 cleanup=1"
+                "origin_native policy_parity=1 folder=1 whole_volume_metadata_only=1 by_handle_flags=1 by_handle_filesystem=1 guid_capacity_begin=1 guid_capacity_end=1 serial64_same=3 serial64_different=0 serial64_unavailable=0 guid_fallbacks=0 identity_endpoints_unchanged=1 generation=1 cancelled_without_end_query=1 failed_without_end_query=1 missing_root_preserved=1 cleanup=1"
             );
         }
 
@@ -1108,6 +1154,33 @@ mod platform {
             );
             info.FileId.Identifier = (2_u128 << 100).to_le_bytes();
             let different = identity_result(Ok(info)).unwrap();
+            let mut observations = crate::scan_win::ScanOriginObservations {
+                generation: crate::scan::ScanGeneration::new(1),
+                started_at: SystemTime::UNIX_EPOCH,
+                enumeration_finished_at: None,
+                directories: Default::default(),
+                root: Ok(RootObservation {
+                    scope: RootScope::WholeVolume,
+                    scope_issue: None,
+                    directory_identity: Ok(directory),
+                    volume_root_identity: Ok(different),
+                    filesystem_flags: Ok(0),
+                    filesystem: Ok(ObservedFilesystem::Ntfs),
+                    captured_at: SystemTime::UNIX_EPOCH,
+                }),
+                before: Err(OriginIssue::RootNotCaptured),
+                after: Err(OriginIssue::ScanNotFinished),
+                validation: Err(OriginIssue::ScanNotFinished),
+            };
+            assert_eq!(
+                crate::composition::VolumeEvidence::from_observations(&observations).scope,
+                Err(OriginIssue::UnprovenVolumeRelation)
+            );
+            observations.root.as_mut().unwrap().directory_identity = zero;
+            assert_eq!(
+                crate::composition::VolumeEvidence::from_observations(&observations).scope,
+                Err(OriginIssue::MissingFileIdentity)
+            );
             assert_eq!(
                 continuity(directory, Ok(different)),
                 Ok(ObservedContinuity::Changed)

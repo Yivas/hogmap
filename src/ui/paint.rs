@@ -130,7 +130,7 @@ pub fn prepare(
         .collect()
 }
 
-fn fit(
+pub(super) fn fit(
     ui: &egui::Ui,
     label: &str,
     rect: egui::Rect,

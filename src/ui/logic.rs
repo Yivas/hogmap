@@ -184,7 +184,7 @@ pub fn other_metric(metric: SizeMetric) -> SizeMetric {
 }
 
 /// The selected metric's totals overflowed. `other_available` is true only when the other
-/// metric's own summary query succeeded; both metrics can overflow.
+/// metric's summary and derived apparent total are representable; both metrics can overflow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricOverflow {
     pub metric: SizeMetric,
@@ -194,11 +194,20 @@ pub struct MetricOverflow {
 /// Totals of the metric the map shows. An overflow is reported for that metric instead of being
 /// replaced by zero or by the other metric's totals.
 pub fn metric_totals(index: &Index, metric: SizeMetric) -> Result<MetricSummary, MetricOverflow> {
-    // `summary_for` reports only `SizeOverflow`; every error therefore means an overflow.
-    index.summary_for(metric).map_err(|_| MetricOverflow {
-        metric,
-        other_available: index.summary_for(other_metric(metric)).is_ok(),
-    })
+    // Both listed accounting and its derived apparent area must fit.
+    index
+        .summary_for(metric)
+        .and_then(|summary| {
+            summary.apparent_bytes()?;
+            Ok(summary)
+        })
+        .map_err(|_| MetricOverflow {
+            metric,
+            other_available: index
+                .summary_for(other_metric(metric))
+                .and_then(|summary| summary.apparent_bytes())
+                .is_ok(),
+        })
 }
 
 /// The renderer paints descendants after parents; hit testing follows that same order.

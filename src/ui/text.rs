@@ -51,7 +51,7 @@ pub const FORWARD_TIP: &str = "Forward · Alt+Right";
 pub const UP_TIP: &str = "Up · Backspace";
 pub const HOME_TIP: &str = "Home · Alt+Home";
 pub const RESCAN_TIP: &str = "Rescan selected scan root or sample · F5";
-pub const STOP_TIP: &str = "Stop scan · Esc";
+pub const STOP_TIP: &str = "Stop scan or hard-link checks · Esc";
 pub const EXPORT_TIP: &str = "Save / Export — not implemented yet";
 pub const VIEW_MODE_TIP: &str = "Nested / flat view — not implemented yet; current map is nested";
 pub const GROUP_BY_TIP: &str = "Group by — not implemented yet";
@@ -72,12 +72,21 @@ pub const BACK: &str = "Back";
 pub const FORWARD: &str = "Forward";
 pub const UP: &str = "Up";
 pub const HOME: &str = "Home";
-pub const CANCEL: &str = "Stop scan";
+pub const CANCEL: &str = "Stop scan or hard-link checks";
 pub const FILTER: &str = "Highlight";
 pub const FILTER_HINT: &str = "Name or logical size: *.bin;>1mb";
 pub const SAMPLE: &str = "Synthetic sample";
 pub const WAITING: &str = "Waiting for metadata…";
 pub const PARTIAL: &str = "Partial";
+pub const RESOLVING_CONFLICTS: &str = "Checking hard-link conflicts…";
+pub const APPLYING_CONFLICTS: &str = "Updating hard-link charges…";
+pub const CONFLICT_CHECK_PENDING: &str = "Hard-link checks wait for scan completion.";
+pub const NO_CONFLICTS: &str = "Hard-link check: no conflicting identities.";
+pub const CONFLICT_CHECK_UNAVAILABLE: &str =
+    "Hard-link check unavailable; unresolved conflicts are retained.";
+pub const REREAD_PANIC: &str =
+    "The hard-link check thread stopped unexpectedly; unresolved conflicts are retained";
+pub const REREAD_START_ERROR: &str = "Could not start the hard-link check thread";
 
 /// The metric inside a sentence. Allocated bytes are what Windows reports per file, so the map
 /// calls them observed: they are not a physical attribution or recoverable space.
@@ -98,9 +107,11 @@ fn metric_title(metric: SizeMetric) -> &'static str {
 /// The line under the highlight field. Highlight size conditions stay logical in either view.
 pub fn map_metric(metric: SizeMetric) -> &'static str {
     match metric {
-        SizeMetric::Logical => "Map: known unique logical bytes",
+        SizeMetric::Logical => {
+            "Apparent size: logical · Each listed name counts · Can exceed disk capacity"
+        }
         SizeMetric::Allocated => {
-            "Map: known unique observed allocated bytes · Highlight uses logical size"
+            "Apparent size: observed allocated · Each listed name counts · Can exceed disk capacity · Highlight uses logical size"
         }
     }
 }
@@ -114,7 +125,7 @@ pub fn empty_map(metric: SizeMetric) -> String {
 
 pub fn about(metric: SizeMetric) -> String {
     format!(
-        "Read-only Windows folder and drive scanning. No release yet.\nMap area now: known unique {} bytes. View switches between logical size (the default) and observed allocated size; each is charged once per available file identity.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas, and separate from map bytes.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
+        "Read-only Windows folder and drive scanning. No release yet.\nApparent size totals count each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. Unique totals remain secondary status detail. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt a finished whole-volume root in Allocated size, independently known Free space and Reserved by Windows cells share the scanned tree's byte scale. They have no file actions. The map is not a complete disk partition: estimated difference is diagnostic text only, never an inaccessible-space block.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
         metric_bytes(metric)
     )
 }
@@ -128,8 +139,9 @@ pub fn scan_state(state: super::logic::ScanState) -> &'static str {
     }
 }
 pub const LAYOUT_ERROR: &str = "Cannot lay out this map";
+pub const NEITHER_SIZE_DRAWABLE: &str = "Neither logical nor allocated size can be drawn.";
 
-/// `other_available` is true only when the other metric's own summary query succeeded.
+/// `other_available` requires representable accounting and apparent bytes in the other metric.
 pub fn layout_error(metric: SizeMetric, error: LayoutError, other_available: bool) -> String {
     let reason = match error {
         LayoutError::SizeOverflow => "the byte total overflowed",
@@ -143,6 +155,9 @@ pub fn layout_error(metric: SizeMetric, error: LayoutError, other_available: boo
             " {} size is available in View.",
             metric_title(super::logic::other_metric(metric))
         ));
+    } else if error == LayoutError::SizeOverflow {
+        text.push(' ');
+        text.push_str(NEITHER_SIZE_DRAWABLE);
     }
     text
 }
@@ -161,7 +176,7 @@ fn overflow_detail(overflow: MetricOverflow) -> String {
     let other = if overflow.other_available {
         format!("{other} size is available in View")
     } else {
-        format!("{other} totals overflowed too")
+        format!("{other} totals overflowed too. {NEITHER_SIZE_DRAWABLE}")
     };
     format!(
         "{} byte totals overflowed and are not shown | {other}",
@@ -281,6 +296,13 @@ pub fn filter_error(error: FilterError) -> &'static str {
     }
 }
 
+/// Format the apparent total without narrowing or concealing arithmetic overflow.
+fn apparent_size(summary: &MetricSummary) -> String {
+    summary
+        .apparent_bytes()
+        .map_or_else(|_| "overflowed".into(), |bytes| size(bytes, false))
+}
+
 /// An aggregate's members opened as the map. `small` holds while the map uses the metric that
 /// grouped them; after a metric switch the same members are only known to be grouped.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -351,9 +373,9 @@ pub fn status(
             };
             // Identity gaps are confidence indicators, reported apart from coverage.
             format!(
-                "{} | {} visible {metric} | {} unique map | {completeness}: {} unknown {metric} sizes, {} inaccessible, {} partial | Identity: {} without ID, {} conflicting {conflicts}",
+                "{} | Apparent size: {} {metric} | {} unique per identity | Each listed name counts; can exceed disk capacity | {completeness}: {} unknown {metric} sizes, {} inaccessible, {} partial | Identity: {} without ID, {} conflicting {conflicts}",
                 files(summary.files),
-                size(summary.known_bytes, false),
+                apparent_size(summary),
                 size(summary.unique_bytes, false),
                 summary.unknown_size_files,
                 diagnostics.directory_failures,
@@ -376,8 +398,8 @@ pub fn master_status(
     let seconds = elapsed.as_secs();
     let bytes = match totals {
         Ok(summary) => format!(
-            "{} known {}",
-            size(summary.known_bytes, false),
+            "Apparent size: {} {}",
+            apparent_size(summary),
             metric_bytes(summary.metric)
         ),
         Err(overflow) => format!("{} total overflowed", metric_title(overflow.metric)),
@@ -460,7 +482,7 @@ pub fn aggregate_name(count: usize) -> String {
 }
 pub fn aggregate_tooltip(count: usize, size: &str, metric: SizeMetric) -> String {
     format!(
-        "{} · {size} known unique {}\nDouble-click to open",
+        "{} · Apparent size: {size} {}\nEach listed name counts; not physical attribution. Unique totals are in the status detail.\nDouble-click to open",
         aggregate_name(count),
         metric_bytes(metric)
     )
@@ -478,8 +500,202 @@ pub fn label(name: &str, size: &str) -> String {
 }
 pub fn tooltip(name: &str, size: &str, state: &str, metric: SizeMetric) -> String {
     format!(
-        "{name}\nKnown unique {}: {size}\nState: {state}",
+        "{name}\nApparent size: {size} {}\nEach listed name counts; not physical attribution. Unique totals are in the status detail.\nState: {state}",
         metric_bytes(metric)
+    )
+}
+
+pub fn preparing_conflicts(count: usize) -> String {
+    format!("Preparing metadata checks for {count} conflicting identities…")
+}
+
+pub fn conflict_report(report: &scan_win::ConflictRereadReport) -> String {
+    let state = if report
+        .issues
+        .contains_key(&scan_win::ConflictRereadIssue::Cancelled)
+    {
+        "cancelled"
+    } else {
+        "finished"
+    };
+    format!(
+        "Hard-link check {state}: {} candidates, {} attempted, {} resolved, {} unresolved. Charge corrections: logical {:+} B; allocated {:+} B. Issues: {:?}. Apparent size = listed known bytes + charge corrections. The charged record uses the authoritative size; aliases retain listed sizes. No full per-name correction or error bound.",
+        report.candidate_identities,
+        report.attempted_identities,
+        report.resolved_identities,
+        report.unresolved_identities,
+        report.logical_delta_bytes,
+        report.allocated_delta_bytes,
+        report.issues
+    )
+}
+
+fn eligibility_issue(issue: &hogmap::composition::EligibilityIssue) -> String {
+    use hogmap::composition::EligibilityIssue as Issue;
+    match issue {
+        Issue::NotObserved => "no origin observations".into(),
+        Issue::LogicalView => "choose Allocated size for volume composition".into(),
+        Issue::Zoomed => "volume composition is hidden while zoomed".into(),
+        Issue::NotFinished => "the whole-volume scan is not finished".into(),
+        Issue::ScopeUnavailable(cause) => format!("volume scope unavailable ({cause:?})"),
+        Issue::NotWholeVolume => "the scan root is not a proven whole volume".into(),
+        Issue::ValidationUnavailable(cause) => {
+            format!("root endpoint validation unavailable ({cause:?})")
+        }
+        Issue::RootIdentityUnproven => {
+            "root identity is changed or unproven at the endpoints".into()
+        }
+        Issue::RootPathUnproven => "root path is changed or unproven at the endpoints".into(),
+        Issue::CapacityUnavailable(endpoint, cause) => format!(
+            "{} origin-bound capacity unavailable ({cause:?})",
+            endpoint_name(*endpoint)
+        ),
+        Issue::CapacityFailed(endpoint, cause) => {
+            format!("{} capacity failed ({cause:?})", endpoint_name(*endpoint))
+        }
+        Issue::UnknownCapacity(endpoint) => format!(
+            "{} total/free capacity is unknown",
+            endpoint_name(*endpoint)
+        ),
+        Issue::ReserveFailed(endpoint, cause) => format!(
+            "{} Windows storage reserve failed ({cause:?})",
+            endpoint_name(*endpoint)
+        ),
+        Issue::UnknownReserve(endpoint) => format!(
+            "{} Windows storage reserve is unknown",
+            endpoint_name(*endpoint)
+        ),
+        Issue::AllocatedOverflow => "allocated or apparent byte arithmetic overflowed".into(),
+        Issue::UnresolvedConflicts(count) => format!("{count} unresolved identity conflicts"),
+        Issue::KnownSizeWithoutIdentity(count) => {
+            format!("{count} known allocated sizes without identity")
+        }
+        Issue::SerialMismatch(count) => format!("{count} directory volume serial mismatches"),
+        Issue::DifferentGuidUnproven(count) => {
+            format!("{count} different volume names with an unproven relation")
+        }
+        Issue::FilesystemUnavailable(cause) => {
+            format!("root-handle filesystem type unavailable ({cause:?})")
+        }
+        Issue::NotNtfs => "the root-handle filesystem is not NTFS".into(),
+        Issue::NonPositiveDifference => {
+            "at least one endpoint difference is zero or negative; accounting discrepancy, not area"
+                .into()
+        }
+    }
+}
+
+fn endpoint_name(endpoint: hogmap::composition::Endpoint) -> &'static str {
+    match endpoint {
+        hogmap::composition::Endpoint::Before => "before-scan",
+        hogmap::composition::Endpoint::After => "after-scan",
+    }
+}
+
+fn signed_size(bytes: i128) -> String {
+    match u64::try_from(bytes.unsigned_abs()) {
+        Ok(magnitude) => format!(
+            "{}{}",
+            if bytes < 0 { "−" } else { "" },
+            size(magnitude, false)
+        ),
+        Err(_) => format!("{bytes} B"),
+    }
+}
+
+pub fn composition_status(evaluation: &hogmap::composition::CompositionEvaluation) -> String {
+    let difference = match evaluation.differences {
+        Some(values) => format!(
+            "Estimated difference (not drawn): before {}, after {}",
+            signed_size(values.before),
+            signed_size(values.after)
+        ),
+        None => "Estimated difference unavailable".into(),
+    };
+    let reasons = evaluation
+        .issues
+        .iter()
+        .map(eligibility_issue)
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "Not a complete disk partition · Difference uses apparent size, which can exceed disk capacity · {difference}{}",
+        if reasons.is_empty() {
+            String::new()
+        } else {
+            format!(" · {reasons}")
+        }
+    )
+}
+
+pub fn volume_cell(part: hogmap::composition::VolumePart, bytes: u64) -> String {
+    let name = match part {
+        hogmap::composition::VolumePart::Free => "Free space",
+        hogmap::composition::VolumePart::Reserve => "Reserved by Windows",
+    };
+    format!("{name}\n{}", size(bytes, false))
+}
+
+pub fn volume_cell_detail(
+    part: hogmap::composition::VolumePart,
+    bytes: u64,
+    detail: &str,
+) -> String {
+    let meaning = match part {
+        hogmap::composition::VolumePart::Free => {
+            "Global available filesystem bytes, not limited by per-user quotas."
+        }
+        hogmap::composition::VolumePart::Reserve => {
+            "Measured Windows storage reserve. Included in Total Reserved; not subtracted twice."
+        }
+    };
+    format!(
+        "{} ({bytes} B)\n{meaning} Final origin-bound capacity observation.\nNot a file; no file actions.\n{detail}",
+        volume_cell(part, bytes)
+    )
+}
+
+pub fn observation_detail(observations: &scan_win::ScanOriginObservations) -> String {
+    let offset = |at: SystemTime| match at.duration_since(observations.started_at) {
+        Ok(elapsed) => format!("{} ms", elapsed.as_millis()),
+        Err(elapsed) => format!("−{} ms (clock changed)", elapsed.duration().as_millis()),
+    };
+    let sample =
+        |value: Result<hogmap::volume::OriginCapacitySample, hogmap::volume::OriginIssue>| {
+            value.map_or_else(
+                |issue| format!("unavailable ({issue:?})"),
+                |sample| {
+                    format!(
+                        "{}; storage reserve {}; offset {}",
+                        drive_capacity(sample.free_bytes, sample.total_bytes),
+                        sample
+                            .storage_reserve_bytes
+                            .map_or_else(|| "unknown".into(), |bytes| size(bytes, false)),
+                        offset(sample.metadata.captured_at)
+                    )
+                },
+            )
+        };
+    let free_change = observations
+        .before
+        .ok()
+        .zip(observations.after.ok())
+        .and_then(|(before, after)| before.free_bytes.zip(after.free_bytes))
+        .map_or_else(
+            || "unknown".into(),
+            |(before, after)| format!("{:+} B", i128::from(after) - i128::from(before)),
+        );
+    let counts = &observations.directories;
+    format!(
+        "Capacity before: {}. Capacity after: {}. Free-space change: {free_change}. Enumeration ended: {}. Endpoint readings are not an atomic snapshot or bounds on intermediate changes; conflict rereads happen afterwards. Namespace diagnostics: {} serial checks unavailable, {} GUID checks unavailable, {} not queried. NTFS metadata, resident files, snapshots and named streams are not separately attributed.",
+        sample(observations.before),
+        sample(observations.after),
+        observations
+            .enumeration_finished_at
+            .map_or_else(|| "unknown".into(), offset),
+        counts.serial64_unavailable,
+        counts.unavailable,
+        counts.not_queried
     )
 }
 
@@ -583,13 +799,13 @@ mod tests {
         let allocated = metric_totals(&index, SizeMetric::Allocated);
         assert_eq!(
             status("Finished", "Fixture", &allocated, &quiet),
-            "Finished | Fixture | 5 files | 16.0 KiB visible observed allocated | 8.0 KiB unique map | Incomplete: 1 unknown observed allocated sizes, 0 inaccessible, 0 partial | Identity: 1 file without ID, 1 conflicting ID | 0 protocol diagnostics"
+            "Finished | Fixture | 5 files | Apparent size: 16.0 KiB observed allocated | 8.0 KiB unique per identity | Each listed name counts; can exceed disk capacity | Incomplete: 1 unknown observed allocated sizes, 0 inaccessible, 0 partial | Identity: 1 file without ID, 1 conflicting ID | 0 protocol diagnostics"
         );
         assert_eq!(completeness(&allocated), INCOMPLETE_METADATA);
         let logical = metric_totals(&index, SizeMetric::Logical);
         assert_eq!(
             status("Finished", "Fixture", &logical, &quiet),
-            "Finished | Fixture | 5 files | 260 B visible logical | 160 B unique map | Complete: 0 unknown logical sizes, 0 inaccessible, 0 partial | Identity: 2 files without ID, 0 conflicting IDs | 0 protocol diagnostics"
+            "Finished | Fixture | 5 files | Apparent size: 260 B logical | 160 B unique per identity | Each listed name counts; can exceed disk capacity | Complete: 0 unknown logical sizes, 0 inaccessible, 0 partial | Identity: 2 files without ID, 0 conflicting IDs | 0 protocol diagnostics"
         );
         assert_eq!(completeness(&logical), COMPLETE_METADATA);
 
@@ -606,6 +822,30 @@ mod tests {
             master_status("Ready", 3, &totals, std::time::Duration::from_secs(61)),
             "Ready  ·  3 entries seen  ·  Allocated total overflowed  ·  1:01 elapsed"
         );
+
+        let mut resolved = fixture(&[
+            ("charged", sizes(Some(100), Some(100)), Some(9)),
+            ("alias", sizes(Some(200), Some(200)), Some(9)),
+        ]);
+        resolved
+            .apply_authoritative_sizes(
+                FileIdentity { volume: 1, file: 9 },
+                sizes(Some(80), Some(80)),
+            )
+            .unwrap();
+        let totals = metric_totals(&resolved, SizeMetric::Allocated);
+        let detail = status("Finished", "Fixture", &totals, &quiet);
+        assert!(
+            detail.contains("Apparent size: 280 B observed allocated | 80 B unique per identity"),
+            "{detail}"
+        );
+        assert_eq!(
+            master_status("Ready", 3, &totals, std::time::Duration::ZERO),
+            "Ready  ·  3 entries seen  ·  Apparent size: 280 B observed allocated  ·  0:00 elapsed"
+        );
+        let mut overflow = resolved.summary_for(SizeMetric::Allocated).unwrap();
+        overflow.resolution_delta_bytes = i128::MAX;
+        assert_eq!(apparent_size(&overflow), "overflowed");
 
         let both_overflow = fixture(&[
             ("max.bin", sizes(Some(u64::MAX), Some(u64::MAX)), None),

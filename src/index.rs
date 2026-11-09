@@ -5,6 +5,8 @@ use std::num::NonZeroU32;
 
 /// Win32 reports the maximum component length in UTF-16 units; NTFS uses 255.
 const MAX_COMPONENT_UTF16_UNITS: usize = 255;
+/// Bound on retained conflict names and metadata rereads, not on accounting conflicts.
+pub const MAX_CONFLICT_REREADS: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct EntryId(NonZeroU32);
@@ -147,8 +149,9 @@ struct FileTotals {
     metrics: [MetricTotals; 2],
 }
 
-/// Totals for one size metric. `complete` covers entry states and known sizes of this metric only:
-/// it does not prove consistent identities or an exclusive physical attribution.
+/// Totals for one size metric. Listed, unique and shared facts keep their original meanings.
+/// Apparent area uses `apparent_bytes()`: known + delta = unique + shared, checked as u64.
+/// `complete` covers states/known sizes, not identity consistency or physical attribution.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MetricSummary {
     pub metric: SizeMetric,
@@ -170,6 +173,17 @@ pub struct MetricSummary {
     pub complete: bool,
 }
 
+impl MetricSummary {
+    /// Per-name area total: only the charged record is corrected; aliases retain listed sizes.
+    /// No physical attribution or error bound is implied. Overflow never wraps or saturates.
+    pub fn apparent_bytes(&self) -> Result<u64, IndexError> {
+        i128::from(self.known_bytes)
+            .checked_add(self.resolution_delta_bytes)
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or(IndexError::SizeOverflow)
+    }
+}
+
 /// Append-only metadata snapshot. IDs identify entries, not physical files.
 ///
 /// The index keeps one accounting row per file identity and a count of incomplete entries to
@@ -182,6 +196,9 @@ pub struct Index {
     totals: FileTotals,
     identity_charges: HashMap<StoredIdentity, IdentityCharge>,
     authoritative_sizes: HashMap<StoredIdentity, Sizes>,
+    // Only conflicts retain a representative listed name; ordinary entries do not grow.
+    conflict_names: HashMap<StoredIdentity, EntryId>,
+    conflicting_identity_count: usize,
     incomplete_entries: usize,
 }
 
@@ -204,6 +221,8 @@ impl Index {
             totals: FileTotals::default(),
             identity_charges: HashMap::new(),
             authoritative_sizes: HashMap::new(),
+            conflict_names: HashMap::new(),
+            conflicting_identity_count: 0,
             incomplete_entries: 1,
         })
     }
@@ -221,6 +240,8 @@ impl Index {
                 self.identity_charges.capacity(),
             ) + hash_bytes::<(StoredIdentity, Sizes)>(
                 self.authoritative_sizes.capacity(),
+            ) + hash_bytes::<(StoredIdentity, EntryId)>(
+                self.conflict_names.capacity(),
             ),
         }
     }
@@ -260,14 +281,17 @@ impl Index {
         if let Some(identity) = identity {
             self.identities.push(identity.into());
         }
-        self.account(&Entry {
-            parent: Some(parent),
-            name: &name,
-            kind,
-            sizes,
-            identity,
-            state,
-        });
+        self.account(
+            id,
+            &Entry {
+                parent: Some(parent),
+                name: &name,
+                kind,
+                sizes,
+                identity,
+                state,
+            },
+        );
         self.entries.push(StoredEntry::new(
             Some(parent),
             name_ref,
@@ -279,7 +303,7 @@ impl Index {
         Ok(id)
     }
 
-    fn account(&mut self, entry: &Entry<'_>) {
+    fn account(&mut self, id: EntryId, entry: &Entry<'_>) {
         if entry.state != State::Complete {
             self.incomplete_entries += 1;
         }
@@ -289,8 +313,17 @@ impl Index {
         self.totals.files += 1;
         // Each metric charges independently: an unknown logical size must not skip a known
         // allocated size, and one metric's overflow must not hide the other's totals.
-        self.account_metric(SizeMetric::Logical, entry.sizes.logical, entry.identity);
-        self.account_metric(SizeMetric::Allocated, entry.sizes.allocated, entry.identity);
+        let logical_conflict =
+            self.account_metric(SizeMetric::Logical, entry.sizes.logical, entry.identity);
+        let allocated_conflict =
+            self.account_metric(SizeMetric::Allocated, entry.sizes.allocated, entry.identity);
+        if logical_conflict || allocated_conflict {
+            self.conflicting_identity_count += 1;
+            if self.conflict_names.len() < MAX_CONFLICT_REREADS {
+                self.conflict_names
+                    .insert(entry.identity.expect("conflict has identity").into(), id);
+            }
+        }
     }
 
     fn account_metric(
@@ -298,11 +331,11 @@ impl Index {
         metric: SizeMetric,
         size: Option<u64>,
         identity: Option<FileIdentity>,
-    ) {
+    ) -> bool {
         let totals = &mut self.totals.metrics[metric.slot()];
         let Some(bytes) = size else {
             totals.unknown_size_files += 1;
-            return;
+            return false;
         };
         accumulate(&mut totals.known_bytes, bytes, &mut totals.overflowed);
         let Some(identity) = identity else {
@@ -310,13 +343,12 @@ impl Index {
             // and reported as a separate confidence gap.
             totals.identity_missing_files += 1;
             accumulate(&mut totals.unique_bytes, bytes, &mut totals.overflowed);
-            return;
+            return false;
         };
-        let sample = self
-            .identity_charges
-            .entry(identity.into())
-            .or_default()
-            .for_metric_mut(metric);
+        let charge = self.identity_charges.entry(identity.into()).or_default();
+        let was_conflicted = charge.logical.conflicted || charge.allocated.conflicted;
+        let sample = charge.for_metric_mut(metric);
+        let mut new_identity_conflict = false;
         match sample.first {
             None => {
                 sample.first = Some(bytes);
@@ -326,10 +358,12 @@ impl Index {
                 if first != bytes && !sample.conflicted {
                     sample.conflicted = true;
                     totals.conflicting_identities += 1;
+                    new_identity_conflict = !was_conflicted;
                 }
                 accumulate(&mut totals.shared_bytes, bytes, &mut totals.overflowed);
             }
         }
+        new_identity_conflict
     }
 
     /// Each still-conflicting identity once, regardless of which metrics disagree.
@@ -340,6 +374,19 @@ impl Index {
                 (charge.logical.conflicted || charge.allocated.conflicted)
                     .then_some((*identity).into())
             })
+    }
+
+    /// Constant-time count of the union of unresolved logical/allocated identities.
+    pub fn conflicting_identity_count(&self) -> usize {
+        self.conflicting_identity_count
+    }
+
+    /// At most MAX_CONFLICT_REREADS listed names, selected when an identity first disagrees.
+    /// Selection is not a promise to retain its first listed hardlink or retry another name.
+    pub fn conflict_candidates(&self) -> impl Iterator<Item = (FileIdentity, EntryId)> + '_ {
+        self.conflict_names
+            .iter()
+            .map(|(identity, id)| ((*identity).into(), *id))
     }
 
     /// Apply verified handle sizes after the producer has finished. Listed records and their
@@ -419,14 +466,20 @@ impl Index {
             }
         }
         let charge = self.identity_charges.get(&key).expect("validated charge");
+        let still_conflicted = charge.logical.conflicted || charge.allocated.conflicted;
+        if !still_conflicted {
+            self.conflicting_identity_count -= 1;
+            self.conflict_names.remove(&key);
+        }
         Ok(IdentityResolution {
             logical: statuses[0],
             allocated: statuses[1],
-            still_conflicted: charge.logical.conflicted || charge.allocated.conflicted,
+            still_conflicted,
         })
     }
 
-    /// Layout uses the correction at the first already-known charge; raw entries stay listed.
+    /// Only the first known entry for this identity/metric may use this correction.
+    /// Layout keeps every later alias at its listed size; raw entries stay untouched.
     pub(crate) fn effective_size(&self, entry: &Entry<'_>, metric: SizeMetric) -> Option<u64> {
         let listed = metric.of(entry.sizes)?;
         Some(
@@ -702,7 +755,7 @@ fn validate_name(name: &OsStr) -> Result<(), IndexError> {
 /// Counts UTF-16 units in the WTF-8 bytes behind `OsStr::as_encoded_bytes` on Windows.
 /// Each non-continuation byte starts one code point, and a four-byte sequence (a code point
 /// above U+FFFF) takes one extra unit.
-fn utf16_units(encoded: &[u8]) -> usize {
+pub(crate) fn utf16_units(encoded: &[u8]) -> usize {
     let mut units = 0;
     for byte in encoded {
         if *byte & 0b1100_0000 != 0b1000_0000 {

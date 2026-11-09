@@ -7,6 +7,11 @@ use crate::synthetic::ProducerOutcome;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 
+mod conflicts;
+#[cfg(windows)]
+use conflicts::ConflictCandidate;
+pub use conflicts::{ConflictRereadBatch, ConflictRereadPlan};
+
 /// Producer-defined codes, deliberately outside the Win32 error range.
 /// Skipped entries are not followed, not necessarily denied by permissions.
 pub const SKIP_REPARSE_CODE: u32 = 0xFFFF_FE01;
@@ -214,7 +219,7 @@ pub fn run_win_scan_with_options(
 }
 
 /// Maximum identities selected for the explicit post-pass; excess conflicts remain unresolved.
-pub const MAX_CONFLICT_REREADS: usize = 4096;
+pub use crate::index::MAX_CONFLICT_REREADS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ConflictRereadStage {
@@ -240,6 +245,7 @@ pub enum ConflictRereadIssue {
     MissingName,
     Cancelled,
     LimitExceeded,
+    PathTooLong,
     UnsupportedPlatform,
 }
 
@@ -271,31 +277,11 @@ pub fn reread_identity_conflicts(
     root: &std::path::Path,
     cancel: &ScanCancellation,
 ) -> ConflictRereadReport {
-    let count = index.conflicting_identities().count();
-    let started_at = std::time::SystemTime::now();
-    let mut report = ConflictRereadReport {
-        candidate_identities: count,
-        attempted_identities: 0,
-        resolved_identities: 0,
-        unresolved_identities: count,
-        logical_delta_bytes: 0,
-        allocated_delta_bytes: 0,
-        started_at,
-        finished_at: started_at,
-        issues: Default::default(),
-    };
-    if count > 0 {
-        #[cfg(windows)]
-        platform::reread_conflicts(index, root, cancel, &mut report);
-        #[cfg(not(windows))]
-        {
-            let _ = (root, cancel);
-            report.issue(ConflictRereadIssue::UnsupportedPlatform, count);
-        }
-    }
-    report.unresolved_identities = count - report.resolved_identities;
-    report.finished_at = std::time::SystemTime::now();
-    report
+    let mut plan = ConflictRereadPlan::new(index, root);
+    while !plan.prepare(index, cancel, std::time::Duration::MAX) {}
+    let mut batch = plan.reread(cancel);
+    while !batch.apply(index, std::time::Duration::MAX) {}
+    batch.into_report()
 }
 
 #[cfg(windows)]
@@ -472,40 +458,13 @@ mod platform {
             allocated: u64::try_from(standard.AllocationSize).ok(),
         })
     }
-    pub(super) fn reread_conflicts(
-        index: &mut crate::index::Index,
+    pub(super) fn reread_candidates(
+        candidates: Vec<ConflictCandidate>,
         root: &Path,
         cancel: &ScanCancellation,
-        report: &mut ConflictRereadReport,
+        batch: &mut ConflictRereadBatch,
     ) {
-        use crate::index::{EntryId, SizeMetric};
-        use std::collections::HashMap;
-        let mut candidates: HashMap<FileIdentity, Option<EntryId>> = index
-            .conflicting_identities()
-            .take(MAX_CONFLICT_REREADS)
-            .map(|identity| (identity, None))
-            .collect();
-        report.issue(
-            ConflictRereadIssue::LimitExceeded,
-            report.candidate_identities - candidates.len(),
-        );
-        if cancel.is_cancelled() {
-            report.issue(ConflictRereadIssue::Cancelled, candidates.len());
-            return;
-        }
-        for (id, entry) in index.entries() {
-            if cancel.is_cancelled() {
-                report.issue(ConflictRereadIssue::Cancelled, candidates.len());
-                return;
-            }
-            if entry.kind == Kind::File
-                && let Some(identity) = entry.identity
-                && let Some(selected) = candidates.get_mut(&identity)
-                && selected.is_none()
-            {
-                *selected = Some(id);
-            }
-        }
+        let report = &mut batch.report;
         let binding = (|| {
             let _mode = crate::volume::ErrorModeGuard::new()
                 .map_err(|error| reread_error(ConflictRereadStage::Open, error.code))?;
@@ -520,37 +479,10 @@ mod platform {
                 return;
             }
         };
-        'identities: for (identity, entry) in candidates {
+        for ConflictCandidate { identity, path } in candidates {
             if cancel.is_cancelled() {
                 report.issue(ConflictRereadIssue::Cancelled, 1);
                 continue;
-            }
-            let Some(mut id) = entry else {
-                report.issue(ConflictRereadIssue::MissingName, 1);
-                continue;
-            };
-            let mut names = Vec::new();
-            let mut path_units = root.as_os_str().encode_wide().count();
-            while id != index.root() {
-                if cancel.is_cancelled() {
-                    report.issue(ConflictRereadIssue::Cancelled, 1);
-                    continue 'identities;
-                }
-                let entry = index.get(id).expect("selected stored entry");
-                path_units += entry.name.encode_wide().count() + 1;
-                if path_units >= 32767 {
-                    report.issue(
-                        reread_error(ConflictRereadStage::Path, ERROR_FILENAME_EXCED_RANGE),
-                        1,
-                    );
-                    continue 'identities;
-                }
-                names.push(entry.name);
-                id = entry.parent.expect("non-root parent");
-            }
-            let mut path = root.to_path_buf();
-            for name in names.into_iter().rev() {
-                path.push(name);
             }
             report.attempted_identities += 1;
             let sizes = match reread_file(&path, identity, serial64, cancel) {
@@ -560,36 +492,7 @@ mod platform {
                     continue;
                 }
             };
-            let before = [
-                index.summary_for(SizeMetric::Logical),
-                index.summary_for(SizeMetric::Allocated),
-            ];
-            match index.apply_authoritative_sizes(identity, sizes) {
-                Ok(result) => {
-                    if result.still_conflicted {
-                        report.issue(ConflictRereadIssue::UnknownSize, 1);
-                    } else {
-                        report.resolved_identities += 1;
-                    }
-                    let after = [
-                        index.summary_for(SizeMetric::Logical),
-                        index.summary_for(SizeMetric::Allocated),
-                    ];
-                    for (slot, metric_delta) in [
-                        &mut report.logical_delta_bytes,
-                        &mut report.allocated_delta_bytes,
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        if let (Ok(before), Ok(after)) = (before[slot], after[slot]) {
-                            *metric_delta +=
-                                i128::from(after.unique_bytes) - i128::from(before.unique_bytes);
-                        }
-                    }
-                }
-                Err(_) => report.issue(ConflictRereadIssue::IndexRejected, 1),
-            }
+            batch.resolutions.push((identity, sizes));
         }
     }
 

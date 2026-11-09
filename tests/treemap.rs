@@ -303,11 +303,12 @@ fn layout_aggregates_small_siblings_and_preserves_totals() {
     let root = index.root();
     insert_file(&mut index, root, "big.bin", Some(1_000_000));
     for number in 0..100 {
-        insert_file(
+        insert_linked_file(
             &mut index,
             root,
             &format!("small_{number:03}.bin"),
-            Some(100),
+            100,
+            FileIdentity { volume: 1, file: 7 },
         );
     }
     index.set_state(root, State::Complete).unwrap();
@@ -468,7 +469,7 @@ fn layout_rejects_invalid_geometry_and_foreign_roots() {
 }
 
 #[test]
-fn layout_charges_a_hardlink_once_at_its_first_entry() {
+fn layout_gives_each_hardlink_name_its_own_area() {
     let mut index = Index::new("Volume".into()).unwrap();
     let root = index.root();
     let first = insert_dir(&mut index, root, "First");
@@ -492,25 +493,40 @@ fn layout_charges_a_hardlink_once_at_its_first_entry() {
         params(1.0, 0.0),
     )
     .unwrap();
-    assert_eq!(result.known_sum, 100);
-    assert_eq!(find(&result, NodeRef::Entry(first)).known_sum, 100);
-    assert_eq!(find(&result, NodeRef::Entry(original)).known_sum, 100);
-    assert!(
-        result
-            .placed
-            .iter()
-            .all(|placed| placed.node != NodeRef::Entry(link))
+    assert_eq!(result.known_sum, 200);
+    assert_eq!(
+        result,
+        layout(
+            &index,
+            root,
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            params(1.0, 0.0)
+        )
+        .unwrap()
     );
-    assert!(
-        result
-            .placed
-            .iter()
-            .all(|placed| placed.node != NodeRef::Entry(second))
+    for id in [first, second, original, link] {
+        assert_eq!(find(&result, NodeRef::Entry(id)).known_sum, 100);
+    }
+    assert_proportional(find(&result, NodeRef::Entry(first)).rect, 10000.0, 100, 200);
+    assert_proportional(
+        find(&result, NodeRef::Entry(second)).rect,
+        10000.0,
+        100,
+        200,
     );
+    let zoomed = layout(
+        &index,
+        second,
+        Rect::new(0.0, 0.0, 100.0, 100.0),
+        params(1.0, 0.0),
+    )
+    .unwrap();
+    assert_eq!(zoomed.known_sum, 100);
+    assert_eq!(find(&zoomed, NodeRef::Entry(link)).known_sum, 100);
 }
 
 #[test]
-fn the_allocated_layout_charges_a_hardlink_at_its_first_known_allocated_size() {
+fn unknown_hardlink_sizes_have_no_area_without_hiding_known_names() {
     let mut index = Index::new("Volume".into()).unwrap();
     let root = index.root();
     let first = insert_dir(&mut index, root, "First");
@@ -541,12 +557,8 @@ fn the_allocated_layout_charges_a_hardlink_at_its_first_known_allocated_size() {
 
     let logical = layout(&index, root, rect, params(1.0, 0.0)).unwrap();
     assert_eq!(find(&logical, NodeRef::Entry(original)).known_sum, 100);
-    assert!(
-        logical
-            .placed
-            .iter()
-            .all(|placed| placed.node != NodeRef::Entry(later))
-    );
+    assert_eq!(find(&logical, NodeRef::Entry(later)).known_sum, 100);
+    assert_eq!(logical.known_sum, 200);
 
     // The first link has no allocated size, so the later one carries the allocated charge.
     let allocated =
@@ -562,6 +574,61 @@ fn the_allocated_layout_charges_a_hardlink_at_its_first_known_allocated_size() {
                 .iter()
                 .all(|placed| placed.node != NodeRef::Entry(absent))
         );
+    }
+}
+
+#[test]
+fn apparent_overflow_is_reported_even_when_unique_bytes_fit() {
+    for corrected in [false, true] {
+        let mut index = Index::new("Synthetic".into()).unwrap();
+        let root = index.root();
+        let identity = FileIdentity {
+            volume: 1,
+            file: 99,
+        };
+        insert_linked_file(
+            &mut index,
+            root,
+            "charged",
+            if corrected { 1 } else { u64::MAX },
+            identity,
+        );
+        insert_linked_file(
+            &mut index,
+            root,
+            "alias",
+            if corrected { u64::MAX - 1 } else { 1 },
+            identity,
+        );
+        if corrected {
+            index
+                .apply_authoritative_sizes(
+                    identity,
+                    Sizes {
+                        logical: Some(2),
+                        allocated: Some(2),
+                    },
+                )
+                .unwrap();
+            let summary = index.summary_for(SizeMetric::Logical).unwrap();
+            assert_eq!(summary.unique_bytes, 2);
+            assert_eq!(
+                summary.apparent_bytes(),
+                Err(hogmap::index::IndexError::SizeOverflow)
+            );
+        }
+        for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+            assert_eq!(
+                layout_with_metric(
+                    &index,
+                    root,
+                    Rect::new(0.0, 0.0, 100.0, 100.0),
+                    params(1.0, 0.0),
+                    metric
+                ),
+                Err(LayoutError::SizeOverflow)
+            );
+        }
     }
 }
 

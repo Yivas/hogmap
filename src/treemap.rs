@@ -3,9 +3,9 @@
 //! Geometry is independent from the renderer: the input is an index subtree and
 //! a rectangle, the output is placed cells. Weights are integer bytes of the
 //! selected [`SizeMetric`]; `layout` and `layout_members` keep the logical path.
-//! A file identity is charged once, at its first entry with a known size for
-//! that metric, including an explicit authoritative correction to that charge.
-//! A hardlink never contributes its bytes twice. Unknown sizes
+//! Each listed name contributes its known size. Only the first known entry of
+//! an identity/metric receives any authoritative charge correction; aliases keep
+//! their listed sizes. Apparent area is not physical attribution. Unknown sizes
 //! get no area and are reported through `has_unknown`.
 //!
 //! Volume composition (free and unattributed space) is deliberately absent:
@@ -332,13 +332,18 @@ fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, Layo
         let mut known_sum = 0_u64;
         let mut has_unknown = entry.state != State::Complete;
         if entry.kind == Kind::File {
-            match index.effective_size(&entry, metric) {
-                Some(bytes) => {
-                    let charge = match entry.identity {
-                        Some(identity) if !seen_identities.insert(identity) => 0,
-                        _ => bytes,
+            match metric.of(entry.sizes) {
+                Some(listed) => {
+                    let first_charge = entry
+                        .identity
+                        .is_none_or(|identity| seen_identities.insert(identity));
+                    known_sum = if first_charge {
+                        index
+                            .effective_size(&entry, metric)
+                            .expect("known listed size")
+                    } else {
+                        listed
                     };
-                    known_sum = charge;
                 }
                 None => has_unknown = true,
             }
