@@ -93,10 +93,27 @@ pub enum IndexError {
     NotDirectory,
     SizeOverflow,
     CapacityExceeded,
+    NotConflicted,
+    /// Authoritative charges belong to a finished snapshot; a rescan needs a new Index.
+    ResolvedSnapshot,
 }
 
-/// Logical totals. `known_logical_bytes` counts visible entries, so it equals
-/// `unique_logical_bytes + shared_logical_bytes` when no sum overflows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChargeResolution {
+    Applied,
+    MissingCharge,
+    UnknownSize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IdentityResolution {
+    pub logical: ChargeResolution,
+    pub allocated: ChargeResolution,
+    pub still_conflicted: bool,
+}
+
+/// Logical listed totals. After authoritative correction, add the signed resolution delta
+/// from summary_for(Logical) to known bytes to obtain unique + shared bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Summary {
     pub files: usize,
@@ -119,6 +136,7 @@ struct MetricTotals {
     unknown_size_files: usize,
     identity_missing_files: usize,
     conflicting_identities: usize,
+    resolution_delta_bytes: i128,
     overflowed: bool,
 }
 
@@ -146,6 +164,9 @@ pub struct MetricSummary {
     pub identity_missing_files: usize,
     /// Identities whose known samples for this metric disagree; each identity counts once.
     pub conflicting_identities: usize,
+    /// Signed correction to the first listed charge: known + delta = unique + shared.
+    /// Known/shared/unknown counts remain observations of the directory listings.
+    pub resolution_delta_bytes: i128,
     pub complete: bool,
 }
 
@@ -160,6 +181,7 @@ pub struct Index {
     identities: Vec<StoredIdentity>,
     totals: FileTotals,
     identity_charges: HashMap<StoredIdentity, IdentityCharge>,
+    authoritative_sizes: HashMap<StoredIdentity, Sizes>,
     incomplete_entries: usize,
 }
 
@@ -181,6 +203,7 @@ impl Index {
             identities: Vec::new(),
             totals: FileTotals::default(),
             identity_charges: HashMap::new(),
+            authoritative_sizes: HashMap::new(),
             incomplete_entries: 1,
         })
     }
@@ -196,6 +219,8 @@ impl Index {
             identity_bytes: self.identities.capacity() * std::mem::size_of::<StoredIdentity>(),
             charged_identity_bytes: hash_bytes::<(StoredIdentity, IdentityCharge)>(
                 self.identity_charges.capacity(),
+            ) + hash_bytes::<(StoredIdentity, Sizes)>(
+                self.authoritative_sizes.capacity(),
             ),
         }
     }
@@ -214,6 +239,9 @@ impl Index {
         identity: Option<FileIdentity>,
         state: State,
     ) -> Result<EntryId, IndexError> {
+        if !self.authoritative_sizes.is_empty() {
+            return Err(IndexError::ResolvedSnapshot);
+        }
         let parent_entry = self.get(parent).ok_or(IndexError::InvalidParent)?;
         if parent_entry.kind != Kind::Directory {
             return Err(IndexError::NotDirectory);
@@ -302,6 +330,115 @@ impl Index {
                 accumulate(&mut totals.shared_bytes, bytes, &mut totals.overflowed);
             }
         }
+    }
+
+    /// Each still-conflicting identity once, regardless of which metrics disagree.
+    pub fn conflicting_identities(&self) -> impl Iterator<Item = FileIdentity> + '_ {
+        self.identity_charges
+            .iter()
+            .filter_map(|(identity, charge)| {
+                (charge.logical.conflicted || charge.allocated.conflicted)
+                    .then_some((*identity).into())
+            })
+    }
+
+    /// Apply verified handle sizes after the producer has finished. Listed records and their
+    /// known/shared/unknown observations stay untouched. Only existing charges are corrected.
+    /// The first successful correction seals insertion; set_state remains available.
+    pub fn apply_authoritative_sizes(
+        &mut self,
+        identity: FileIdentity,
+        sizes: Sizes,
+    ) -> Result<IdentityResolution, IndexError> {
+        let key = StoredIdentity::from(identity);
+        let charge = self
+            .identity_charges
+            .get(&key)
+            .ok_or(IndexError::NotConflicted)?;
+        if !charge.logical.conflicted && !charge.allocated.conflicted {
+            return Err(IndexError::NotConflicted);
+        }
+        let previous = self
+            .authoritative_sizes
+            .get(&key)
+            .copied()
+            .unwrap_or_default();
+        let mut corrected = previous;
+        let mut next = [(0_u64, 0_i128); 2];
+        let mut statuses = [ChargeResolution::MissingCharge; 2];
+        for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+            let slot = metric.slot();
+            let Some(first) = charge.for_metric(metric).first else {
+                continue;
+            };
+            let Some(value) = metric.of(sizes) else {
+                statuses[slot] = ChargeResolution::UnknownSize;
+                continue;
+            };
+            let totals = &self.totals.metrics[slot];
+            if totals.overflowed {
+                return Err(IndexError::SizeOverflow);
+            }
+            let old = metric.of(previous).unwrap_or(first);
+            let unique = totals
+                .unique_bytes
+                .checked_sub(old)
+                .and_then(|sum| sum.checked_add(value))
+                .ok_or(IndexError::SizeOverflow)?;
+            let delta = totals
+                .resolution_delta_bytes
+                .checked_add(i128::from(value) - i128::from(old))
+                .ok_or(IndexError::SizeOverflow)?;
+            next[slot] = (unique, delta);
+            statuses[slot] = ChargeResolution::Applied;
+            match metric {
+                SizeMetric::Logical => corrected.logical = Some(value),
+                SizeMetric::Allocated => corrected.allocated = Some(value),
+            }
+        }
+        // Validate both updates before mutating either metric.
+        if statuses.contains(&ChargeResolution::Applied) {
+            self.authoritative_sizes.insert(key, corrected);
+            let charge = self
+                .identity_charges
+                .get_mut(&key)
+                .expect("validated charge");
+            for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+                let slot = metric.slot();
+                if statuses[slot] != ChargeResolution::Applied {
+                    continue;
+                }
+                let sample = charge.for_metric_mut(metric);
+                let totals = &mut self.totals.metrics[slot];
+                totals.unique_bytes = next[slot].0;
+                totals.resolution_delta_bytes = next[slot].1;
+                if sample.conflicted {
+                    totals.conflicting_identities -= 1;
+                    sample.conflicted = false;
+                }
+            }
+        }
+        let charge = self.identity_charges.get(&key).expect("validated charge");
+        Ok(IdentityResolution {
+            logical: statuses[0],
+            allocated: statuses[1],
+            still_conflicted: charge.logical.conflicted || charge.allocated.conflicted,
+        })
+    }
+
+    /// Layout uses the correction at the first already-known charge; raw entries stay listed.
+    pub(crate) fn effective_size(&self, entry: &Entry<'_>, metric: SizeMetric) -> Option<u64> {
+        let listed = metric.of(entry.sizes)?;
+        Some(
+            entry
+                .identity
+                .and_then(|identity| {
+                    self.authoritative_sizes
+                        .get(&StoredIdentity::from(identity))
+                })
+                .and_then(|sizes| metric.of(*sizes))
+                .unwrap_or(listed),
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -395,6 +532,7 @@ impl Index {
             unknown_size_files: totals.unknown_size_files,
             identity_missing_files: totals.identity_missing_files,
             conflicting_identities: totals.conflicting_identities,
+            resolution_delta_bytes: totals.resolution_delta_bytes,
             complete: self.incomplete_entries == 0 && totals.unknown_size_files == 0,
         })
     }
@@ -487,6 +625,12 @@ struct IdentityCharge {
 }
 
 impl IdentityCharge {
+    fn for_metric(&self, metric: SizeMetric) -> &MetricCharge {
+        match metric {
+            SizeMetric::Logical => &self.logical,
+            SizeMetric::Allocated => &self.allocated,
+        }
+    }
     fn for_metric_mut(&mut self, metric: SizeMetric) -> &mut MetricCharge {
         match metric {
             SizeMetric::Logical => &mut self.logical,

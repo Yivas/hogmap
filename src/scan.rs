@@ -330,6 +330,15 @@ impl ScanReducer {
         self.index.as_ref()
     }
 
+    /// Mutable access for an explicit post-pass only after a Finished terminal was consumed.
+    pub fn finished_index_mut(&mut self) -> Option<&mut Index> {
+        if self.terminal == Some(Terminal::Finished) {
+            self.index.as_mut()
+        } else {
+            None
+        }
+    }
+
     pub fn diagnostics(&self) -> &ScanDiagnostics {
         &self.diagnostics
     }

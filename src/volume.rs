@@ -38,6 +38,11 @@ pub struct VolumeInfo {
     pub total_bytes: Option<u64>,
     /// Global available filesystem bytes, ignoring caller quotas. Some(0) is known full.
     pub free_bytes: Option<u64>,
+    /// Per-volume Windows storage reserve, included in total_reserved_bytes, not added to free.
+    pub storage_reserve_bytes: Option<u64>,
+    pub total_reserved_bytes: Option<u64>,
+    /// Reserve conversion failure; does not invalidate an otherwise valid total/free pair.
+    pub reserve_issue: Option<CapacityIssue>,
     pub capacity: CapacityMetadata,
 }
 
@@ -103,6 +108,9 @@ pub struct RootObservation {
 pub struct OriginCapacitySample {
     pub total_bytes: Option<u64>,
     pub free_bytes: Option<u64>,
+    pub storage_reserve_bytes: Option<u64>,
+    pub total_reserved_bytes: Option<u64>,
+    pub reserve_issue: Option<CapacityIssue>,
     pub metadata: CapacityMetadata,
 }
 
@@ -497,9 +505,15 @@ mod platform {
         captured_at: SystemTime,
     ) -> OriginCapacitySample {
         let values = capacity_values(result, space);
+        // Base failure also invalidates reserves. A reserve-only overflow must not change
+        // the legacy total/free result; both observations came from this same native query.
+        let reserves = values.and_then(|_| reserve_values(space));
         OriginCapacitySample {
             total_bytes: values.ok().map(|value| value.0),
             free_bytes: values.ok().map(|value| value.1),
+            storage_reserve_bytes: reserves.ok().map(|value| value.0),
+            total_reserved_bytes: reserves.ok().map(|value| value.1),
+            reserve_issue: reserves.err(),
             metadata: CapacityMetadata {
                 source: CapacitySource::WindowsActualGlobalFilesystem,
                 captured_at,
@@ -768,20 +782,17 @@ mod platform {
             // This metadata query needs no raw-disk handle or privilege request.
             let result = unsafe { GetDiskSpaceInformationW(terminated.as_ptr(), &mut space) };
             let captured_at = SystemTime::now();
-            let values = capacity_values(result, &space);
-            let (total_bytes, free_bytes) =
-                values.map_or((None, None), |(total, free)| (Some(total), Some(free)));
+            let sample = capacity_sample(result, &space, captured_at);
             drives.push(VolumeInfo {
                 root: text(root),
                 label: information_ok.then(|| text(&label)),
                 filesystem: information_ok.then(|| text(&filesystem)),
-                total_bytes,
-                free_bytes,
-                capacity: CapacityMetadata {
-                    source: CapacitySource::WindowsActualGlobalFilesystem,
-                    captured_at,
-                    issue: values.err(),
-                },
+                total_bytes: sample.total_bytes,
+                free_bytes: sample.free_bytes,
+                storage_reserve_bytes: sample.storage_reserve_bytes,
+                total_reserved_bytes: sample.total_reserved_bytes,
+                reserve_issue: sample.reserve_issue,
+                capacity: sample.metadata,
             });
         }
         Ok(drives)
@@ -814,6 +825,24 @@ mod platform {
             .checked_mul(unit)
             .ok_or(CapacityIssue::SizeOverflow)?;
         Ok((total, free))
+    }
+
+    fn reserve_values(space: &DISK_SPACE_INFORMATION) -> Result<(u64, u64), CapacityIssue> {
+        // Called only after capacity_values validated the query, unit and total/free pair.
+        let unit = u64::from(space.SectorsPerAllocationUnit)
+            .checked_mul(u64::from(space.BytesPerSector))
+            .ok_or(CapacityIssue::SizeOverflow)?;
+        let storage = space
+            .VolumeStorageReserveAllocationUnits
+            .checked_mul(unit)
+            .ok_or(CapacityIssue::SizeOverflow)?;
+        let total_reserved = space
+            .TotalReservedAllocationUnits
+            .checked_mul(unit)
+            .ok_or(CapacityIssue::SizeOverflow)?;
+        // The contract includes storage reserve in total reserved, but does not promise
+        // free + reserve <= total for every provider. Record, rather than reject, the values.
+        Ok((storage, total_reserved))
     }
 
     pub fn volume_root_for(path: &Path) -> Option<String> {
@@ -926,6 +955,11 @@ mod platform {
             );
             assert!(before.total_bytes.is_some() && before.free_bytes.is_some());
             assert!(after.total_bytes.is_some() && after.free_bytes.is_some());
+            for sample in [before, after] {
+                assert_eq!(sample.reserve_issue, None);
+                assert!(sample.storage_reserve_bytes.is_some());
+                assert!(sample.total_reserved_bytes.is_some());
+            }
             let finished = observations.enumeration_finished_at.unwrap();
             assert!(observations.started_at <= before.metadata.captured_at);
             assert!(
@@ -1139,6 +1173,8 @@ mod platform {
             let space = DISK_SPACE_INFORMATION {
                 ActualTotalAllocationUnits: 10,
                 ActualAvailableAllocationUnits: 20,
+                VolumeStorageReserveAllocationUnits: 3,
+                TotalReservedAllocationUnits: 4,
                 SectorsPerAllocationUnit: 1,
                 BytesPerSector: 512,
                 ..Default::default()
@@ -1150,6 +1186,9 @@ mod platform {
                 let sample = capacity_sample(result, &space, SystemTime::now());
                 assert_eq!(sample.total_bytes, None);
                 assert_eq!(sample.free_bytes, None);
+                assert_eq!(sample.storage_reserve_bytes, None);
+                assert_eq!(sample.total_reserved_bytes, None);
+                assert_eq!(sample.reserve_issue, Some(expected));
                 assert_eq!(sample.metadata.issue, Some(expected));
             }
         }
@@ -1198,6 +1237,101 @@ mod platform {
             space.BytesPerSector = 2;
             space.ActualTotalAllocationUnits = u64::MAX;
             assert_eq!(capacity_values(0, &space), Err(CapacityIssue::SizeOverflow));
+
+            let valid = DISK_SPACE_INFORMATION {
+                ActualTotalAllocationUnits: 100,
+                ActualAvailableAllocationUnits: 60,
+                VolumeStorageReserveAllocationUnits: 10,
+                TotalReservedAllocationUnits: 15,
+                SectorsPerAllocationUnit: 2,
+                BytesPerSector: 512,
+                ..Default::default()
+            };
+            let sample = capacity_sample(0, &valid, SystemTime::UNIX_EPOCH);
+            assert_eq!(sample.storage_reserve_bytes, Some(10240));
+            assert_eq!(sample.total_reserved_bytes, Some(15360));
+            assert_eq!(sample.reserve_issue, None);
+            let zero = DISK_SPACE_INFORMATION {
+                VolumeStorageReserveAllocationUnits: 0,
+                TotalReservedAllocationUnits: 0,
+                ..valid
+            };
+            let sample = capacity_sample(0, &zero, SystemTime::UNIX_EPOCH);
+            assert_eq!(sample.storage_reserve_bytes, Some(0));
+            assert_eq!(sample.total_reserved_bytes, Some(0));
+            assert_eq!(sample.reserve_issue, None);
+            for (result, output, expected) in [
+                (-2147467263, valid, CapacityIssue::QueryFailed(-2147467263)),
+                (
+                    0,
+                    DISK_SPACE_INFORMATION {
+                        SectorsPerAllocationUnit: 0,
+                        ..valid
+                    },
+                    CapacityIssue::InvalidAllocationUnit,
+                ),
+                (
+                    0,
+                    DISK_SPACE_INFORMATION {
+                        BytesPerSector: 0,
+                        ..valid
+                    },
+                    CapacityIssue::InvalidAllocationUnit,
+                ),
+                (
+                    0,
+                    DISK_SPACE_INFORMATION {
+                        ActualTotalAllocationUnits: u64::MAX,
+                        ..valid
+                    },
+                    CapacityIssue::SizeOverflow,
+                ),
+                (
+                    0,
+                    DISK_SPACE_INFORMATION {
+                        ActualAvailableAllocationUnits: 101,
+                        ..valid
+                    },
+                    CapacityIssue::IncoherentFreeSpace,
+                ),
+            ] {
+                let sample = capacity_sample(result, &output, SystemTime::UNIX_EPOCH);
+                assert_eq!(sample.total_bytes, None);
+                assert_eq!(sample.free_bytes, None);
+                assert_eq!(sample.metadata.issue, Some(expected));
+                assert_eq!(sample.storage_reserve_bytes, None);
+                assert_eq!(sample.total_reserved_bytes, None);
+                assert_eq!(sample.reserve_issue, Some(expected));
+            }
+            for output in [
+                DISK_SPACE_INFORMATION {
+                    VolumeStorageReserveAllocationUnits: u64::MAX,
+                    ..valid
+                },
+                DISK_SPACE_INFORMATION {
+                    TotalReservedAllocationUnits: u64::MAX,
+                    ..valid
+                },
+            ] {
+                let sample = capacity_sample(0, &output, SystemTime::UNIX_EPOCH);
+                assert_eq!(sample.total_bytes, Some(102400));
+                assert_eq!(sample.free_bytes, Some(61440));
+                assert_eq!(sample.metadata.issue, None);
+                assert_eq!(sample.storage_reserve_bytes, None);
+                assert_eq!(sample.total_reserved_bytes, None);
+                assert_eq!(sample.reserve_issue, Some(CapacityIssue::SizeOverflow));
+            }
+            // Do not impose an undocumented partition equality on provider observations.
+            let overlapping = DISK_SPACE_INFORMATION {
+                VolumeStorageReserveAllocationUnits: 50,
+                TotalReservedAllocationUnits: 50,
+                ..valid
+            };
+            let sample = capacity_sample(0, &overlapping, SystemTime::UNIX_EPOCH);
+            assert_eq!(sample.free_bytes, Some(61440));
+            assert_eq!(sample.storage_reserve_bytes, Some(51200));
+            assert_eq!(sample.metadata.issue, None);
+            assert_eq!(sample.reserve_issue, None);
         }
     }
 }
@@ -1232,9 +1366,9 @@ mod tests {
         let path = std::env::temp_dir();
         let root = volume_root_for(&path).expect("temp directory volume root");
         let before = SystemTime::now();
-        let volume = list_drives()
-            .unwrap()
-            .into_iter()
+        let volumes = list_drives().unwrap();
+        let volume = volumes
+            .iter()
             .find(|volume| volume.root.eq_ignore_ascii_case(&root))
             .expect("temp volume listed");
         assert!(
@@ -1257,8 +1391,41 @@ mod tests {
         let total = volume.total_bytes.expect("global total known");
         let free = volume.free_bytes.expect("global free known");
         assert!(total > 0 && free <= total);
+        assert_eq!(volume.reserve_issue, None);
+        let storage = volume
+            .storage_reserve_bytes
+            .expect("storage reserve known, including zero");
+        let reserved = volume
+            .total_reserved_bytes
+            .expect("total reserved known, including zero");
         println!(
-            "native_capacity_source=WindowsActualGlobalFilesystem total_bytes={total} free_bytes={free} coherent=1 capture_time_recorded=1"
+            "native_capacity_source=WindowsActualGlobalFilesystem total_bytes={total} free_bytes={free} storage_reserve_bytes={storage} total_reserved_bytes={reserved} reserve_known=1 coherent=1 capture_time_recorded=1"
         );
+        // Reuse the same drive listing, not a scan or another query, for private system-volume
+        // evidence. Do not demand a positive reserve: zero is valid on another machine.
+        if let Ok(drive) = std::env::var("SystemDrive") {
+            let system_root = format!("{drive}\\");
+            if let Some(system) = volumes
+                .iter()
+                .find(|volume| volume.root.eq_ignore_ascii_case(&system_root))
+            {
+                let free_plus_storage = system
+                    .free_bytes
+                    .zip(system.storage_reserve_bytes)
+                    .and_then(|(free, reserve)| free.checked_add(reserve));
+                println!(
+                    "native_system_capacity total_bytes={:?} free_bytes={:?} storage_reserve_bytes={:?} total_reserved_bytes={:?} reserve_issue={:?} free_plus_storage_reserve_bytes={:?} free_plus_storage_within_total={:?}",
+                    system.total_bytes,
+                    system.free_bytes,
+                    system.storage_reserve_bytes,
+                    system.total_reserved_bytes,
+                    system.reserve_issue,
+                    free_plus_storage,
+                    free_plus_storage
+                        .zip(system.total_bytes)
+                        .map(|(sum, total)| sum <= total)
+                );
+            }
+        }
     }
 }

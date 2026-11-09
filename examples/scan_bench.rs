@@ -125,6 +125,22 @@ fn difference(
     Ok(i128::from(total) - i128::from(free) - i128::from(allocated))
 }
 
+fn difference_excluding_reserve(
+    sample: Result<hogmap::volume::OriginCapacitySample, hogmap::volume::OriginIssue>,
+    allocated: Option<u64>,
+) -> Result<i128, String> {
+    let sample = sample.map_err(|issue| format!("origin:{issue:?}"))?;
+    let including_reserve = difference(Ok(sample), allocated)?;
+    if let Some(issue) = sample.reserve_issue {
+        return Err(format!("reserve:{issue:?}"));
+    }
+    let reserve = sample
+        .storage_reserve_bytes
+        .ok_or("storage_reserve_unknown")?;
+    // Four u64 inputs fit in i128, even when the observed difference is negative.
+    Ok(including_reserve - i128::from(reserve))
+}
+
 fn print_origin_diagnostics(
     observations: &hogmap::scan_win::ScanOriginObservations,
     filesystem: Option<&str>,
@@ -194,6 +210,15 @@ fn print_origin_diagnostics(
                     "origin_{name}_free_bytes={}",
                     optional_count(sample.free_bytes)
                 );
+                println!(
+                    "origin_{name}_storage_reserve_bytes={}",
+                    optional_count(sample.storage_reserve_bytes)
+                );
+                println!(
+                    "origin_{name}_total_reserved_bytes={}",
+                    optional_count(sample.total_reserved_bytes)
+                );
+                println!("origin_{name}_reserve_issue={:?}", sample.reserve_issue);
                 println!("origin_{name}_capacity_issue={:?}", sample.metadata.issue);
                 println!(
                     "origin_{name}_capture_offset_ms={}",
@@ -203,18 +228,34 @@ fn print_origin_diagnostics(
             Err(issue) => {
                 println!("origin_{name}_total_bytes=unknown");
                 println!("origin_{name}_free_bytes=unknown");
+                println!("origin_{name}_storage_reserve_bytes=unknown");
+                println!("origin_{name}_total_reserved_bytes=unknown");
+                println!("origin_{name}_reserve_issue=origin:{issue:?}");
                 println!("origin_{name}_capacity_issue=origin:{issue:?}");
                 println!("origin_{name}_capture_offset_ms=unknown");
             }
         }
-        match difference(sample, allocated) {
-            Ok(value) => {
-                println!("observed_d_{name}_bytes={value}");
-                println!("observed_d_{name}_issue=none");
-            }
-            Err(issue) => {
-                println!("observed_d_{name}_bytes=unknown");
-                println!("observed_d_{name}_issue={issue}");
+        // Keep the earlier diagnostic keys as aliases for the including-reserve value.
+        for (field, result) in [
+            (format!("observed_d_{name}"), difference(sample, allocated)),
+            (
+                format!("observed_d_including_reserve_{name}"),
+                difference(sample, allocated),
+            ),
+            (
+                format!("observed_d_excluding_reserve_{name}"),
+                difference_excluding_reserve(sample, allocated),
+            ),
+        ] {
+            match result {
+                Ok(value) => {
+                    println!("{field}_bytes={value}");
+                    println!("{field}_issue=none");
+                }
+                Err(issue) => {
+                    println!("{field}_bytes=unknown");
+                    println!("{field}_issue={issue}");
+                }
             }
         }
     }
@@ -258,6 +299,7 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
             }
         })
     });
+    let reread_root = args.observed.then(|| args.root.clone());
     let producer = thread::Builder::new()
         .name("hogmap-scan-bench".into())
         .spawn(move || {
@@ -348,6 +390,67 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
     let ingested = Instant::now();
     let ((outcome, report), observations, producer_finished) =
         producer.join().map_err(|_| "producer_panicked")?;
+    if observations.is_some()
+        && let Some(root) = reread_root.as_ref()
+    {
+        if let Some(index) = reducer.finished_index_mut() {
+            for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+                println!(
+                    "conflict_reread_before_{metric:?}={}",
+                    optional_count(
+                        index
+                            .summary_for(metric)
+                            .ok()
+                            .map(|s| s.conflicting_identities)
+                    )
+                );
+            }
+            let reread = hogmap::scan_win::reread_identity_conflicts(index, root, &cancellation);
+            println!("conflict_reread_candidates={}", reread.candidate_identities);
+            println!("conflict_reread_attempted={}", reread.attempted_identities);
+            println!("conflict_reread_resolved={}", reread.resolved_identities);
+            println!(
+                "conflict_reread_unresolved={}",
+                reread.unresolved_identities
+            );
+            println!(
+                "conflict_reread_logical_delta_bytes={}",
+                reread.logical_delta_bytes
+            );
+            println!(
+                "conflict_reread_allocated_delta_bytes={}",
+                reread.allocated_delta_bytes
+            );
+            println!("conflict_reread_issues={:?}", reread.issues);
+            println!(
+                "conflict_reread_limit={}",
+                hogmap::scan_win::MAX_CONFLICT_REREADS
+            );
+            if let Some(observed) = observations.as_ref() {
+                println!(
+                    "conflict_reread_started_offset_ms={}",
+                    wall_offset_ms(observed.started_at, reread.started_at)
+                );
+                println!(
+                    "conflict_reread_finished_offset_ms={}",
+                    wall_offset_ms(observed.started_at, reread.finished_at)
+                );
+            }
+            for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+                println!(
+                    "conflict_reread_after_{metric:?}={}",
+                    optional_count(
+                        index
+                            .summary_for(metric)
+                            .ok()
+                            .map(|s| s.conflicting_identities)
+                    )
+                );
+            }
+        } else {
+            println!("conflict_reread_status=not_finished");
+        }
+    }
     let elapsed = started.elapsed();
     let _ = stop_timer.send(());
     if let Some(timer) = timer {

@@ -460,6 +460,9 @@ mod tests {
             filesystem: Some("NTFS".into()),
             total_bytes: Some(8192),
             free_bytes: Some(2048),
+            storage_reserve_bytes: Some(0),
+            total_reserved_bytes: Some(0),
+            reserve_issue: None,
             capacity: capacity_metadata(None),
         };
         let choice = DriveChoice::from(volume.clone());
@@ -511,6 +514,9 @@ mod tests {
                 filesystem: Some("NTFS".into()),
                 total_bytes: Some(8192),
                 free_bytes: Some(4096),
+                storage_reserve_bytes: Some(0),
+                total_reserved_bytes: Some(0),
+                reserve_issue: None,
                 capacity: capacity_metadata(None),
             },
             VolumeInfo {
@@ -519,6 +525,9 @@ mod tests {
                 filesystem: Some("NTFS".into()),
                 total_bytes: Some(1024),
                 free_bytes: Some(0),
+                storage_reserve_bytes: Some(0),
+                total_reserved_bytes: Some(0),
+                reserve_issue: None,
                 capacity: capacity_metadata(None),
             },
         ];
@@ -541,6 +550,9 @@ mod tests {
                 filesystem: None,
                 total_bytes: None,
                 free_bytes: None,
+                storage_reserve_bytes: None,
+                total_reserved_bytes: None,
+                reserve_issue: failed.issue,
                 capacity: failed,
             }],
         );

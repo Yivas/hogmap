@@ -1,4 +1,5 @@
-//! Read-only Windows directory enumeration. No file contents or per-file opens.
+//! Read-only Windows directory enumeration and an explicit conflict-only metadata post-pass.
+//! Enumeration never opens individual files; neither path reads file contents.
 #![allow(unsafe_code)]
 
 use crate::scan::{ScanCancellation, ScanGeneration, ScanSender};
@@ -212,6 +213,91 @@ pub fn run_win_scan_with_options(
     )
 }
 
+/// Maximum identities selected for the explicit post-pass; excess conflicts remain unresolved.
+pub const MAX_CONFLICT_REREADS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConflictRereadStage {
+    Path,
+    Open,
+    Attributes,
+    Identity,
+    StandardInfo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ConflictRereadIssue {
+    QueryFailed {
+        stage: ConflictRereadStage,
+        code: u32,
+    },
+    UnsafePath,
+    UnsafeFile,
+    IdentityMismatch,
+    VolumeMismatch,
+    UnknownSize,
+    IndexRejected,
+    MissingName,
+    Cancelled,
+    LimitExceeded,
+    UnsupportedPlatform,
+}
+
+/// Anonymous results of a separate post-Finished pass, never part of ScanReport.
+#[derive(Debug)]
+pub struct ConflictRereadReport {
+    pub candidate_identities: usize,
+    pub attempted_identities: usize,
+    pub resolved_identities: usize,
+    pub unresolved_identities: usize,
+    pub logical_delta_bytes: i128,
+    pub allocated_delta_bytes: i128,
+    pub started_at: std::time::SystemTime,
+    pub finished_at: std::time::SystemTime,
+    pub issues: std::collections::BTreeMap<ConflictRereadIssue, usize>,
+}
+impl ConflictRereadReport {
+    fn issue(&mut self, issue: ConflictRereadIssue, count: usize) {
+        if count > 0 {
+            *self.issues.entry(issue).or_default() += count;
+        }
+    }
+}
+
+/// Reopen at most one listed name per conflicting identity after Finished. Callers must not
+/// run this against an index still receiving records. The legacy producer never calls it.
+pub fn reread_identity_conflicts(
+    index: &mut crate::index::Index,
+    root: &std::path::Path,
+    cancel: &ScanCancellation,
+) -> ConflictRereadReport {
+    let count = index.conflicting_identities().count();
+    let started_at = std::time::SystemTime::now();
+    let mut report = ConflictRereadReport {
+        candidate_identities: count,
+        attempted_identities: 0,
+        resolved_identities: 0,
+        unresolved_identities: count,
+        logical_delta_bytes: 0,
+        allocated_delta_bytes: 0,
+        started_at,
+        finished_at: started_at,
+        issues: Default::default(),
+    };
+    if count > 0 {
+        #[cfg(windows)]
+        platform::reread_conflicts(index, root, cancel, &mut report);
+        #[cfg(not(windows))]
+        {
+            let _ = (root, cancel);
+            report.issue(ConflictRereadIssue::UnsupportedPlatform, count);
+        }
+    }
+    report.unresolved_identities = count - report.resolved_identities;
+    report.finished_at = std::time::SystemTime::now();
+    report
+}
+
 #[cfg(windows)]
 pub(crate) use platform::extended_path;
 #[cfg(windows)]
@@ -243,6 +329,269 @@ mod platform {
         ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, HANDLE, INVALID_HANDLE_VALUE,
     };
     use windows_sys::Win32::Storage::FileSystem::*;
+
+    fn reread_error(stage: ConflictRereadStage, code: u32) -> ConflictRereadIssue {
+        ConflictRereadIssue::QueryFailed { stage, code }
+    }
+    fn reread_running(cancel: &ScanCancellation) -> Result<(), ConflictRereadIssue> {
+        if cancel.is_cancelled() {
+            Err(ConflictRereadIssue::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+    fn reread_safe_path(path: &Path, cancel: &ScanCancellation) -> Result<(), ConflictRereadIssue> {
+        let absolute = std::path::absolute(path).map_err(|_| ConflictRereadIssue::UnsafePath)?;
+        let mut prefix = PathBuf::new();
+        for component in absolute.components() {
+            reread_running(cancel)?;
+            if matches!(component, Component::ParentDir) {
+                return Err(ConflictRereadIssue::UnsafePath);
+            }
+            prefix.push(component);
+            if matches!(component, Component::Prefix(_)) {
+                continue;
+            }
+            let attrs = attributes(&prefix)
+                .map_err(|error| reread_error(ConflictRereadStage::Path, error.code))?;
+            if skip_code(attrs, 0).is_some() {
+                return Err(ConflictRereadIssue::UnsafePath);
+            }
+        }
+        Ok(())
+    }
+    fn reread_open(
+        path: &Path,
+        directory: bool,
+        cancel: &ScanCancellation,
+    ) -> Result<std::fs::File, ConflictRereadIssue> {
+        use std::os::windows::fs::OpenOptionsExt;
+        reread_safe_path(path, cancel)?;
+        let path = extended_path(path)
+            .map_err(|error| reread_error(ConflictRereadStage::Path, error.code))?;
+        reread_running(cancel)?;
+        std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT
+                    | FILE_FLAG_OPEN_NO_RECALL
+                    | if directory {
+                        FILE_FLAG_BACKUP_SEMANTICS
+                    } else {
+                        0
+                    },
+            )
+            .open(OsString::from_wide(&path[..path.len() - 1]))
+            .map_err(|error| {
+                reread_error(
+                    ConflictRereadStage::Open,
+                    error.raw_os_error().unwrap_or(-1) as u32,
+                )
+            })
+    }
+    fn reread_binding(
+        file: &std::fs::File,
+        directory: bool,
+        cancel: &ScanCancellation,
+    ) -> Result<(u32, FILE_ID_INFO), ConflictRereadIssue> {
+        use std::os::windows::io::AsRawHandle;
+        reread_running(cancel)?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: live owned metadata-only handle and exact binding-defined output.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+            return Err(reread_error(
+                ConflictRereadStage::Attributes,
+                ScanError::last().code,
+            ));
+        }
+        if skip_code(info.dwFileAttributes, 0).is_some()
+            || (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0) != directory
+        {
+            return Err(ConflictRereadIssue::UnsafeFile);
+        }
+        reread_running(cancel)?;
+        let mut identity = FILE_ID_INFO::default();
+        // SAFETY: same live handle and the exact FILE_ID_INFO layout and size.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileIdInfo,
+                (&mut identity as *mut FILE_ID_INFO).cast(),
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(reread_error(
+                ConflictRereadStage::Identity,
+                ScanError::last().code,
+            ));
+        }
+        if identity.FileId.Identifier == [0; 16] {
+            return Err(ConflictRereadIssue::IdentityMismatch);
+        }
+        Ok((info.dwVolumeSerialNumber, identity))
+    }
+    fn reread_file(
+        path: &Path,
+        expected: FileIdentity,
+        root_serial: u64,
+        cancel: &ScanCancellation,
+    ) -> Result<Sizes, ConflictRereadIssue> {
+        use std::os::windows::io::AsRawHandle;
+        let file = reread_open(path, false, cancel)?;
+        let (serial32, identity) = reread_binding(&file, false, cancel)?;
+        if u64::from(serial32) != expected.volume || identity.VolumeSerialNumber != root_serial {
+            return Err(ConflictRereadIssue::VolumeMismatch);
+        }
+        if u128::from_le_bytes(identity.FileId.Identifier) != expected.file {
+            return Err(ConflictRereadIssue::IdentityMismatch);
+        }
+        reread_running(cancel)?;
+        let mut standard = FILE_STANDARD_INFO::default();
+        // SAFETY: verified live file handle and exact binding-defined output; no data read.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle(),
+                FileStandardInfo,
+                (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                size_of::<FILE_STANDARD_INFO>() as u32,
+            )
+        } == 0
+        {
+            return Err(reread_error(
+                ConflictRereadStage::StandardInfo,
+                ScanError::last().code,
+            ));
+        }
+        if standard.Directory {
+            return Err(ConflictRereadIssue::UnsafeFile);
+        }
+        Ok(Sizes {
+            logical: u64::try_from(standard.EndOfFile).ok(),
+            allocated: u64::try_from(standard.AllocationSize).ok(),
+        })
+    }
+    pub(super) fn reread_conflicts(
+        index: &mut crate::index::Index,
+        root: &Path,
+        cancel: &ScanCancellation,
+        report: &mut ConflictRereadReport,
+    ) {
+        use crate::index::{EntryId, SizeMetric};
+        use std::collections::HashMap;
+        let mut candidates: HashMap<FileIdentity, Option<EntryId>> = index
+            .conflicting_identities()
+            .take(MAX_CONFLICT_REREADS)
+            .map(|identity| (identity, None))
+            .collect();
+        report.issue(
+            ConflictRereadIssue::LimitExceeded,
+            report.candidate_identities - candidates.len(),
+        );
+        if cancel.is_cancelled() {
+            report.issue(ConflictRereadIssue::Cancelled, candidates.len());
+            return;
+        }
+        for (id, entry) in index.entries() {
+            if cancel.is_cancelled() {
+                report.issue(ConflictRereadIssue::Cancelled, candidates.len());
+                return;
+            }
+            if entry.kind == Kind::File
+                && let Some(identity) = entry.identity
+                && let Some(selected) = candidates.get_mut(&identity)
+                && selected.is_none()
+            {
+                *selected = Some(id);
+            }
+        }
+        let binding = (|| {
+            let _mode = crate::volume::ErrorModeGuard::new()
+                .map_err(|error| reread_error(ConflictRereadStage::Open, error.code))?;
+            let file = reread_open(root, true, cancel)?;
+            let (_, identity) = reread_binding(&file, true, cancel)?;
+            Ok::<_, ConflictRereadIssue>((_mode, file, identity.VolumeSerialNumber))
+        })();
+        let (_mode, _root_handle, serial64) = match binding {
+            Ok(binding) => binding,
+            Err(issue) => {
+                report.issue(issue, candidates.len());
+                return;
+            }
+        };
+        'identities: for (identity, entry) in candidates {
+            if cancel.is_cancelled() {
+                report.issue(ConflictRereadIssue::Cancelled, 1);
+                continue;
+            }
+            let Some(mut id) = entry else {
+                report.issue(ConflictRereadIssue::MissingName, 1);
+                continue;
+            };
+            let mut names = Vec::new();
+            let mut path_units = root.as_os_str().encode_wide().count();
+            while id != index.root() {
+                if cancel.is_cancelled() {
+                    report.issue(ConflictRereadIssue::Cancelled, 1);
+                    continue 'identities;
+                }
+                let entry = index.get(id).expect("selected stored entry");
+                path_units += entry.name.encode_wide().count() + 1;
+                if path_units >= 32767 {
+                    report.issue(
+                        reread_error(ConflictRereadStage::Path, ERROR_FILENAME_EXCED_RANGE),
+                        1,
+                    );
+                    continue 'identities;
+                }
+                names.push(entry.name);
+                id = entry.parent.expect("non-root parent");
+            }
+            let mut path = root.to_path_buf();
+            for name in names.into_iter().rev() {
+                path.push(name);
+            }
+            report.attempted_identities += 1;
+            let sizes = match reread_file(&path, identity, serial64, cancel) {
+                Ok(sizes) => sizes,
+                Err(issue) => {
+                    report.issue(issue, 1);
+                    continue;
+                }
+            };
+            let before = [
+                index.summary_for(SizeMetric::Logical),
+                index.summary_for(SizeMetric::Allocated),
+            ];
+            match index.apply_authoritative_sizes(identity, sizes) {
+                Ok(result) => {
+                    if result.still_conflicted {
+                        report.issue(ConflictRereadIssue::UnknownSize, 1);
+                    } else {
+                        report.resolved_identities += 1;
+                    }
+                    let after = [
+                        index.summary_for(SizeMetric::Logical),
+                        index.summary_for(SizeMetric::Allocated),
+                    ];
+                    for (slot, metric_delta) in [
+                        &mut report.logical_delta_bytes,
+                        &mut report.allocated_delta_bytes,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        if let (Ok(before), Ok(after)) = (before[slot], after[slot]) {
+                            *metric_delta +=
+                                i128::from(after.unique_bytes) - i128::from(before.unique_bytes);
+                        }
+                    }
+                }
+                Err(_) => report.issue(ConflictRereadIssue::IndexRejected, 1),
+            }
+        }
+    }
 
     const BATCH_RECORDS: usize = 2000;
     const FLUSH_INTERVAL: Duration = Duration::from_millis(40);
@@ -1563,6 +1912,151 @@ mod platform {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn conflict_reread_uses_verified_native_hardlink_handles_not_listed_sizes() {
+            use crate::index::{Index, SizeMetric, State};
+            use std::os::windows::io::AsRawHandle;
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root =
+                std::env::temp_dir().join(format!("hogmap-reread-{}-{unique}", std::process::id()));
+            std::fs::create_dir(&root).unwrap();
+            struct Fixture(PathBuf);
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    std::fs::remove_dir_all(&self.0).expect("owned reread fixture cleanup");
+                }
+            }
+            let fixture = Fixture(root.clone());
+            std::fs::write(root.join("first"), [7_u8; 4096]).unwrap();
+            std::fs::hard_link(root.join("first"), root.join("second")).unwrap();
+            let cancel = ScanCancellation::new();
+            let directory = reread_open(&root, true, &cancel).unwrap();
+            let (_, root_identity) = reread_binding(&directory, true, &cancel).unwrap();
+            let file = reread_open(&root.join("first"), false, &cancel).unwrap();
+            let (serial32, native_id) = reread_binding(&file, false, &cancel).unwrap();
+            let identity = FileIdentity {
+                volume: u64::from(serial32),
+                file: u128::from_le_bytes(native_id.FileId.Identifier),
+            };
+            let mut standard = FILE_STANDARD_INFO::default();
+            // SAFETY: independent oracle on a live fixture handle and exact binding output.
+            assert_ne!(
+                unsafe {
+                    GetFileInformationByHandleEx(
+                        file.as_raw_handle(),
+                        FileStandardInfo,
+                        (&mut standard as *mut FILE_STANDARD_INFO).cast(),
+                        size_of::<FILE_STANDARD_INFO>() as u32,
+                    )
+                },
+                0
+            );
+            let expected = Sizes {
+                logical: u64::try_from(standard.EndOfFile).ok(),
+                allocated: u64::try_from(standard.AllocationSize).ok(),
+            };
+            assert!(expected.logical.is_some() && expected.allocated.is_some());
+            assert_eq!(
+                reread_file(
+                    &root.join("second"),
+                    identity,
+                    root_identity.VolumeSerialNumber,
+                    &cancel
+                ),
+                Ok(expected)
+            );
+            let wrong = FileIdentity {
+                file: identity.file ^ 1,
+                ..identity
+            };
+            assert_eq!(
+                reread_file(
+                    &root.join("first"),
+                    wrong,
+                    root_identity.VolumeSerialNumber,
+                    &cancel
+                ),
+                Err(ConflictRereadIssue::IdentityMismatch)
+            );
+            assert_eq!(
+                reread_file(
+                    &root.join("first"),
+                    identity,
+                    root_identity.VolumeSerialNumber ^ (1_u64 << 63),
+                    &cancel
+                ),
+                Err(ConflictRereadIssue::VolumeMismatch)
+            );
+            assert_eq!(
+                reread_file(
+                    &root.join("first"),
+                    FileIdentity {
+                        volume: identity.volume ^ 1,
+                        ..identity
+                    },
+                    root_identity.VolumeSerialNumber,
+                    &cancel
+                ),
+                Err(ConflictRereadIssue::VolumeMismatch)
+            );
+            // Disagreement is synthetic input to Index, NOT a claimed NTFS stale-entry reproduction.
+            let mut index = Index::new("Fixture".into()).unwrap();
+            let mut ids = Vec::new();
+            for (name, bytes) in [("first", 1), ("second", 2)] {
+                ids.push(
+                    index
+                        .insert(
+                            index.root(),
+                            name.into(),
+                            Kind::File,
+                            Sizes {
+                                logical: Some(bytes),
+                                allocated: Some(bytes),
+                            },
+                            Some(identity),
+                            State::Complete,
+                        )
+                        .unwrap(),
+                );
+            }
+            index.set_state(index.root(), State::Complete).unwrap();
+            let report = reread_identity_conflicts(&mut index, &root, &cancel);
+            assert_eq!(
+                (
+                    report.candidate_identities,
+                    report.attempted_identities,
+                    report.resolved_identities,
+                    report.unresolved_identities
+                ),
+                (1, 1, 1, 0)
+            );
+            assert!(report.issues.is_empty());
+            assert_eq!(
+                index.summary_for(SizeMetric::Logical).unwrap().unique_bytes,
+                expected.logical.unwrap()
+            );
+            assert_eq!(
+                index
+                    .summary_for(SizeMetric::Allocated)
+                    .unwrap()
+                    .unique_bytes,
+                expected.allocated.unwrap()
+            );
+            assert_eq!(index.get(ids[0]).unwrap().sizes.logical, Some(1));
+            assert_eq!(index.get(ids[1]).unwrap().sizes.allocated, Some(2));
+            drop(file);
+            drop(directory);
+            drop(fixture);
+            assert!(!root.exists());
+            println!(
+                "native_conflict_reread hardlinks=1 handle_standard_oracle=1 mismatched_file_rejected=1 mismatched_volume32_rejected=1 mismatched_volume64_rejected=1 synthetic_conflict_input=1 resolved=1 listed_records_unchanged=1 cleanup=1"
+            );
+        }
+
         #[test]
         fn mft_frontier_orders_only_ntfs_seek_devices_and_ignores_sequence_bits() {
             assert!(mft_order_for(Some(true), Some("ntfs")));
