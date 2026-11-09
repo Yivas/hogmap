@@ -1093,7 +1093,10 @@ impl HogMap {
                         detail.push_str(&text::scan_report(report));
                     }
                     let composition = self.composition();
-                    let composition_status = text::composition_status(&composition);
+                    let composition_status = text::composition_status(
+                        &composition,
+                        index.summary_for(SizeMetric::Allocated).ok(),
+                    );
                     detail.push('\n');
                     detail.push_str(&composition_status);
                     detail.push('\n');
@@ -1252,18 +1255,22 @@ impl HogMap {
             return;
         };
         let evaluation = self.composition();
-        let allocated = index
-            .summary_for(SizeMetric::Allocated)
-            .ok()
-            .and_then(|summary| summary.apparent_bytes().ok())
-            .unwrap_or(0);
+        let allocated = index.summary_for(SizeMetric::Allocated).ok();
+        let apparent = allocated.and_then(|summary| summary.apparent_bytes().ok());
+        // D can remain known when apparent geometry overflows; never draw volume cells
+        // against an unrepresentable tree total or substitute zero for that total.
+        let components = if apparent.is_some() {
+            evaluation.components
+        } else {
+            Default::default()
+        };
         let (tree_area, volume_cells) =
-            composition::arrange(area, allocated, evaluation.components);
+            composition::arrange(area, apparent.unwrap_or(0), components);
         composition::draw(
             ui,
             palette,
             &volume_cells,
-            &text::composition_status(&evaluation),
+            &text::composition_status(&evaluation, allocated),
         );
         let rect = Rect::new(
             tree_area.min.x,
@@ -1525,7 +1532,14 @@ impl eframe::App for HogMap {
             }
         }
         if self.about {
-            let about = text::about(self.metric);
+            let mut about = text::about(self.metric);
+            if let Some(index) = self.reducer.index() {
+                about.push_str("\n\nCurrent scan: ");
+                about.push_str(&text::composition_status(
+                    &self.composition(),
+                    index.summary_for(SizeMetric::Allocated).ok(),
+                ));
+            }
             egui::Window::new(text::ABOUT)
                 .open(&mut self.about)
                 .resizable(false)

@@ -33,13 +33,13 @@ fn evidence() -> VolumeEvidence {
         directories: DirectoryNamespaceObservations::default(),
     }
 }
-fn summary(apparent: u64) -> MetricSummary {
+fn summary(unique: u64) -> MetricSummary {
     MetricSummary {
         metric: SizeMetric::Allocated,
         files: 2,
-        known_bytes: apparent,
-        unique_bytes: apparent / 2,
-        shared_bytes: apparent - apparent / 2,
+        known_bytes: unique,
+        unique_bytes: unique,
+        shared_bytes: 0,
         unknown_size_files: 0,
         identity_missing_files: 0,
         conflicting_identities: 0,
@@ -127,48 +127,74 @@ fn apparent_total_corrects_only_the_charged_record_and_retains_listed_alias_size
     assert_eq!(
         result.differences,
         Some(EndpointDifferences {
-            before: 150,
-            after: 100
+            before: 350,
+            after: 300
         })
     );
 
-    // Repeated aliases can make apparent size exceed capacity, even when unique bytes do not.
-    let totals = MetricSummary {
-        known_bytes: 1100,
-        unique_bytes: 350,
-        shared_bytes: 950,
-        ..totals
-    };
-    let result = evaluate(view(), Some(&evidence()), Ok(totals), 0);
-    assert_eq!(
-        result.differences,
-        Some(EndpointDifferences {
-            before: -600,
-            after: -650
-        })
-    );
-    assert_eq!(result.issues, vec![EligibilityIssue::NonPositiveDifference]);
-    assert_eq!(result.components.free_bytes, Some(250));
+    // Two listed names of a 300-byte file plus a separate 50-byte file: apparent 650,
+    // unique 350. More repeated names may exceed capacity without changing D.
+    for apparent in [650, 1100] {
+        let totals = MetricSummary {
+            known_bytes: apparent,
+            unique_bytes: 350,
+            shared_bytes: apparent - 350,
+            resolution_delta_bytes: 0,
+            ..totals
+        };
+        assert_eq!(totals.apparent_bytes(), Ok(apparent));
+        let result = evaluate(view(), Some(&evidence()), Ok(totals), 0);
+        assert_eq!(
+            result.differences,
+            Some(EndpointDifferences {
+                before: 350,
+                after: 300
+            })
+        );
+        assert!(result.eligible());
+        assert_eq!(result.components.free_bytes, Some(250));
+    }
 }
 
 #[test]
-fn apparent_arithmetic_overflow_is_reported_instead_of_wrapping() {
+fn unique_difference_is_independent_of_apparent_overflow_but_rejects_allocated_overflow() {
     let totals = MetricSummary {
-        resolution_delta_bytes: i128::MAX,
-        ..summary(1)
+        known_bytes: u64::MAX,
+        unique_bytes: 2,
+        shared_bytes: u64::MAX - 1,
+        resolution_delta_bytes: 1,
+        ..summary(2)
     };
+    assert_eq!(totals.apparent_bytes(), Err(IndexError::SizeOverflow));
     let result = evaluate(view(), Some(&evidence()), Ok(totals), 0);
-    assert_eq!(result.differences, None);
-    assert_eq!(result.issues, vec![EligibilityIssue::AllocatedOverflow]);
-    let mut facts = evidence();
-    facts.before = Ok(sample(0, 0, Some(u64::MAX)));
-    facts.after = facts.before;
-    let totals = MetricSummary {
-        known_bytes: 0,
-        resolution_delta_bytes: i128::MAX,
-        ..summary(0)
-    };
-    let result = evaluate(view(), Some(&facts), Ok(totals), 0);
+    assert!(result.eligible());
+    assert_eq!(
+        result.differences,
+        Some(EndpointDifferences {
+            before: 698,
+            after: 648
+        })
+    );
+
+    let mut index = Index::new("Overflow".into()).unwrap();
+    for (name, bytes) in [("max", u64::MAX), ("one", 1)] {
+        index
+            .insert(
+                index.root(),
+                name.into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(0),
+                    allocated: Some(bytes),
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap();
+    }
+    let totals = index.summary_for(SizeMetric::Allocated);
+    assert_eq!(totals, Err(IndexError::SizeOverflow));
+    let result = evaluate(view(), Some(&evidence()), totals, 0);
     assert_eq!(result.differences, None);
     assert_eq!(result.issues, vec![EligibilityIssue::AllocatedOverflow]);
 }
@@ -193,8 +219,8 @@ fn measured_reserve_is_subtracted_once_and_endpoints_are_signed_not_clipped() {
         }
     );
     // TotalReserved=900 is deliberately different: it is not an additional subtraction.
-    for (apparent, before, after) in [(650, 50, 0), (700, 0, -50), (800, -100, -150)] {
-        let result = evaluate(view(), Some(&facts), Ok(summary(apparent)), 0);
+    for (unique, before, after) in [(650, 50, 0), (700, 0, -50), (800, -100, -150)] {
+        let result = evaluate(view(), Some(&facts), Ok(summary(unique)), 0);
         assert_eq!(
             result.differences,
             Some(EndpointDifferences { before, after })

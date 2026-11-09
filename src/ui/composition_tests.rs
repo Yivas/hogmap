@@ -206,6 +206,30 @@ fn apparent_overflow_only_offers_a_metric_that_can_be_drawn() {
                 (u64::MAX, 1, 2, u64::MAX - 1)
             );
             app.metric = metric;
+            if metric == SizeMetric::Allocated {
+                let mut evidence = facts();
+                evidence.before.as_mut().unwrap().total_bytes = Some(1000);
+                evidence.after.as_mut().unwrap().total_bytes = Some(1000);
+                app.volume_evidence = Some(evidence);
+                let evaluation = app.composition();
+                assert_eq!(
+                    evaluation.differences,
+                    Some(hogmap::composition::EndpointDifferences {
+                        before: 698,
+                        after: 648,
+                    })
+                );
+                let detail = text::composition_status(&evaluation, Some(summary));
+                assert!(
+                    detail.contains("Estimated difference (not drawn): before 698 B, after 648 B")
+                );
+                assert!(
+                    detail.contains(
+                        "Repeated hard-link names (apparent − unique): 17179869184.0 GiB"
+                    ),
+                    "{detail}"
+                );
+            }
             let _ = frame(&context, &mut app, Vec::new());
             assert!(app.cache.is_none());
             let message = &app.current_layout_failure().unwrap().message;
@@ -293,7 +317,9 @@ fn whole_volume_cells_share_the_tree_scale_without_d_or_file_actions() {
             let name = node.label().or(node.value()).unwrap();
             assert!(name.contains("Not a file; no file actions"));
             assert!(name.contains("Not a complete disk partition"));
-            assert!(name.contains("Estimated difference (not drawn): before 200 B, after 150 B"));
+            assert!(name.contains("Estimated difference (not drawn): before 400 B, after 350 B"));
+            assert!(name.contains("Uses unique allocated bytes: 500 B"));
+            assert!(name.contains("Repeated hard-link names (apparent − unique): 200 B"));
             assert!(!node.supports_action(egui::accesskit::Action::Click));
             assert!(node.supports_action(egui::accesskit::Action::Focus));
             let bounds = node.bounds().unwrap();

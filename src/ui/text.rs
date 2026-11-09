@@ -108,10 +108,10 @@ fn metric_title(metric: SizeMetric) -> &'static str {
 pub fn map_metric(metric: SizeMetric) -> &'static str {
     match metric {
         SizeMetric::Logical => {
-            "Apparent size: logical · Each listed name counts · Can exceed disk capacity"
+            "Apparent size (map): logical · Each listed name counts · Can exceed disk capacity"
         }
         SizeMetric::Allocated => {
-            "Apparent size: observed allocated · Each listed name counts · Can exceed disk capacity · Highlight uses logical size"
+            "Apparent size (map): observed allocated · Each listed name counts · Can exceed disk capacity · Highlight uses logical size"
         }
     }
 }
@@ -125,7 +125,7 @@ pub fn empty_map(metric: SizeMetric) -> String {
 
 pub fn about(metric: SizeMetric) -> String {
     format!(
-        "Read-only Windows folder and drive scanning. No release yet.\nApparent size totals count each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. Unique totals remain secondary status detail. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt a finished whole-volume root in Allocated size, independently known Free space and Reserved by Windows cells share the scanned tree's byte scale. They have no file actions. The map is not a complete disk partition: estimated difference is diagnostic text only, never an inaccessible-space block.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
+        "Read-only Windows folder and drive scanning. No release yet.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt a finished whole-volume root in Allocated size, independently known Free space and Reserved by Windows cells share the scanned tree's byte scale. They have no file actions. The map is not a complete disk partition: estimated difference is diagnostic text only, never an inaccessible-space block.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
         metric_bytes(metric)
     )
 }
@@ -373,7 +373,7 @@ pub fn status(
             };
             // Identity gaps are confidence indicators, reported apart from coverage.
             format!(
-                "{} | Apparent size: {} {metric} | {} unique per identity | Each listed name counts; can exceed disk capacity | {completeness}: {} unknown {metric} sizes, {} inaccessible, {} partial | Identity: {} without ID, {} conflicting {conflicts}",
+                "{} | Apparent size (map): {} {metric} | {} unique per identity | Each listed name counts; can exceed disk capacity | {completeness}: {} unknown {metric} sizes, {} inaccessible, {} partial | Identity: {} without ID, {} conflicting {conflicts}",
                 files(summary.files),
                 apparent_size(summary),
                 size(summary.unique_bytes, false),
@@ -398,7 +398,7 @@ pub fn master_status(
     let seconds = elapsed.as_secs();
     let bytes = match totals {
         Ok(summary) => format!(
-            "Apparent size: {} {}",
+            "Apparent size (map): {} {}",
             apparent_size(summary),
             metric_bytes(summary.metric)
         ),
@@ -565,7 +565,7 @@ fn eligibility_issue(issue: &hogmap::composition::EligibilityIssue) -> String {
             "{} Windows storage reserve is unknown",
             endpoint_name(*endpoint)
         ),
-        Issue::AllocatedOverflow => "allocated or apparent byte arithmetic overflowed".into(),
+        Issue::AllocatedOverflow => "allocated byte arithmetic overflowed".into(),
         Issue::UnresolvedConflicts(count) => format!("{count} unresolved identity conflicts"),
         Issue::KnownSizeWithoutIdentity(count) => {
             format!("{count} known allocated sizes without identity")
@@ -603,7 +603,10 @@ fn signed_size(bytes: i128) -> String {
     }
 }
 
-pub fn composition_status(evaluation: &hogmap::composition::CompositionEvaluation) -> String {
+pub fn composition_status(
+    evaluation: &hogmap::composition::CompositionEvaluation,
+    allocated: Option<MetricSummary>,
+) -> String {
     let difference = match evaluation.differences {
         Some(values) => format!(
             "Estimated difference (not drawn): before {}, after {}",
@@ -618,8 +621,17 @@ pub fn composition_status(evaluation: &hogmap::composition::CompositionEvaluatio
         .map(eligibility_issue)
         .collect::<Vec<_>>()
         .join("; ");
+    let unique = allocated.map_or_else(
+        || "unavailable".into(),
+        |summary| size(summary.unique_bytes, false),
+    );
+    // shared = apparent - unique stays known even when the apparent area exceeds u64.
+    let repeated = allocated.map_or_else(
+        || "unavailable".into(),
+        |summary| size(summary.shared_bytes, false),
+    );
     format!(
-        "Not a complete disk partition · Difference uses apparent size, which can exceed disk capacity · {difference}{}",
+        "{difference} · Uses unique allocated bytes: {unique} · Repeated hard-link names (apparent − unique): {repeated} · Not a complete disk partition · The map counts each listed name. Map + free + reserve + estimated difference can exceed disk capacity by these repeated-name bytes.{}",
         if reasons.is_empty() {
             String::new()
         } else {
@@ -799,13 +811,13 @@ mod tests {
         let allocated = metric_totals(&index, SizeMetric::Allocated);
         assert_eq!(
             status("Finished", "Fixture", &allocated, &quiet),
-            "Finished | Fixture | 5 files | Apparent size: 16.0 KiB observed allocated | 8.0 KiB unique per identity | Each listed name counts; can exceed disk capacity | Incomplete: 1 unknown observed allocated sizes, 0 inaccessible, 0 partial | Identity: 1 file without ID, 1 conflicting ID | 0 protocol diagnostics"
+            "Finished | Fixture | 5 files | Apparent size (map): 16.0 KiB observed allocated | 8.0 KiB unique per identity | Each listed name counts; can exceed disk capacity | Incomplete: 1 unknown observed allocated sizes, 0 inaccessible, 0 partial | Identity: 1 file without ID, 1 conflicting ID | 0 protocol diagnostics"
         );
         assert_eq!(completeness(&allocated), INCOMPLETE_METADATA);
         let logical = metric_totals(&index, SizeMetric::Logical);
         assert_eq!(
             status("Finished", "Fixture", &logical, &quiet),
-            "Finished | Fixture | 5 files | Apparent size: 260 B logical | 160 B unique per identity | Each listed name counts; can exceed disk capacity | Complete: 0 unknown logical sizes, 0 inaccessible, 0 partial | Identity: 2 files without ID, 0 conflicting IDs | 0 protocol diagnostics"
+            "Finished | Fixture | 5 files | Apparent size (map): 260 B logical | 160 B unique per identity | Each listed name counts; can exceed disk capacity | Complete: 0 unknown logical sizes, 0 inaccessible, 0 partial | Identity: 2 files without ID, 0 conflicting IDs | 0 protocol diagnostics"
         );
         assert_eq!(completeness(&logical), COMPLETE_METADATA);
 
@@ -836,12 +848,14 @@ mod tests {
         let totals = metric_totals(&resolved, SizeMetric::Allocated);
         let detail = status("Finished", "Fixture", &totals, &quiet);
         assert!(
-            detail.contains("Apparent size: 280 B observed allocated | 80 B unique per identity"),
+            detail.contains(
+                "Apparent size (map): 280 B observed allocated | 80 B unique per identity"
+            ),
             "{detail}"
         );
         assert_eq!(
             master_status("Ready", 3, &totals, std::time::Duration::ZERO),
-            "Ready  ·  3 entries seen  ·  Apparent size: 280 B observed allocated  ·  0:00 elapsed"
+            "Ready  ·  3 entries seen  ·  Apparent size (map): 280 B observed allocated  ·  0:00 elapsed"
         );
         let mut overflow = resolved.summary_for(SizeMetric::Allocated).unwrap();
         overflow.resolution_delta_bytes = i128::MAX;

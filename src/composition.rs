@@ -177,10 +177,6 @@ pub fn evaluate(
     unresolved_identities: usize,
 ) -> CompositionEvaluation {
     use EligibilityIssue as Issue;
-    let allocated = allocated.and_then(|summary| {
-        summary.apparent_bytes()?;
-        Ok(summary)
-    });
     let mut issues = Vec::new();
     if view.metric != SizeMetric::Allocated {
         issues.push(Issue::LogicalView);
@@ -265,15 +261,17 @@ pub fn evaluate(
         && let (Some((bt, bf)), Some(br), Some((at, af)), Some(ar), Ok(summary)) =
             (before, before_reserve, after, after_reserve, allocated)
     {
-        // Apparent total corrects the charged record; alias records retain listed sizes.
-        // This is not full per-name authoritative correction and implies no error bound.
-        let differences = summary.apparent_bytes().ok().and_then(|apparent| {
-            let apparent = i128::from(apparent);
-            Some(EndpointDifferences {
-                before: (i128::from(bt) - i128::from(bf) - i128::from(br)).checked_sub(apparent)?,
-                after: (i128::from(at) - i128::from(af) - i128::from(ar)).checked_sub(apparent)?,
-            })
-        });
+        // unique_bytes already includes authoritative identity-charge corrections. Listed
+        // aliases contribute to map geometry, not to this independent volume comparison.
+        let difference = |total, free, reserve| {
+            i128::from(total)
+                .checked_sub(i128::from(free))?
+                .checked_sub(i128::from(reserve))?
+                .checked_sub(i128::from(summary.unique_bytes))
+        };
+        let differences = difference(bt, bf, br)
+            .zip(difference(at, af, ar))
+            .map(|(before, after)| EndpointDifferences { before, after });
         if let Some(differences) = differences {
             if differences.before <= 0 || differences.after <= 0 {
                 result.issues.push(Issue::NonPositiveDifference);
