@@ -11,6 +11,7 @@ fn params(min_pixel_area: f32, header_height: f32) -> LayoutParams {
     LayoutParams {
         min_pixel_area,
         header_height,
+        max_depth: usize::MAX,
     }
 }
 
@@ -76,6 +77,148 @@ fn insert_linked_file(
             State::Complete,
         )
         .unwrap()
+}
+
+#[test]
+fn repeated_layout_tracks_append_states_metrics_resolution_and_members() {
+    let mut index = Index::new("Cache fixture".into()).unwrap();
+    let root = index.root();
+    index.set_state(root, State::Complete).unwrap();
+    let identity = FileIdentity { volume: 1, file: 7 };
+    let first = index
+        .insert(
+            root,
+            "first".into(),
+            Kind::File,
+            Sizes {
+                logical: Some(10),
+                allocated: Some(20),
+            },
+            Some(identity),
+            State::Complete,
+        )
+        .unwrap();
+    let draw = |index: &Index, metric| {
+        layout_with_metric(
+            index,
+            root,
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            params(1.0, 0.0),
+            metric,
+        )
+        .unwrap()
+    };
+    assert_eq!(draw(&index, SizeMetric::Logical).known_sum, 10);
+    let pending = index
+        .insert(
+            root,
+            "pending".into(),
+            Kind::Directory,
+            Sizes::default(),
+            None,
+            State::Pending,
+        )
+        .unwrap();
+    index
+        .insert(
+            pending,
+            "unknown allocation".into(),
+            Kind::File,
+            Sizes {
+                logical: Some(5),
+                allocated: None,
+            },
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    let growing = draw(&index, SizeMetric::Logical);
+    assert_eq!(growing.known_sum, 15);
+    assert!(growing.has_unknown);
+    index.set_state(pending, State::Complete).unwrap();
+    assert!(!draw(&index, SizeMetric::Logical).has_unknown);
+    let allocated = draw(&index, SizeMetric::Allocated);
+    assert_eq!(allocated.known_sum, 20);
+    assert!(allocated.has_unknown);
+    assert_eq!(draw(&index, SizeMetric::Logical).known_sum, 15);
+    index.set_state(first, State::Stale).unwrap();
+    assert!(draw(&index, SizeMetric::Logical).has_unknown);
+    index.set_state(first, State::Complete).unwrap();
+    assert!(!draw(&index, SizeMetric::Logical).has_unknown);
+    index
+        .insert(
+            root,
+            "alias".into(),
+            Kind::File,
+            Sizes {
+                logical: Some(30),
+                allocated: Some(40),
+            },
+            Some(identity),
+            State::Complete,
+        )
+        .unwrap();
+    assert_eq!(draw(&index, SizeMetric::Logical).known_sum, 45);
+    index
+        .apply_authoritative_sizes(
+            identity,
+            Sizes {
+                logical: Some(12),
+                allocated: Some(24),
+            },
+        )
+        .unwrap();
+    assert_eq!(draw(&index, SizeMetric::Logical).known_sum, 47);
+    assert_eq!(draw(&index, SizeMetric::Allocated).known_sum, 64);
+    assert_eq!(
+        index.insert(
+            root,
+            "sealed".into(),
+            Kind::File,
+            Sizes::default(),
+            None,
+            State::Complete
+        ),
+        Err(hogmap::index::IndexError::ResolvedSnapshot)
+    );
+    let subset = layout_members_with_metric(
+        &index,
+        root,
+        &[first],
+        Rect::new(0.0, 0.0, 100.0, 100.0),
+        params(1.0, 0.0),
+        SizeMetric::Logical,
+    )
+    .unwrap();
+    assert_eq!(subset.known_sum, 12);
+    assert_eq!(draw(&index, SizeMetric::Logical).known_sum, 47);
+}
+
+#[test]
+fn depth_limit_counts_levels_below_the_drawn_root_including_zero() {
+    let mut index = Index::new("Depth fixture".into()).unwrap();
+    let root = index.root();
+    let first = insert_dir(&mut index, root, "first");
+    let second = insert_dir(&mut index, first, "second");
+    let third = insert_dir(&mut index, second, "third");
+    insert_file(&mut index, third, "leaf", Some(7));
+    index.set_state(root, State::Complete).unwrap();
+    for (max_depth, expected_cells) in [(0, 1), (2, 3), (usize::MAX, 5)] {
+        let result = layout(
+            &index,
+            root,
+            Rect::new(0.0, 0.0, 100.0, 100.0),
+            LayoutParams {
+                min_pixel_area: 1.0,
+                header_height: 0.0,
+                max_depth,
+            },
+        )
+        .unwrap();
+        assert_eq!(result.known_sum, 7);
+        assert!(!result.has_unknown);
+        assert_eq!(result.placed.len(), expected_cells, "depth={max_depth}");
+    }
 }
 
 struct Basic {

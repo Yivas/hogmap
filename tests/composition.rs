@@ -118,6 +118,7 @@ fn apparent_total_corrects_only_the_charged_record_and_retains_listed_alias_size
         hogmap::treemap::LayoutParams {
             min_pixel_area: 1.0,
             header_height: 0.0,
+            max_depth: usize::MAX,
         },
         SizeMetric::Allocated,
     )

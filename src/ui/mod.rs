@@ -33,6 +33,9 @@ use theme::Theme;
 const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
 const DRAIN_BUDGET: Duration = Duration::from_millis(4);
+// Levels below the drawn root that the map tiles. Deeper folders stay whole blocks the user opens
+// by navigating, so the map never fills with cells too small to name.
+const MAP_MAX_DEPTH: usize = 2;
 // Hold a close request this long so returning threads can finish; then detach the rest.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
@@ -156,6 +159,8 @@ pub struct HogMap {
     cache: Option<Cache>,
     layout_failure: Option<LayoutFailure>,
     last_layout: Option<Instant>,
+    last_layout_cost: Duration,
+    paint_dashes: Vec<egui::Shape>,
     error: Option<String>,
     about: bool,
     chooser: dialog::SpaceDialog,
@@ -207,6 +212,8 @@ impl HogMap {
             cache: None,
             layout_failure: None,
             last_layout: None,
+            last_layout_cost: Duration::ZERO,
+            paint_dashes: Vec::new(),
             error: None,
             about: false,
             chooser: dialog::SpaceDialog::default(),
@@ -489,6 +496,7 @@ impl HogMap {
         self.cache = None;
         self.layout_failure = None;
         self.last_layout = None;
+        self.last_layout_cost = Duration::ZERO;
         // A panic in the replaced producer is this scan's only report; do not hide it.
         if !previous_failed {
             self.error = None;
@@ -1113,12 +1121,11 @@ impl HogMap {
                         detail.push('\n');
                         detail.push_str(&failure.message);
                     }
-                    let master = text::master_status(
-                        master,
-                        self.reducer.progress().records as usize,
-                        &totals,
-                        self.scan_elapsed,
-                    );
+                    // Count what the snapshot actually holds. The producer's coalescable progress
+                    // events are dropped under backpressure, which showed "0 entries seen" beside a
+                    // map already holding gigabytes.
+                    let seen = self.reducer.index().map_or(0, |index| index.len());
+                    let master = text::master_status(master, seen, &totals, self.scan_elapsed);
                     let master = format!("{master} · {composition_status}");
                     let accessible = format!("{master}\n{detail}");
                     let status = ui.add(egui::Label::new(master).truncate());
@@ -1297,10 +1304,11 @@ impl HogMap {
         // The scan throttle limits growth updates; it never keeps the previous metric's cells on
         // screen once the other metric is chosen, so an explicit switch rebuilds at once.
         let switched = shown.is_some_and(|shown| shown.metric != key.metric);
-        let due = self
-            .last_layout
-            .is_none_or(|last| last.elapsed() >= LAYOUT_INTERVAL);
+        let due = self.last_layout.is_none_or(|last| {
+            last.elapsed() >= LAYOUT_INTERVAL.max(self.last_layout_cost.saturating_mul(4))
+        });
         if dirty && (self.receiver.is_none() || due || switched) {
+            let rebuild_started = Instant::now();
             let location = &key.location;
             // Resolve components against this generation; a missing path during rescan shows the
             // root temporarily, without replacing the history entry before its parent arrives.
@@ -1313,6 +1321,7 @@ impl HogMap {
             let params = LayoutParams {
                 min_pixel_area: min_area,
                 header_height: 20.0,
+                max_depth: MAP_MAX_DEPTH,
             };
             let subset = members.as_deref().filter(|members| !members.is_empty());
             let caption = subset_caption(location, subset, self.metric);
@@ -1353,9 +1362,11 @@ impl HogMap {
                             (previous.matches, previous.match_counts)
                         }
                         _ => {
-                            let matches = self.filter.matches(index);
-                            let counts = logic::match_counts(index, &matches);
-                            (matches, counts)
+                            let results = self.filter.match_results(index);
+                            (
+                                results.matches,
+                                (results.matched_files, results.unknown_files),
+                            )
                         }
                     };
                     self.cache = Some(Cache {
@@ -1380,12 +1391,16 @@ impl HogMap {
                     });
                 }
             }
+            // Keep scan-time rebuild work near a quarter of the interval when a frame is
+            // expensive. Navigation after completion and metric switches stay immediate.
+            self.last_layout_cost = rebuild_started.elapsed();
         }
         if self.filter_changed
             && let Some(cache) = &mut self.cache
         {
-            cache.matches = self.filter.matches(index);
-            cache.match_counts = logic::match_counts(index, &cache.matches);
+            let results = self.filter.match_results(index);
+            cache.matches = results.matches;
+            cache.match_counts = (results.matched_files, results.unknown_files);
             self.filter_changed = false;
         }
         let Some(cache) = &self.cache else {
@@ -1413,8 +1428,8 @@ impl HogMap {
             &cache.layout,
             &cache.cells,
             &cache.matches,
-            self.selected,
-            pointed,
+            (self.selected, pointed),
+            &mut self.paint_dashes,
         );
         if cache.layout.known_sum == 0 {
             ui.painter().text(
@@ -1726,6 +1741,7 @@ mod tests {
             LayoutParams {
                 min_pixel_area: 400.0,
                 header_height: 20.0,
+                max_depth: MAP_MAX_DEPTH,
             },
             SizeMetric::Allocated,
         )
@@ -1782,6 +1798,7 @@ mod tests {
             LayoutParams {
                 min_pixel_area: 1.0,
                 header_height: 20.0,
+                max_depth: MAP_MAX_DEPTH,
             },
             SizeMetric::Allocated,
         )

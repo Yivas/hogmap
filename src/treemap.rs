@@ -16,6 +16,10 @@ use std::collections::{HashSet, VecDeque};
 
 use crate::index::{Entry, EntryId, FileIdentity, Index, Kind, SizeMetric, State};
 
+/// Content smaller than this under a header band is not worth the band: the cell keeps its whole
+/// rectangle and relies on the tooltip.
+const MIN_CONTENT_UNDER_HEADER: f32 = 6.0;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
     pub x: f32,
@@ -53,6 +57,11 @@ pub struct LayoutParams {
     pub min_pixel_area: f32,
     /// Header strip for directory cells; zero disables headers.
     pub header_height: f32,
+    /// Levels below the drawn root that are laid out. Deeper directories stay whole rectangles:
+    /// the map shows readable blocks and the user opens them by navigating, instead of tiling
+    /// every descendant until the smallest cells carry punctuation. Zero draws only the root;
+    /// `usize::MAX` disables the cap.
+    pub max_depth: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -168,10 +177,26 @@ fn layout_selection(
         return Err(LayoutError::InvalidParams);
     }
     let root_entry = index.get(root).ok_or(LayoutError::UnknownRoot)?;
-    let mut children = children_map(index);
-    let totals = subtree_totals(index, metric)?;
+    let mut storage = index
+        .layout_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if storage.as_ref().is_none_or(|cache| cache.metric != metric) {
+        *storage = Some(LayoutData::build(index, metric)?);
+    }
+    let data = storage.as_mut().expect("initialized layout data");
+    let mut selected_children = members.map(<[EntryId]>::to_vec);
+    if let Some(selected) = &mut selected_children {
+        selected.sort_by(|a, b| {
+            compare_children(
+                index,
+                &(*a, data.totals[a.position()].known_sum),
+                &(*b, data.totals[b.position()].known_sum),
+            )
+        });
+    }
+    let totals = &data.totals;
     let root_totals = if let Some(members) = members {
-        children[root.position()] = members.to_vec();
         let mut selected = Totals::default();
         for id in members {
             let value = totals[id.position()];
@@ -179,7 +204,7 @@ fn layout_selection(
                 .known_sum
                 .checked_add(value.known_sum)
                 .ok_or(LayoutError::SizeOverflow)?;
-            selected.has_unknown |= value.has_unknown;
+            selected.unknown += value.unknown;
         }
         selected
     } else {
@@ -190,60 +215,64 @@ fn layout_selection(
         &root_entry,
         rect,
         root_totals,
-        params.header_height,
+        header_for_depth(0, params.header_height),
     );
     let mut result = Layout {
         root: rect,
         content: root_placed.content,
         known_sum: root_totals.known_sum,
-        has_unknown: root_totals.has_unknown,
+        has_unknown: root_totals.unknown > 0,
         placed: vec![root_placed.clone()],
     };
 
     let mut queue = VecDeque::new();
-    if root_entry.kind == Kind::Directory {
-        queue.push_back((root, root_placed.content));
+    if root_entry.kind == Kind::Directory && params.max_depth > 0 {
+        queue.push_back((root, root_placed.content, 1_usize));
     }
-    while let Some((parent, content)) = queue.pop_front() {
-        let Some(child_ids) = children.get(parent.position()) else {
-            continue;
+    while let Some((parent, content, depth)) = queue.pop_front() {
+        let slot = parent.position();
+        if !data.sorted[slot] {
+            data.children[slot].sort_by(|a, b| {
+                compare_children(
+                    index,
+                    &(*a, totals[a.position()].known_sum),
+                    &(*b, totals[b.position()].known_sum),
+                )
+            });
+            data.sorted[slot] = true;
+        }
+        let child_ids = if parent == root {
+            selected_children.as_deref().unwrap_or(&data.children[slot])
+        } else {
+            &data.children[slot]
         };
-        let mut weights: Vec<(EntryId, u64)> = child_ids
-            .iter()
-            .filter_map(|id| {
-                let weight = totals.get(id.position())?.known_sum;
-                (weight > 0).then_some((*id, weight))
-            })
-            .collect();
-        if weights.is_empty() {
+        let positive = child_ids.partition_point(|id| totals[id.position()].known_sum > 0);
+        if positive == 0 {
             continue;
         }
-        weights.sort_by(|a, b| compare_children(index, a, b));
-        let total = weights
-            .iter()
-            .try_fold(0_u64, |sum, (_, weight)| sum.checked_add(*weight))
-            .ok_or(LayoutError::SizeOverflow)?;
+        let child_ids = &child_ids[..positive];
+        let total = if parent == root {
+            root_totals.known_sum
+        } else {
+            totals[slot].known_sum
+        };
         let content_area = f64::from(content.area());
-
-        let mut keep = weights.len();
-        while keep > 0 {
-            let expected = content_area * weights[keep - 1].1 as f64 / total as f64;
-            if expected >= f64::from(params.min_pixel_area) {
-                break;
-            }
-            keep -= 1;
-        }
-        let aggregate_members: Vec<EntryId> = weights[keep..].iter().map(|(id, _)| *id).collect();
-        let aggregate_weight = weights[keep..]
+        let keep = child_ids.partition_point(|id| {
+            content_area * totals[id.position()].known_sum as f64 / total as f64
+                >= f64::from(params.min_pixel_area)
+        });
+        let aggregate_members = child_ids[keep..].to_vec();
+        let aggregate_weight = aggregate_members
             .iter()
-            .try_fold(0_u64, |sum, (_, weight)| sum.checked_add(*weight))
+            .try_fold(0_u64, |sum, id| {
+                sum.checked_add(totals[id.position()].known_sum)
+            })
             .ok_or(LayoutError::SizeOverflow)?;
-
-        let mut cells: Vec<Cell> = weights[..keep]
+        let mut cells: Vec<Cell> = child_ids[..keep]
             .iter()
-            .map(|(id, weight)| Cell {
+            .map(|id| Cell {
                 node: Some(*id),
-                weight: *weight,
+                weight: totals[id.position()].known_sum,
             })
             .collect();
         if !aggregate_members.is_empty() {
@@ -264,19 +293,20 @@ fn layout_selection(
                         &entry,
                         cell_rect,
                         cell_totals,
-                        params.header_height,
+                        header_for_depth(depth, params.header_height),
                     );
                     if entry.kind == Kind::Directory
+                        && depth < params.max_depth
                         && placed.content.area() >= params.min_pixel_area
                     {
-                        queue.push_back((id, placed.content));
+                        queue.push_back((id, placed.content, depth + 1));
                     }
                     result.placed.push(placed);
                 }
                 None => {
                     let has_unknown = aggregate_members
                         .iter()
-                        .any(|id| totals[id.position()].has_unknown);
+                        .any(|id| totals[id.position()].unknown > 0);
                     result.placed.push(Placed {
                         node: NodeRef::Aggregate { parent },
                         rect: cell_rect,
@@ -309,34 +339,139 @@ fn validate_rect(rect: Rect) -> Result<(), LayoutError> {
     Ok(())
 }
 
-fn children_map(index: &Index) -> Vec<Vec<EntryId>> {
-    let mut children = vec![Vec::new(); index.len()];
-    for (id, entry) in index.entries() {
-        if let Some(parent) = entry.parent {
-            children[parent.position()].push(id);
-        }
-    }
-    children
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct Totals {
     known_sum: u64,
-    has_unknown: bool,
+    unknown: usize,
+}
+
+/// Snapshot-owned, one metric at a time. Unknown counts allow completion to clear an ancestor
+/// flag without rereading its other descendants. Only visited sibling lists are sorted.
+#[derive(Debug)]
+pub(crate) struct LayoutData {
+    metric: SizeMetric,
+    children: Vec<Vec<EntryId>>,
+    totals: Vec<Totals>,
+    sorted: Vec<bool>,
+    child_capacity_bytes: usize,
+}
+impl LayoutData {
+    fn build(index: &Index, metric: SizeMetric) -> Result<Self, LayoutError> {
+        let mut children = Vec::with_capacity(index.len() + 4096);
+        children.resize_with(index.len(), Vec::new);
+        for (id, entry) in index.entries() {
+            if let Some(parent) = entry.parent {
+                children[parent.position()].push(id);
+            }
+        }
+        let child_capacity_bytes = children
+            .iter()
+            .map(|list| list.capacity() * std::mem::size_of::<EntryId>())
+            .sum();
+        let mut sorted = Vec::with_capacity(index.len() + 4096);
+        sorted.resize(index.len(), false);
+        Ok(Self {
+            metric,
+            children,
+            totals: subtree_totals(index, metric)?,
+            sorted,
+            child_capacity_bytes,
+        })
+    }
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.children.capacity() * std::mem::size_of::<Vec<EntryId>>()
+            + self.totals.capacity() * std::mem::size_of::<Totals>()
+            + self.sorted.capacity() * std::mem::size_of::<bool>()
+            + self.child_capacity_bytes
+    }
+    pub(crate) fn append(&mut self, index: &Index, id: EntryId) -> Result<(), LayoutError> {
+        if self.children.len() == self.children.capacity() {
+            self.children.reserve_exact(4096);
+        }
+        if self.totals.len() == self.totals.capacity() {
+            self.totals.reserve_exact(4096);
+        }
+        let entry = index.get(id).expect("new index entry");
+        let value = Totals {
+            known_sum: if entry.kind == Kind::File {
+                self.metric.of(entry.sizes).unwrap_or(0)
+            } else {
+                0
+            },
+            unknown: usize::from(
+                entry.state != State::Complete
+                    || (entry.kind == Kind::File && self.metric.of(entry.sizes).is_none()),
+            ),
+        };
+        self.children.push(Vec::new());
+        if self.sorted.len() == self.sorted.capacity() {
+            self.sorted.reserve_exact(4096);
+        }
+        self.sorted.push(false);
+        self.totals.push(value);
+        if let Some(parent) = entry.parent {
+            let list = &mut self.children[parent.position()];
+            let previous = list.capacity();
+            list.push(id);
+            self.child_capacity_bytes +=
+                (list.capacity() - previous) * std::mem::size_of::<EntryId>();
+        }
+        let mut next = entry.parent;
+        while let Some(parent) = next {
+            let slot = parent.position();
+            self.sorted[slot] = false;
+            self.totals[slot].known_sum = self.totals[slot]
+                .known_sum
+                .checked_add(value.known_sum)
+                .ok_or(LayoutError::SizeOverflow)?;
+            self.totals[slot].unknown += value.unknown;
+            next = index.get(parent).expect("existing parent").parent;
+        }
+        Ok(())
+    }
+    pub(crate) fn state_changed(
+        &mut self,
+        index: &Index,
+        id: EntryId,
+        previous: State,
+        next: State,
+    ) {
+        let entry = index.get(id).expect("existing state entry");
+        if previous == next || (entry.kind == Kind::File && self.metric.of(entry.sizes).is_none()) {
+            return;
+        }
+        let before = previous != State::Complete;
+        let after = next != State::Complete;
+        if before == after {
+            return;
+        }
+        let mut next = Some(id);
+        while let Some(id) = next {
+            if after {
+                self.totals[id.position()].unknown += 1;
+            } else {
+                self.totals[id.position()].unknown -= 1;
+            }
+            next = index.get(id).expect("existing ancestor").parent;
+        }
+    }
 }
 
 fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, LayoutError> {
     let mut seen_identities: HashSet<FileIdentity> = HashSet::new();
-    let mut totals = vec![Totals::default(); index.len()];
+    let mut totals = Vec::with_capacity(index.len() + 4096);
+    totals.resize(index.len(), Totals::default());
+    let corrected = index.has_authoritative_sizes();
     for (id, entry) in index.entries() {
         let mut known_sum = 0_u64;
         let mut has_unknown = entry.state != State::Complete;
         if entry.kind == Kind::File {
             match metric.of(entry.sizes) {
                 Some(listed) => {
-                    let first_charge = entry
-                        .identity
-                        .is_none_or(|identity| seen_identities.insert(identity));
+                    let first_charge = !corrected
+                        || entry
+                            .identity
+                            .is_none_or(|identity| seen_identities.insert(identity));
                     known_sum = if first_charge {
                         index
                             .effective_size(&entry, metric)
@@ -350,7 +485,7 @@ fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, Layo
         }
         totals[id.position()] = Totals {
             known_sum,
-            has_unknown,
+            unknown: usize::from(has_unknown),
         };
     }
 
@@ -367,7 +502,7 @@ fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, Layo
             .known_sum
             .checked_add(child.known_sum)
             .ok_or(LayoutError::SizeOverflow)?;
-        parent_totals.has_unknown |= child.has_unknown;
+        parent_totals.unknown += child.unknown;
     }
     Ok(totals)
 }
@@ -398,7 +533,7 @@ fn place(
         header,
         content,
         known_sum: totals.known_sum,
-        has_unknown: totals.has_unknown,
+        has_unknown: totals.unknown > 0,
         members: Vec::new(),
     }
 }
@@ -412,10 +547,24 @@ fn split_header(rect: Rect, header_height: f32) -> (Option<Rect>, Rect) {
             rect.width,
             rect.height - header_height,
         );
-        (Some(header), content)
-    } else {
-        (None, rect)
+        // A band that leaves a sliver of content costs area and shows nothing. Small cells keep
+        // their whole rectangle and are identified by the tooltip instead.
+        if content.height >= MIN_CONTENT_UNDER_HEADER && content.width >= MIN_CONTENT_UNDER_HEADER {
+            return (Some(header), content);
+        }
     }
+    (None, rect)
+}
+
+/// Nested bands shrink so a deep level does not spend the same pixels as the root. The depth tone
+/// already separates levels; the band only has to stay legible.
+fn header_for_depth(depth: usize, max: f32) -> f32 {
+    let scale = match depth {
+        0 => 1.0,
+        1 => 0.8,
+        _ => 0.65,
+    };
+    max * scale
 }
 
 #[derive(Clone, Copy)]

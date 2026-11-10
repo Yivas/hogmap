@@ -200,6 +200,9 @@ pub struct Index {
     conflict_names: HashMap<StoredIdentity, EntryId>,
     conflicting_identity_count: usize,
     incomplete_entries: usize,
+    // One lazy metric cache belongs to this snapshot; mutations maintain it or invalidate it.
+    pub(crate) layout_cache: std::sync::Mutex<Option<crate::treemap::LayoutData>>,
+    pub(crate) filter_cache: std::sync::Mutex<Option<crate::filter::MatchCache>>,
 }
 
 impl Index {
@@ -224,6 +227,8 @@ impl Index {
             conflict_names: HashMap::new(),
             conflicting_identity_count: 0,
             incomplete_entries: 1,
+            layout_cache: std::sync::Mutex::new(None),
+            filter_cache: std::sync::Mutex::new(None),
         })
     }
 
@@ -236,6 +241,18 @@ impl Index {
             name_capacity_bytes: self.names.capacity(),
             name_boundary_capacity_bytes: self.names.boundary_capacity_bytes(),
             identity_bytes: self.identities.capacity() * std::mem::size_of::<StoredIdentity>(),
+            layout_cache_bytes: self
+                .layout_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map_or(0, |cache| cache.memory_bytes()),
+            filter_cache_bytes: self
+                .filter_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map_or(0, |cache| cache.memory_bytes()),
             charged_identity_bytes: hash_bytes::<(StoredIdentity, IdentityCharge)>(
                 self.identity_charges.capacity(),
             ) + hash_bytes::<(StoredIdentity, Sizes)>(
@@ -300,6 +317,31 @@ impl Index {
             identity_slot,
             state,
         ));
+        let cache = self
+            .layout_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut cache) = cache
+            && cache.append(self, id).is_ok()
+        {
+            *self
+                .layout_cache
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cache);
+        }
+        let cache = self
+            .filter_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut cache) = cache {
+            cache.append(self, id);
+            *self
+                .filter_cache
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cache);
+        }
         Ok(id)
     }
 
@@ -445,6 +487,14 @@ impl Index {
         }
         // Validate both updates before mutating either metric.
         if statuses.contains(&ChargeResolution::Applied) {
+            *self
+                .layout_cache
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *self
+                .filter_cache
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             self.authoritative_sizes.insert(key, corrected);
             let charge = self
                 .identity_charges
@@ -492,6 +542,10 @@ impl Index {
                 .and_then(|sizes| metric.of(*sizes))
                 .unwrap_or(listed),
         )
+    }
+
+    pub(crate) fn has_authoritative_sizes(&self) -> bool {
+        !self.authoritative_sizes.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -543,13 +597,26 @@ impl Index {
             .entries
             .get_mut(id.position())
             .ok_or(IndexError::InvalidParent)?;
-        let was_complete = entry.state() == State::Complete;
+        let previous = entry.state();
+        let was_complete = previous == State::Complete;
         let is_complete = state == State::Complete;
         entry.set_state(state);
         match (was_complete, is_complete) {
             (true, false) => self.incomplete_entries += 1,
             (false, true) => self.incomplete_entries -= 1,
             _ => {}
+        }
+        let cache = self
+            .layout_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut cache) = cache {
+            cache.state_changed(self, id, previous, state);
+            *self
+                .layout_cache
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cache);
         }
         Ok(())
     }
@@ -710,6 +777,8 @@ pub struct IndexMemory {
     pub name_boundary_capacity_bytes: usize,
     pub identity_bytes: usize,
     pub charged_identity_bytes: usize,
+    pub layout_cache_bytes: usize,
+    pub filter_cache_bytes: usize,
 }
 impl IndexMemory {
     pub fn total_bytes(self) -> usize {
@@ -718,6 +787,8 @@ impl IndexMemory {
             + self.name_boundary_capacity_bytes
             + self.identity_bytes
             + self.charged_identity_bytes
+            + self.layout_cache_bytes
+            + self.filter_cache_bytes
     }
 }
 

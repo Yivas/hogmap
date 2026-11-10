@@ -182,6 +182,7 @@ fn a_metric_switch_keeps_entries_but_only_aggregates_with_the_same_members() {
     let params = LayoutParams {
         min_pixel_area: 5000.0,
         header_height: 0.0,
+        max_depth: usize::MAX,
     };
     let logical =
         treemap::layout_with_metric(&index, root, rect, params, SizeMetric::Logical).unwrap();
@@ -273,6 +274,7 @@ fn hit_testing_prefers_descendants_and_excludes_outside_edges() {
         LayoutParams {
             min_pixel_area: 1.0,
             header_height: 10.0,
+            max_depth: usize::MAX,
         },
     )
     .unwrap();

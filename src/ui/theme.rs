@@ -110,15 +110,17 @@ const DARK: Palette = Palette {
     map_background: rgb(0x0F1114),
     message: DARK_TEXT,
     directories: [
-        tone(rgb(0x654A2C), rgb(0xF5EFE6), Some(DARK_STATE_MARK)),
-        tone(rgb(0x6E522F), rgb(0xF5EFE6), Some(DARK_STATE_MARK)),
-        tone(rgb(0x775933), rgb(0xF5EFE6), Some(DARK_STATE_MARK)),
-        tone(rgb(0x806037), rgb(0xF7F1E8), Some(DARK_STATE_MARK)),
+        tone(rgb(0x4E3820), rgb(0xF5EFE6), Some(DARK_STATE_MARK)),
+        tone(rgb(0x5C4327), rgb(0xF5EFE6), Some(DARK_STATE_MARK)),
+        tone(rgb(0x6A4E2E), rgb(0xF5EFE6), Some(DARK_STATE_MARK)),
+        tone(rgb(0x785A35), rgb(0xF7F1E8), Some(DARK_STATE_MARK)),
     ],
+    // Large files cover big areas, so the fill carries the map's centre. The earlier value read
+    // as background once a cell reached gigabytes.
     file: seamed(
-        rgb(0x2A4B68),
+        rgb(0x35597A),
         rgb(0xEEF3F8),
-        rgb(0x1B3249),
+        rgb(0x24405B),
         Some(DARK_STATE_MARK),
     ),
     aggregate: seamed(

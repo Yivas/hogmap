@@ -62,6 +62,7 @@ fn opening_an_aggregate_preserves_ids_bytes_and_descendants_without_other_siblin
         LayoutParams {
             min_pixel_area: 100.0,
             header_height: 10.0,
+            max_depth: usize::MAX,
         },
     )
     .unwrap();
@@ -79,6 +80,7 @@ fn opening_an_aggregate_preserves_ids_bytes_and_descendants_without_other_siblin
         LayoutParams {
             min_pixel_area: 1.0,
             header_height: 10.0,
+            max_depth: usize::MAX,
         },
     )
     .unwrap();
@@ -104,7 +106,8 @@ fn opening_an_aggregate_preserves_ids_bytes_and_descendants_without_other_siblin
             area,
             LayoutParams {
                 min_pixel_area: 1.0,
-                header_height: 10.0
+                header_height: 10.0,
+                max_depth: usize::MAX,
             }
         )
         .is_err()
@@ -117,7 +120,8 @@ fn opening_an_aggregate_preserves_ids_bytes_and_descendants_without_other_siblin
             area,
             LayoutParams {
                 min_pixel_area: 1.0,
-                header_height: 10.0
+                header_height: 10.0,
+                max_depth: usize::MAX,
             }
         )
         .is_err()

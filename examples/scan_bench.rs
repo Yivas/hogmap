@@ -262,6 +262,10 @@ fn print_origin_diagnostics(
 }
 
 fn run(args: Arguments) -> Result<bool, &'static str> {
+    #[cfg(feature = "desktop")]
+    if args.synthetic_million && env::var_os("HOGMAP_BENCH_UI").is_some_and(|value| value == "1") {
+        return ui_bench();
+    }
     // Query capacity outside the scan timing; never print roots, labels or filesystem names.
     let volume_root = if args.synthetic_million {
         None
@@ -787,10 +791,13 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
             hogmap::treemap::LayoutParams {
                 min_pixel_area: 400.0,
                 header_height: 20.0,
+                max_depth: usize::MAX,
             },
         )
         .map_err(|_| "synthetic_layout_failed")?;
-        let matches = logic::HighlightFilter::default().matches(index);
+        let matches = logic::HighlightFilter::default()
+            .match_results(index)
+            .matches;
         #[cfg(feature = "desktop")]
         let _ = context.as_ref().expect("synthetic context").run_ui(
             eframe::egui::RawInput::default(),
@@ -925,6 +932,256 @@ fn synthetic_million(
     } else {
         ProducerOutcome::Disconnected
     }
+}
+
+/// Opt-in release comparison: the existing million-entry stream, no filesystem or native UI.
+#[cfg(feature = "desktop")]
+fn ui_bench() -> Result<bool, &'static str> {
+    use hogmap::treemap::{Layout, LayoutParams, NodeRef, Rect, layout};
+    use std::hash::{Hash, Hasher};
+    if cfg!(debug_assertions) {
+        return Err("ui_bench_requires_release");
+    }
+    let generation = ScanGeneration::new(660);
+    let (sender, receiver) = event_channel(16);
+    let worker =
+        thread::spawn(move || synthetic_million(generation, sender, &ScanCancellation::new()));
+    let mut reducer = ScanReducer::new(generation);
+    while reducer.terminal().is_none() {
+        receiver.wait_ready();
+        reducer.drain(&receiver, 65536);
+    }
+    assert_eq!(
+        worker.join().unwrap(),
+        hogmap::synthetic::ProducerOutcome::Finished
+    );
+    let index = reducer
+        .finished_index_mut()
+        .ok_or("ui_fixture_not_finished")?;
+    assert_eq!(index.len(), 1_000_000);
+    let area = Rect::new(0.0, 0.0, 1920.0, 1000.0);
+    let params = LayoutParams {
+        min_pixel_area: 400.0,
+        header_height: 20.0,
+        max_depth: 2,
+    };
+    let digest = |layout: &Layout| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        layout.known_sum.hash(&mut hash);
+        layout.has_unknown.hash(&mut hash);
+        for cell in &layout.placed {
+            match cell.node {
+                NodeRef::Entry(id) => (0, id.position()).hash(&mut hash),
+                NodeRef::Aggregate { parent } => (1, parent.position()).hash(&mut hash),
+            }
+            for value in [
+                cell.rect.x,
+                cell.rect.y,
+                cell.rect.width,
+                cell.rect.height,
+                cell.content.x,
+                cell.content.y,
+                cell.content.width,
+                cell.content.height,
+            ] {
+                value.to_bits().hash(&mut hash);
+            }
+            cell.known_sum.hash(&mut hash);
+            cell.has_unknown.hash(&mut hash);
+            cell.members.hash(&mut hash);
+        }
+        hash.finish()
+    };
+    println!(
+        "ui_bench_dataset=synthetic-million-v1 entries={} width=1920 height=1000 depth=2 native_window=0",
+        index.len()
+    );
+    let start = Instant::now();
+    let first = layout(index, index.root(), area, params).map_err(|_| "ui_layout_failed")?;
+    println!(
+        "ui_layout_cold_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    println!(
+        "ui_layout_cells={} ui_layout_digest={}",
+        first.placed.len(),
+        digest(&first)
+    );
+    let mut warm = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        let repeated = layout(index, index.root(), area, params).map_err(|_| "ui_layout_failed")?;
+        warm.push(start.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(digest(&first), digest(&repeated));
+        std::hint::black_box(repeated);
+    }
+    warm.sort_by(f64::total_cmp);
+    println!("ui_layout_warm_median_ms={:.3}", warm[2]);
+    let context = eframe::egui::Context::default();
+    let input = || eframe::egui::RawInput {
+        screen_rect: Some(eframe::egui::Rect::from_min_size(
+            eframe::egui::Pos2::ZERO,
+            eframe::egui::vec2(1920.0, 1000.0),
+        )),
+        ..Default::default()
+    };
+    let mut cells = Vec::new();
+    let start = Instant::now();
+    let _ = context.run_ui(input(), |ui| {
+        cells = paint::prepare(ui, index, &first, None, SizeMetric::Logical);
+    });
+    println!(
+        "ui_labels_cold_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    let mut label_hash = std::collections::hash_map::DefaultHasher::new();
+    for cell in &cells {
+        if let Some((galley, position)) = &cell.label {
+            galley.job.text.hash(&mut label_hash);
+            position.x.to_bits().hash(&mut label_hash);
+            position.y.to_bits().hash(&mut label_hash);
+        }
+    }
+    println!(
+        "ui_labels_count={} ui_labels_digest={}",
+        cells.iter().filter(|cell| cell.label.is_some()).count(),
+        label_hash.finish()
+    );
+    let mut labels = Vec::new();
+    let mut draws = Vec::new();
+    let mut draw_scratch = Vec::new();
+    for _ in 0..5 {
+        let start = Instant::now();
+        let _ = context.run_ui(input(), |ui| {
+            cells = paint::prepare(ui, index, &first, None, SizeMetric::Logical);
+        });
+        labels.push(start.elapsed().as_secs_f64() * 1000.0);
+        let start = Instant::now();
+        let _ = context.run_ui(input(), |ui| {
+            paint::draw(
+                ui,
+                theme::Theme::Dark.palette(),
+                &first,
+                &cells,
+                &[],
+                (None, None),
+                &mut draw_scratch,
+            );
+        });
+        draws.push(start.elapsed().as_secs_f64() * 1000.0);
+    }
+    labels.sort_by(f64::total_cmp);
+    draws.sort_by(f64::total_cmp);
+    println!(
+        "ui_labels_warm_median_ms={:.3} ui_draw_median_ms={:.3}",
+        labels[2], draws[2]
+    );
+    for (tag, expression) in [("empty", ""), ("real", "*.bin;>32kb")] {
+        let mut filter = logic::HighlightFilter::default();
+        assert!(filter.set(expression));
+        let start = Instant::now();
+        let results = filter.match_results(index);
+        let counts = (results.matched_files, results.unknown_files);
+        let values = results.matches;
+        let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for value in &values {
+            (match value {
+                hogmap::filter::Match::Yes => 1_u8,
+                hogmap::filter::Match::No => 0,
+                hogmap::filter::Match::Unknown => 2,
+            })
+            .hash(&mut hash);
+        }
+        println!(
+            "ui_filter_{tag}_first_ms={elapsed:.3} matched={} unknown={} digest={}",
+            counts.0,
+            counts.1,
+            hash.finish()
+        );
+        let mut frames = Vec::new();
+        for _ in 0..5 {
+            let start = Instant::now();
+            let _ = context.run_ui(input(), |ui| {
+                let map = layout(index, index.root(), area, params).unwrap();
+                let results = filter.match_results(index);
+                let counts = (results.matched_files, results.unknown_files);
+                let matches = results.matches;
+                let prepared = paint::prepare(ui, index, &map, None, SizeMetric::Logical);
+                paint::draw(
+                    ui,
+                    theme::Theme::Dark.palette(),
+                    &map,
+                    &prepared,
+                    &matches,
+                    (None, None),
+                    &mut draw_scratch,
+                );
+                std::hint::black_box((map, matches, counts, prepared));
+            });
+            frames.push(start.elapsed().as_secs_f64() * 1000.0);
+        }
+        frames.sort_by(f64::total_cmp);
+        println!("ui_rebuild_full_{tag}_median_ms={:.3}", frames[2]);
+    }
+    let parent = index
+        .entries()
+        .find(|(id, entry)| *id != index.root() && entry.kind == Kind::Directory)
+        .unwrap()
+        .0;
+    let start = Instant::now();
+    for number in 0..64 {
+        index
+            .insert(
+                parent,
+                format!("growth-{number:03}").into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(17),
+                    allocated: Some(32),
+                },
+                None,
+                State::Complete,
+            )
+            .map_err(|_| "ui_append_failed")?;
+    }
+    println!(
+        "ui_append_64_ms={:.3}",
+        start.elapsed().as_secs_f64() * 1000.0
+    );
+    let start = Instant::now();
+    let grown = layout(index, index.root(), area, params).map_err(|_| "ui_growth_layout_failed")?;
+    println!(
+        "ui_layout_after_append_ms={:.3} ui_growth_digest={} ui_growth_cells={}",
+        start.elapsed().as_secs_f64() * 1000.0,
+        digest(&grown),
+        grown.placed.len()
+    );
+    let mut filter = logic::HighlightFilter::default();
+    assert!(filter.set("*.bin;>32kb"));
+    let start = Instant::now();
+    let growth_matches = filter.match_results(index);
+    println!(
+        "ui_filter_after_append_ms={:.3} matched={} unknown={}",
+        start.elapsed().as_secs_f64() * 1000.0,
+        growth_matches.matched_files,
+        growth_matches.unknown_files
+    );
+    let memory = index.memory_estimate();
+    println!(
+        "ui_index_estimate_bytes={} ui_layout_cache_bytes={} ui_filter_cache_bytes={} ui_draw_scratch_capacity={}",
+        memory.total_bytes(),
+        memory.layout_cache_bytes,
+        memory.filter_cache_bytes,
+        draw_scratch.capacity()
+    );
+    println!("scan_done=1");
+    println!("entries={}", index.len());
+    println!("sample_hold_ms=1500");
+    io::stdout().flush().map_err(|_| "stdout_failed")?;
+    thread::sleep(SAMPLE_HOLD);
+    std::hint::black_box((&reducer, first, grown, cells, context));
+    Ok(true)
 }
 
 fn main() -> ExitCode {

@@ -498,11 +498,17 @@ pub fn header(name: &str, size: &str) -> String {
 pub fn label(name: &str, size: &str) -> String {
     format!("{name}\n{size}")
 }
-pub fn tooltip(name: &str, size: &str, state: &str, metric: SizeMetric) -> String {
-    format!(
+pub fn tooltip(name: &str, size: &str, state: &str, metric: SizeMetric, directory: bool) -> String {
+    let mut text = format!(
         "{name}\nApparent size: {size} {}\nEach listed name counts; not physical attribution. Unique totals are in the status detail.\nState: {state}",
         metric_bytes(metric)
-    )
+    );
+    if directory {
+        // Entry is the only way to see what a bounded map leaves out, so the gesture has to be
+        // stated where the user already is: the tooltip of the folder itself.
+        text.push_str("\nDouble-click to open this folder");
+    }
+    text
 }
 
 pub fn preparing_conflicts(count: usize) -> String {

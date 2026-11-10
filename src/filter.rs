@@ -1,5 +1,7 @@
 use std::ffi::OsStr;
 
+use crate::index::{EntryId, Index, Kind};
+
 pub const MAX_EXPRESSION_BYTES: usize = 4096;
 pub const MAX_CONDITIONS: usize = 64;
 
@@ -19,20 +21,38 @@ pub enum FilterError {
     InvalidSize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Filter {
     includes: Vec<Vec<char>>,
     excludes: Vec<Vec<char>>,
     sizes: Vec<(Comparison, u64)>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Comparison {
     Greater,
     Less,
 }
 
 impl Filter {
+    /// Matches listed logical sizes and propagates file matches to directory context.
+    /// One parsed filter is cached per snapshot; insertions update only the new entry/ancestors.
+    pub fn matches(&self, index: &Index) -> FilterMatches {
+        let mut storage = index
+            .filter_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if storage.as_ref().is_none_or(|cache| cache.filter != *self) {
+            *storage = Some(MatchCache::build(index, self.clone()));
+        }
+        let cache = storage.as_ref().expect("initialized filter matches");
+        FilterMatches {
+            matches: cache.matches.clone(),
+            matched_files: cache.matched_files,
+            unknown_files: cache.unknown_files,
+        }
+    }
+
     /// Parses the documented subset without modifying a previously active filter.
     pub fn parse(expression: &str) -> Result<Self, FilterError> {
         if expression.len() > MAX_EXPRESSION_BYTES {
@@ -113,6 +133,96 @@ impl Filter {
             }
         }
         if unknown { Match::Unknown } else { Match::Yes }
+    }
+}
+
+#[derive(Debug)]
+pub struct FilterMatches {
+    pub matches: Vec<Match>,
+    pub matched_files: usize,
+    pub unknown_files: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct MatchCache {
+    filter: Filter,
+    matches: Vec<Match>,
+    matched_files: usize,
+    unknown_files: usize,
+}
+impl MatchCache {
+    fn build(index: &Index, filter: Filter) -> Self {
+        let mut cache = Self {
+            filter,
+            matches: Vec::with_capacity(index.len() + 4096),
+            matched_files: 0,
+            unknown_files: 0,
+        };
+        for (_, entry) in index.entries() {
+            let value = if entry.kind == Kind::File {
+                let value = cache.filter.evaluate(entry.name, entry.sizes.logical);
+                cache.matched_files += usize::from(value == Match::Yes);
+                cache.unknown_files += usize::from(value == Match::Unknown);
+                value
+            } else {
+                Match::No
+            };
+            cache.matches.push(value);
+        }
+        for (id, entry) in index.entries().rev() {
+            if let Some(parent) = entry.parent {
+                cache.matches[parent.position()] = combine(
+                    cache.matches[parent.position()],
+                    cache.matches[id.position()],
+                );
+            }
+        }
+        cache
+    }
+    pub(crate) fn append(&mut self, index: &Index, id: EntryId) {
+        let entry = index.get(id).expect("new filter entry");
+        let value = if entry.kind == Kind::File {
+            let value = self.filter.evaluate(entry.name, entry.sizes.logical);
+            self.matched_files += usize::from(value == Match::Yes);
+            self.unknown_files += usize::from(value == Match::Unknown);
+            value
+        } else {
+            Match::No
+        };
+        if self.matches.len() == self.matches.capacity() {
+            self.matches.reserve_exact(4096);
+        }
+        self.matches.push(value);
+        let mut next = entry.parent;
+        while let Some(parent) = next {
+            let previous = self.matches[parent.position()];
+            let combined = combine(previous, value);
+            if previous == combined {
+                break;
+            }
+            self.matches[parent.position()] = combined;
+            next = index.get(parent).expect("existing filter ancestor").parent;
+        }
+    }
+    pub(crate) fn memory_bytes(&self) -> usize {
+        self.matches.capacity() * std::mem::size_of::<Match>()
+            + (self.filter.includes.capacity() + self.filter.excludes.capacity())
+                * std::mem::size_of::<Vec<char>>()
+            + self
+                .filter
+                .includes
+                .iter()
+                .chain(&self.filter.excludes)
+                .map(|pattern| pattern.capacity() * std::mem::size_of::<char>())
+                .sum::<usize>()
+            + self.filter.sizes.capacity() * std::mem::size_of::<(Comparison, u64)>()
+    }
+}
+fn combine(left: Match, right: Match) -> Match {
+    match (left, right) {
+        (Match::Yes, _) | (_, Match::Yes) => Match::Yes,
+        (Match::Unknown, _) | (_, Match::Unknown) => Match::Unknown,
+        _ => Match::No,
     }
 }
 

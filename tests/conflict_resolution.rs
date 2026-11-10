@@ -116,6 +116,7 @@ fn authoritative_charges_preserve_listings_and_layout_owners_with_signed_deltas(
             LayoutParams {
                 min_pixel_area: 1.0,
                 header_height: 0.0,
+                max_depth: usize::MAX,
             },
             metric,
         )
@@ -164,6 +165,7 @@ fn authoritative_charges_preserve_listings_and_layout_owners_with_signed_deltas(
             LayoutParams {
                 min_pixel_area: 1.0,
                 header_height: 0.0,
+                max_depth: usize::MAX,
             },
             metric,
         )

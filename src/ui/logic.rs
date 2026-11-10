@@ -262,24 +262,13 @@ impl HighlightFilter {
         }
     }
 
+    #[cfg(test)]
     pub fn matches(&self, index: &Index) -> Vec<Match> {
-        let mut result: Vec<_> = index
-            .entries()
-            .map(|(_, entry)| {
-                if entry.kind == Kind::File {
-                    self.filter.evaluate(entry.name, entry.sizes.logical)
-                } else {
-                    Match::No
-                }
-            })
-            .collect();
-        for (id, entry) in index.entries().rev() {
-            if let Some(parent) = entry.parent {
-                result[parent.position()] =
-                    combine(result[parent.position()], result[id.position()]);
-            }
-        }
-        result
+        self.match_results(index).matches
+    }
+
+    pub fn match_results(&self, index: &Index) -> hogmap::filter::FilterMatches {
+        self.filter.matches(index)
     }
 }
 
@@ -289,6 +278,7 @@ pub fn show_match_count(expression: &str) -> bool {
 }
 
 /// Counts files only: directory matches provide context, not additional matching results.
+#[cfg(test)]
 pub fn match_counts(index: &Index, matches: &[Match]) -> (usize, usize) {
     index
         .entries()
