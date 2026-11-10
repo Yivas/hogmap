@@ -126,6 +126,211 @@ fn assert_near(actual: f32, expected: f32) {
 }
 
 #[test]
+fn synthetic_channel_progress_reaches_rendered_status_without_losing_unknowns() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = HogMap::with_context(context.clone());
+    let generation = ScanGeneration::new(620);
+    app.reducer = ScanReducer::new(generation);
+    let (sender, receiver) = event_channel(1);
+    app.receiver = Some(receiver);
+    app.scan_started = Some(Instant::now());
+    app.chooser.open = false;
+    let record =
+        |key: u64, parent: Option<u64>, name: &str, kind: Kind, logical: Option<u64>| ScanRecord {
+            key: NodeKey::new(key),
+            parent: parent.map(NodeKey::new),
+            name: name.into(),
+            kind,
+            sizes: Sizes {
+                logical,
+                allocated: None,
+            },
+            identity: None,
+        };
+    // Fixed expected answers belong to this labelled synthetic stream, not an index/layout
+    // calculation. The unfinished directory deliberately lacks an outcome at Finished.
+    let phases = [
+        (
+            vec![record(
+                1,
+                None,
+                "Progress fixture (synthetic)",
+                Kind::Directory,
+                None,
+            )],
+            1,
+            0,
+            0,
+            0,
+            false,
+            "0 files | Apparent size (map): 0 B logical",
+            "Incomplete: 0 unknown logical sizes, 0 inaccessible, 0 partial",
+        ),
+        (
+            vec![
+                record(2, Some(1), "unfinished", Kind::Directory, None),
+                record(3, Some(1), "eleven", Kind::File, Some(11)),
+                record(4, Some(2), "unknown", Kind::File, None),
+            ],
+            4,
+            2,
+            11,
+            1,
+            false,
+            "2 files | Apparent size (map): 11 B logical",
+            "Incomplete: 1 unknown logical sizes, 0 inaccessible, 0 partial",
+        ),
+        (
+            vec![
+                record(5, Some(1), "known-zero", Kind::File, Some(0)),
+                record(6, Some(1), "five", Kind::File, Some(5)),
+            ],
+            6,
+            4,
+            16,
+            1,
+            true,
+            "4 files | Apparent size (map): 16 B logical",
+            "Incomplete: 1 unknown logical sizes, 0 inaccessible, 1 partial",
+        ),
+    ];
+    for (records, entries, files, known, unknown, finished, size_label, coverage_label) in phases {
+        let mut batch = Batch::new();
+        for record in records {
+            assert!(batch.push(record));
+        }
+        if finished {
+            assert!(batch.push_outcome(DirectoryOutcome {
+                key: NodeKey::new(1),
+                code: None
+            }));
+        }
+        sender
+            .send(ScanEvent {
+                generation,
+                event: ScanEventKind::Batch(batch),
+            })
+            .unwrap();
+        app.drain(&context);
+        sender
+            .send(ScanEvent {
+                generation,
+                event: ScanEventKind::Progress(hogmap::scan::Progress {
+                    records: entries as u64,
+                    directories_done: u64::from(finished),
+                    directories_failed: 0,
+                }),
+            })
+            .unwrap();
+        app.drain(&context);
+        if finished {
+            sender
+                .send(ScanEvent {
+                    generation,
+                    event: ScanEventKind::Terminal(Terminal::Finished),
+                })
+                .unwrap();
+            app.drain(&context);
+        }
+        let index = app.reducer.index().unwrap();
+        let summary = index.summary().unwrap();
+        assert_eq!(index.entries().count(), entries);
+        assert_eq!(
+            (
+                summary.files,
+                summary.known_logical_bytes,
+                summary.unknown_size_files
+            ),
+            (files, known, unknown)
+        );
+        assert!(!summary.complete);
+        assert_eq!(app.reducer.diagnostics().unknown_parent_records, 0);
+        assert_eq!(app.reducer.diagnostics().invalid_records, 0);
+        assert_eq!(
+            app.reducer.terminal(),
+            finished.then_some(Terminal::Finished)
+        );
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 650.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            app.status(ui);
+            app.map(ui);
+        });
+        let labels = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().or(node.value()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(labels.contains(size_label), "{labels}");
+        assert!(labels.contains(coverage_label), "{labels}");
+        assert!(
+            labels.contains(match entries {
+                1 => "1 entries seen",
+                4 => "4 entries seen",
+                6 => "6 entries seen",
+                _ => unreachable!(),
+            }),
+            "{labels}"
+        );
+        assert!(
+            labels.contains(if finished {
+                "Finished | Progress fixture (synthetic)"
+            } else {
+                "Scanning | Progress fixture (synthetic)"
+            }),
+            "{labels}"
+        );
+        println!(
+            "unit62_headless_progress entries={entries} files={files} known_logical={known} unknown={unknown} finished={} accessible_status=1",
+            u8::from(finished)
+        );
+    }
+    let index = app.reducer.index().unwrap();
+    assert_eq!(
+        index
+            .entries()
+            .find(|(_, entry)| entry.name == "unfinished")
+            .unwrap()
+            .1
+            .state,
+        State::Partial
+    );
+    assert_eq!(
+        index
+            .entries()
+            .find(|(_, entry)| entry.name == "known-zero")
+            .unwrap()
+            .1
+            .sizes
+            .logical,
+        Some(0)
+    );
+    assert_eq!(
+        index
+            .entries()
+            .find(|(_, entry)| entry.name == "unknown")
+            .unwrap()
+            .1
+            .sizes
+            .logical,
+        None
+    );
+    assert_eq!(app.cache.as_ref().unwrap().layout.known_sum, 16);
+    assert_eq!(app.reducer.diagnostics().partial_directories, 1);
+}
+
+#[test]
 fn apparent_overflow_only_offers_a_metric_that_can_be_drawn() {
     let context = egui::Context::default();
     for both_overflow in [true, false] {

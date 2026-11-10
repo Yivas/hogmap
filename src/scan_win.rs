@@ -2200,9 +2200,120 @@ mod platform {
                     assert_eq!(reducer.diagnostics().directory_failures, 0);
                 }
             }
+            for extended in [false, true] {
+                let path = if extended {
+                    fixture_extended(&deepest)
+                } else {
+                    deepest.clone()
+                };
+                let generation = ScanGeneration::new(962);
+                // This owned subtree has only two directories and two files. Sixteen envelopes
+                // hold its complete publication, so the synchronous producer cannot block.
+                let (sender, receiver) = crate::scan::event_channel(16);
+                let result = crate::scan_win::run_win_scan_observed_with_options(
+                    generation,
+                    path,
+                    sender,
+                    &ScanCancellation::new(),
+                    ScanOptions {
+                        workers: 1,
+                        ..ScanOptions::default()
+                    },
+                );
+                assert_eq!(result.outcome, ProducerOutcome::Finished);
+                assert_eq!(result.report.fallback_directories, 0);
+                let mut reducer = ScanReducer::new(generation);
+                let (replay, events) = crate::scan::event_channel(1);
+                let mut terminals = 0;
+                while let Ok(event) = receiver.try_recv() {
+                    terminals += usize::from(event.is_terminal());
+                    replay.send(event).unwrap();
+                    reducer.drain(&events, 4096);
+                }
+                assert_eq!(terminals, 1);
+                assert_eq!(reducer.terminal(), Some(Terminal::Finished));
+                assert_eq!(reducer.diagnostics().directory_failures, 0);
+                assert_eq!(reducer.diagnostics().unknown_parent_records, 0);
+                let index = reducer.index().unwrap();
+                assert_eq!(index.entries().count(), 4);
+                assert_eq!(
+                    index
+                        .entries()
+                        .filter(|(_, entry)| entry.kind == Kind::Directory)
+                        .count(),
+                    2
+                );
+                let summary = index.summary().unwrap();
+                assert_eq!(summary.files, 2);
+                assert_eq!(summary.known_logical_bytes, 22);
+                assert!(summary.complete);
+                assert_eq!(indexed_tree(&reducer), find_basic_walk(&deepest));
+                let observations = result.observations;
+                assert_eq!(observations.generation, generation);
+                let root = observations.root.unwrap();
+                assert_eq!(root.scope, crate::volume::RootScope::Folder);
+                assert_eq!(root.scope_issue, None);
+                assert_ne!(
+                    root.directory_identity.unwrap(),
+                    root.volume_root_identity.unwrap()
+                );
+                let validation = observations.validation.unwrap();
+                assert_eq!(
+                    validation.directory_identity,
+                    Ok(crate::volume::ObservedContinuity::UnchangedAtEndpoints)
+                );
+                assert_eq!(
+                    validation.normalized_path,
+                    Ok(crate::volume::ObservedContinuity::UnchangedAtEndpoints)
+                );
+                for sample in [observations.before.unwrap(), observations.after.unwrap()] {
+                    assert_eq!(sample.metadata.issue, None);
+                    assert_eq!(
+                        sample.metadata.source,
+                        crate::volume::CapacitySource::WindowsActualGlobalFilesystem
+                    );
+                    let total = sample.total_bytes.unwrap();
+                    let free = sample.free_bytes.unwrap();
+                    assert!(total > 0 && free <= total);
+                }
+                assert_eq!(observations.directories.opened_directories, 2);
+                println!(
+                    "unit62_observed_long_root extended={} files=2 directories=2 logical=22 folder=1 endpoints_unchanged=1 capacity_known=1 fallback=0 terminal=1",
+                    u8::from(extended)
+                );
+            }
+            // Separate legacy-API probe, not the production Actual* capacity provider. Its
+            // caller allowance/total can be quota-limited; no equality across APIs is asserted.
+            let mut directory = fixture_extended(&deepest).into_os_string();
+            directory.push(r"\");
+            let directory: Vec<u16> = directory.encode_wide().chain(Some(0)).collect();
+            assert!(directory.len() > 260);
+            let (mut caller_free, mut caller_total, mut volume_free) = (0_u64, 0_u64, 0_u64);
+            // SAFETY: terminated owned extended directory path with trailing separator and
+            // three binding-defined writable u64 outputs. Metadata only, no content access.
+            let success = unsafe {
+                GetDiskFreeSpaceExW(
+                    directory.as_ptr(),
+                    &mut caller_free,
+                    &mut caller_total,
+                    &mut volume_free,
+                )
+            };
+            let error = (success == 0).then(|| unsafe { GetLastError() });
+            println!(
+                "unit62_long_GetDiskFreeSpaceExW success={} error={error:?} caller_free={caller_free} caller_total={caller_total} volume_free={volume_free}",
+                u8::from(success != 0)
+            );
+            assert_ne!(
+                success, 0,
+                "extended-directory capacity query failed: {error:?}"
+            );
+            assert!(caller_total > 0 && caller_free <= caller_total);
+            assert!(caller_free <= volume_free);
             let root = fixture.0.clone();
             drop(fixture);
             assert!(!root.try_exists().unwrap());
+            println!("unit62_long_fixture_cleanup=1");
         }
 
         #[test]
