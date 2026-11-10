@@ -11,12 +11,7 @@ pub enum Icon {
     Home,
     Rescan,
     Stop,
-    Export,
-    Nested,
-    Group,
     Highlight,
-    Ghosts,
-    Options,
     Drive,
 }
 
@@ -29,13 +24,8 @@ impl Icon {
             Self::Up => text::UP,
             Self::Home => text::HOME,
             Self::Rescan => text::RESCAN,
-            Self::Stop => text::CANCEL,
-            Self::Export => text::EXPORT,
-            Self::Nested => text::VIEW_MODE,
-            Self::Group => text::GROUP_BY,
+            Self::Stop => text::STOP,
             Self::Highlight => text::FILTER,
-            Self::Ghosts => text::GHOSTS,
-            Self::Options => text::OPTIONS,
             Self::Drive => text::DRIVE,
         }
     }
@@ -50,22 +40,40 @@ pub fn button(
 ) -> Response {
     let response = ui
         .add_enabled_ui(enabled, |ui| {
-            let (rect, response) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), Sense::click());
             let palette = Theme::current(ui.ctx()).palette();
+            let named = matches!(icon, Icon::NewScan | Icon::Rescan | Icon::Stop);
+            let caption = named.then(|| {
+                ui.painter().layout_no_wrap(
+                    icon.name().into(),
+                    egui::FontId::proportional(13.0),
+                    if enabled {
+                        palette.icon
+                    } else {
+                        palette.disabled_icon
+                    },
+                )
+            });
+            let width = caption.as_ref().map_or(32.0, |text| 40.0 + text.size().x);
+            let (rect, response) = ui.allocate_exact_size(egui::vec2(width, 32.0), Sense::click());
             let hover =
                 ui.ctx()
                     .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.1);
             let selection =
                 ui.ctx()
                     .animate_bool_with_time(response.id.with("selected"), selected, 0.1);
-            let mut fill = palette.chrome;
+            let primary = matches!(icon, Icon::NewScan);
+            let mut fill = if primary {
+                palette.tool_selected
+            } else {
+                palette.chrome
+            };
             fill = fill.lerp_to_gamma(palette.tool_hover, hover);
             fill = fill.lerp_to_gamma(palette.tool_selected, selection);
             if response.is_pointer_button_down_on() {
                 fill = palette.tool_pressed;
             }
             ui.painter().rect_filled(rect, 3, fill);
-            if selected {
+            if selected || primary {
                 ui.painter().rect_stroke(
                     rect.shrink(0.5),
                     3,
@@ -76,7 +84,7 @@ pub fn button(
             draw(
                 ui.painter(),
                 icon,
-                rect.center(),
+                egui::pos2(rect.left() + 16.0, rect.center().y),
                 22.0,
                 if enabled {
                     palette.icon
@@ -84,6 +92,13 @@ pub fn button(
                     palette.disabled_icon
                 },
             );
+            if let Some(caption) = caption {
+                ui.painter().galley(
+                    egui::pos2(rect.left() + 32.0, rect.center().y - caption.size().y / 2.0),
+                    caption,
+                    palette.icon,
+                );
+            }
             if response.has_focus() {
                 paint::focus_ring(ui.painter(), rect.shrink(1.0), palette);
             }
@@ -175,23 +190,6 @@ pub fn draw(painter: &egui::Painter, icon: Icon, center: Pos2, size: f32, color:
                 color,
             );
         }
-        Icon::Export => {
-            line(&[(4.0, 3.0), (4.0, 20.0), (18.0, 20.0), (18.0, 15.0)]);
-            line(&[(10.0, 12.0), (20.0, 2.0), (13.0, 2.0)]);
-            line(&[(20.0, 2.0), (20.0, 9.0)]);
-        }
-        Icon::Nested => {
-            box_at(2.0, 2.0, 20.0, 20.0);
-            box_at(5.0, 8.0, 17.0, 17.0);
-            line(&[(11.0, 8.0), (11.0, 17.0)]);
-        }
-        Icon::Group => {
-            box_at(7.0, 2.0, 15.0, 8.0);
-            box_at(1.0, 14.0, 9.0, 20.0);
-            box_at(13.0, 14.0, 21.0, 20.0);
-            line(&[(11.0, 8.0), (11.0, 11.0), (5.0, 11.0), (5.0, 14.0)]);
-            line(&[(11.0, 11.0), (17.0, 11.0), (17.0, 14.0)]);
-        }
         Icon::Highlight => {
             let points = (0..10)
                 .map(|i| {
@@ -202,29 +200,6 @@ pub fn draw(painter: &egui::Painter, icon: Icon, center: Pos2, size: f32, color:
                 })
                 .collect();
             painter.add(Shape::closed_line(points, stroke));
-        }
-        Icon::Ghosts => {
-            line(&[
-                (4.0, 20.0),
-                (4.0, 8.0),
-                (6.0, 3.0),
-                (11.0, 1.0),
-                (16.0, 3.0),
-                (18.0, 8.0),
-                (18.0, 20.0),
-                (14.0, 17.0),
-                (11.0, 20.0),
-                (8.0, 17.0),
-                (4.0, 20.0),
-            ]);
-            painter.circle_filled(p(8.0, 9.0), 1.2, color);
-            painter.circle_filled(p(14.0, 9.0), 1.2, color);
-        }
-        Icon::Options => {
-            for (y, x) in [(5.0, 8.0), (11.0, 15.0), (17.0, 6.0)] {
-                line(&[(2.0, y), (20.0, y)]);
-                painter.circle_filled(p(x, y), 2.5, color);
-            }
         }
         Icon::Drive => {
             box_at(2.0, 4.0, 20.0, 18.0);

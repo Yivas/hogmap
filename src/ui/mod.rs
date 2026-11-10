@@ -91,6 +91,7 @@ struct Cache {
     matches: Vec<Match>,
     match_counts: (usize, usize),
     location_label: String,
+    selection_readout: Option<(NodeRef, String)>,
 }
 
 /// A map that could not be laid out for `key`. It stays apart from scan errors, so the scan keeps
@@ -941,10 +942,7 @@ impl HogMap {
                 if button(ui, Icon::Stop, can_stop, false, text::STOP_TIP).clicked() {
                     self.cancel();
                 }
-                button(ui, Icon::Export, false, false, text::EXPORT_TIP);
                 ui.separator();
-                button(ui, Icon::Nested, false, false, text::VIEW_MODE_TIP);
-                button(ui, Icon::Group, false, false, text::GROUP_BY_TIP);
                 if button(
                     ui,
                     Icon::Highlight,
@@ -956,9 +954,6 @@ impl HogMap {
                 {
                     self.focus_filter = true;
                 }
-                button(ui, Icon::Ghosts, false, false, text::GHOSTS_TIP);
-                ui.separator();
-                button(ui, Icon::Options, false, false, text::OPTIONS_TIP);
             });
             ui.separator();
             ui.horizontal(|ui| {
@@ -1032,11 +1027,57 @@ impl HogMap {
         });
     }
 
-    fn status(&self, ui: &mut egui::Ui) {
+    fn status(&mut self, ui: &mut egui::Ui) {
+        // Resolve the selected path only after selection/layout changes, not on every frame.
+        if let (Some(index), Some(cache), Some(node)) =
+            (self.reducer.index(), &mut self.cache, self.selected)
+            && cache.key.metric == self.metric
+            && cache
+                .selection_readout
+                .as_ref()
+                .is_none_or(|(shown, _)| *shown != node)
+        {
+            cache.selection_readout = cache
+                .layout
+                .placed
+                .iter()
+                .find(|cell| cell.node == node)
+                .map(|cell| {
+                    let (id, suffix, opens) = match node {
+                        NodeRef::Entry(id) => (
+                            id,
+                            None,
+                            index
+                                .get(id)
+                                .is_some_and(|entry| entry.kind == hogmap::index::Kind::Directory),
+                        ),
+                        NodeRef::Aggregate { parent } => {
+                            (parent, Some(text::aggregate_name(cell.members.len())), true)
+                        }
+                    };
+                    let location = Location::directory(index, id);
+                    let mut path =
+                        text::location(&entry_name(index, index.root()), &location.path, None);
+                    if let Some(suffix) = suffix {
+                        path.push_str(&format!(" / {suffix}"));
+                    }
+                    (
+                        node,
+                        text::selection(
+                            &path,
+                            cell.known_sum,
+                            cell.has_unknown,
+                            self.metric,
+                            opens,
+                        ),
+                    )
+                });
+        }
         egui::Panel::bottom("status")
-            .exact_size(56.0)
+            .exact_size(72.0)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
+                ui.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
                 let state = logic::scan_state(
                     self.receiver.is_some(),
                     self.cancelled,
@@ -1126,20 +1167,27 @@ impl HogMap {
                     // map already holding gigabytes.
                     let seen = self.reducer.index().map_or(0, |index| index.len());
                     let master = text::master_status(master, seen, &totals, self.scan_elapsed);
-                    let master = format!("{master} · {composition_status}");
+                    let master = format!("{master} · {}", text::completeness(&totals));
                     let accessible = format!("{master}\n{detail}");
                     let status = ui.add(egui::Label::new(master).truncate());
                     status.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible)
                     });
                     status.on_hover_text(&detail);
-                    ui.horizontal(|ui| {
-                        ui.strong(text::completeness(&totals))
-                            .on_hover_text(&detail);
-                        ui.separator();
-                        ui.add(egui::Label::new(location).truncate())
-                            .on_hover_text(detail);
+                    ui.label(text::ACCOUNTING_NOTE).on_hover_text(&detail);
+                    let selected = self
+                        .cache
+                        .as_ref()
+                        .filter(|cache| cache.key.metric == self.metric)
+                        .and_then(|cache| cache.selection_readout.as_ref())
+                        .filter(|(node, _)| Some(*node) == self.selected)
+                        .map(|(_, label)| label.as_str());
+                    let readout = selected.unwrap_or(&location);
+                    let response = ui.add(egui::Label::new(readout).truncate());
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, readout)
                     });
+                    response.on_hover_text(readout);
                 } else {
                     let detail = self
                         .scan_report
@@ -1152,6 +1200,7 @@ impl HogMap {
                         egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible)
                     });
                     status.on_hover_text(&detail);
+                    ui.label(text::ACCOUNTING_NOTE);
                     ui.label(
                         egui::RichText::new(if let Some(error) = &self.error {
                             error.as_str()
@@ -1185,7 +1234,7 @@ impl HogMap {
                         icons::Icon::Drive,
                         icon_rect.center(),
                         22.0,
-                        palette.accent,
+                        palette.volume_text,
                     );
                     let root = self
                         .volume
@@ -1376,6 +1425,7 @@ impl HogMap {
                         matches,
                         match_counts,
                         location_label,
+                        selection_readout: None,
                     });
                     self.filter_changed = false;
                 }
@@ -1472,6 +1522,7 @@ impl HogMap {
             }
             if control.clicked() {
                 self.selected = Some(cell.node);
+                ui.ctx().request_repaint();
             }
             if control.double_clicked() {
                 zoom = Some(cell.node);
@@ -1480,6 +1531,7 @@ impl HogMap {
         if let Some(position) = hovered {
             if response.clicked() {
                 self.selected = Some(cache.layout.placed[position].node);
+                ui.ctx().request_repaint();
             }
             if response.double_clicked() {
                 zoom = Some(cache.layout.placed[position].node);

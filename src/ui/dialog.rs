@@ -97,11 +97,37 @@ pub fn validate_root(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[derive(Default, PartialEq)]
-enum Tab {
-    #[default]
-    Drives,
-    Snapshots,
+struct DriveColumns {
+    name: egui::Rect,
+    free: egui::Rect,
+    total: egui::Rect,
+    bar: Option<egui::Rect>,
+}
+impl DriveColumns {
+    fn new(area: egui::Rect, capacity_width: f32) -> Self {
+        let bar = (area.width() >= 640.0).then(|| {
+            egui::Rect::from_min_max(
+                egui::pos2(area.right() - 96.0, area.top()),
+                egui::pos2(area.right() - 8.0, area.bottom()),
+            )
+        });
+        let right = bar.map_or(area.right(), |bar| bar.left()) - 8.0;
+        let total = egui::Rect::from_min_max(
+            egui::pos2(right - capacity_width, area.top()),
+            egui::pos2(right, area.bottom()),
+        );
+        let free = total.translate(egui::vec2(-capacity_width - 8.0, 0.0));
+        let name = egui::Rect::from_min_max(
+            egui::pos2(area.left() + 40.0, area.top()),
+            egui::pos2(free.left() - 8.0, area.bottom()),
+        );
+        Self {
+            name,
+            free,
+            total,
+            bar,
+        }
+    }
 }
 
 pub enum Action {
@@ -112,7 +138,6 @@ pub enum Action {
 
 pub struct SpaceDialog {
     pub open: bool,
-    tab: Tab,
     path: String,
     drives: Vec<DriveChoice>,
     drive_worker: Option<JoinHandle<Result<Vec<DriveChoice>, ScanError>>>,
@@ -127,7 +152,6 @@ impl Default for SpaceDialog {
     fn default() -> Self {
         let mut dialog = Self {
             open: true,
-            tab: Tab::Drives,
             path: String::new(),
             drives: Vec::new(),
             drive_worker: None,
@@ -190,7 +214,7 @@ impl SpaceDialog {
         }
         let mut action = None;
         let palette = Theme::current(context).palette();
-        let width = (context.content_rect().width() - 48.0).clamp(280.0, 488.0);
+        let width = (context.content_rect().width() - 64.0).clamp(360.0, 720.0);
         let modal = egui::Modal::new(egui::Id::new("choose-space"))
             .frame(egui::Frame::popup(&context.global_style()).inner_margin(16.0))
             .show(context, |ui| {
@@ -208,8 +232,6 @@ impl SpaceDialog {
                 });
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
-                    ui.selectable_value(&mut self.tab, Tab::Drives, text::DRIVES_TAB);
-                    ui.selectable_value(&mut self.tab, Tab::Snapshots, text::SNAPSHOTS_TAB);
                     if ui
                         .add_enabled(
                             self.drive_worker.is_none(),
@@ -227,179 +249,248 @@ impl SpaceDialog {
                     ui.label(text::PREPARING_SCAN);
                 }
                 ui.separator();
-                match self.tab {
-                    Tab::Drives => {
-                        egui::ScrollArea::vertical()
-                            .id_salt("drive-choices")
-                            .max_height(160.0)
-                            .show(ui, |ui| {
-                                ui.set_min_height(120.0);
-                                if self.drives.is_empty() {
-                                    ui.add_space(40.0);
-                                    ui.vertical_centered(|ui| {
-                                        ui.label(
-                                            self.drive_error
-                                                .as_deref()
-                                                .unwrap_or(text::DRIVES_UNAVAILABLE),
+                {
+                    let number_font = egui::FontId::monospace(13.0);
+                    let capacity_width = self
+                        .drives
+                        .iter()
+                        .flat_map(|drive| [drive.free_bytes, drive.total_bytes])
+                        .map(|value| {
+                            ui.painter()
+                                .layout_no_wrap(
+                                    text::capacity_value(value),
+                                    number_font.clone(),
+                                    palette.secondary_text,
+                                )
+                                .size()
+                                .x
+                        })
+                        .fold(96.0_f32, f32::max);
+                    let capacity_width = ((capacity_width + 8.0) / 8.0).ceil() * 8.0;
+                    let (heading, _) =
+                        ui.allocate_exact_size(egui::vec2(width, 24.0), egui::Sense::hover());
+                    let visible_rows = self.drives.len().clamp(1, 8).min(
+                        ((context.content_rect().height() - 280.0) / 44.0)
+                            .floor()
+                            .max(1.0) as usize,
+                    );
+                    let choices = egui::ScrollArea::vertical()
+                        .auto_shrink([false, true])
+                        .id_salt("drive-choices")
+                        .max_height(visible_rows as f32 * 44.0 - 4.0)
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing.y = 4.0;
+                            if self.drives.is_empty() {
+                                ui.add_space(40.0);
+                                ui.vertical_centered(|ui| {
+                                    ui.label(
+                                        self.drive_error
+                                            .as_deref()
+                                            .unwrap_or(text::DRIVES_UNAVAILABLE),
+                                    );
+                                });
+                            } else {
+                                for (position, drive) in self.drives.iter().enumerate() {
+                                    let selected = self.selected == Some(position);
+                                    let (rect, response) = ui.allocate_exact_size(
+                                        egui::vec2(ui.available_width(), 40.0),
+                                        egui::Sense::click(),
+                                    );
+                                    let hover = context.animate_bool_with_time(
+                                        response.id.with("hover"),
+                                        response.hovered(),
+                                        0.1,
+                                    );
+                                    let selection = context.animate_bool_with_time(
+                                        response.id.with("selection"),
+                                        selected,
+                                        0.1,
+                                    );
+                                    let fill = palette
+                                        .chrome
+                                        .lerp_to_gamma(palette.tool_hover, hover)
+                                        .lerp_to_gamma(palette.tool_selected, selection);
+                                    ui.painter().rect_filled(rect, 0, fill);
+                                    ui.painter().hline(
+                                        rect.x_range(),
+                                        rect.bottom(),
+                                        Stroke::new(1.0, palette.separator),
+                                    );
+                                    if selected {
+                                        ui.painter().rect_stroke(
+                                            rect,
+                                            0,
+                                            Stroke::new(1.0, palette.accent),
+                                            StrokeKind::Inside,
                                         );
+                                    }
+                                    icons::draw(
+                                        ui.painter(),
+                                        Icon::Drive,
+                                        rect.left_center() + egui::vec2(16.0, 0.0),
+                                        22.0,
+                                        palette.icon,
+                                    );
+                                    let root = drive.root.to_string_lossy();
+                                    let caption = if drive.label.is_empty() {
+                                        root.to_string()
+                                    } else {
+                                        format!("{root}  {}", drive.label)
+                                    };
+                                    let capacity =
+                                        text::drive_capacity(drive.free_bytes, drive.total_bytes);
+                                    let capacity_detail = text::capacity_detail(
+                                        drive.capacity.as_ref(),
+                                        std::time::SystemTime::now(),
+                                    );
+                                    let columns = DriveColumns::new(rect, capacity_width);
+                                    let mut job = egui::text::LayoutJob::simple_singleline(
+                                        caption.clone(),
+                                        egui::FontId::proportional(13.0),
+                                        palette.icon,
+                                    );
+                                    job.wrap.max_width = columns.name.width();
+                                    job.wrap.max_rows = 1;
+                                    let caption_galley =
+                                        ui.fonts_mut(|fonts| fonts.layout_job(job));
+                                    ui.painter().galley(
+                                        egui::pos2(
+                                            columns.name.left(),
+                                            rect.center().y - caption_galley.size().y / 2.0,
+                                        ),
+                                        caption_galley,
+                                        palette.icon,
+                                    );
+                                    for (area, value) in [
+                                        (columns.free, drive.free_bytes),
+                                        (columns.total, drive.total_bytes),
+                                    ] {
+                                        ui.painter().text(
+                                            area.right_center(),
+                                            egui::Align2::RIGHT_CENTER,
+                                            text::capacity_value(value),
+                                            number_font.clone(),
+                                            palette.secondary_text,
+                                        );
+                                    }
+                                    if let (Some(area), Some(free), Some(total)) =
+                                        (columns.bar, drive.free_bytes, drive.total_bytes)
+                                        && total > 0
+                                        && free <= total
+                                    {
+                                        let bar = egui::Rect::from_center_size(
+                                            area.center(),
+                                            egui::vec2(area.width(), 4.0),
+                                        );
+                                        ui.painter().rect_filled(bar, 0, palette.separator);
+                                        let used = (1.0 - free as f64 / total as f64) as f32;
+                                        ui.painter().rect_filled(
+                                            egui::Rect::from_min_size(
+                                                bar.min,
+                                                egui::vec2(bar.width() * used, 4.0),
+                                            ),
+                                            0,
+                                            palette.secondary_text,
+                                        );
+                                    }
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::selected(
+                                            egui::WidgetType::Button,
+                                            true,
+                                            selected,
+                                            format!("{caption}, {capacity}. {capacity_detail}"),
+                                        )
                                     });
-                                } else {
-                                    ui.horizontal_wrapped(|ui| {
-                                        for (position, drive) in self.drives.iter().enumerate() {
-                                            let selected = self.selected == Some(position);
-                                            let (rect, response) = ui.allocate_exact_size(
-                                                egui::vec2(148.0, 100.0),
-                                                egui::Sense::click(),
-                                            );
-                                            let hover = context.animate_bool_with_time(
-                                                response.id.with("hover"),
-                                                response.hovered(),
-                                                0.1,
-                                            );
-                                            let selection = context.animate_bool_with_time(
-                                                response.id.with("selection"),
-                                                selected,
-                                                0.1,
-                                            );
-                                            let fill = palette
-                                                .chrome
-                                                .lerp_to_gamma(palette.tool_hover, hover)
-                                                .lerp_to_gamma(palette.tool_selected, selection);
-                                            ui.painter().rect_filled(rect, 3, fill);
-                                            ui.painter().rect_stroke(
-                                                rect,
-                                                3,
-                                                Stroke::new(
-                                                    1.0,
-                                                    if selected {
-                                                        palette.accent
-                                                    } else {
-                                                        palette.separator
-                                                    },
-                                                ),
-                                                StrokeKind::Inside,
-                                            );
-                                            icons::draw(
-                                                ui.painter(),
-                                                Icon::Drive,
-                                                rect.left_top() + egui::vec2(20.0, 24.0),
-                                                24.0,
-                                                palette.icon,
-                                            );
-                                            let root = drive.root.to_string_lossy();
-                                            let caption = if drive.label.is_empty() {
-                                                root.to_string()
-                                            } else {
-                                                format!("{root}  {}", drive.label)
-                                            };
-                                            let capacity = text::drive_capacity(
-                                                drive.free_bytes,
-                                                drive.total_bytes,
-                                            );
-                                            let capacity_detail = text::capacity_detail(
-                                                drive.capacity.as_ref(),
-                                                std::time::SystemTime::now(),
-                                            );
-                                            let painter =
-                                                ui.painter().with_clip_rect(rect.shrink(8.0));
-                                            painter.text(
-                                                rect.left_top() + egui::vec2(8.0, 48.0),
-                                                egui::Align2::LEFT_TOP,
-                                                &caption,
-                                                egui::FontId::proportional(13.0),
-                                                palette.icon,
-                                            );
-                                            painter.text(
-                                                rect.left_top() + egui::vec2(8.0, 72.0),
-                                                egui::Align2::LEFT_TOP,
-                                                &capacity,
-                                                egui::FontId::proportional(11.0),
-                                                palette.secondary_text,
-                                            );
-                                            response.widget_info(|| {
-                                                egui::WidgetInfo::selected(
-                                                    egui::WidgetType::Button,
-                                                    true,
-                                                    selected,
-                                                    format!(
-                                                        "{caption}, {capacity}. {capacity_detail}"
-                                                    ),
-                                                )
-                                            });
-                                            if response.has_focus() {
-                                                paint::focus_ring(
-                                                    ui.painter(),
-                                                    rect.shrink(2.0),
-                                                    palette,
-                                                );
-                                            }
-                                            if response.clicked() {
-                                                self.selected = Some(position);
-                                                self.path = root.to_string();
-                                            }
-                                            if !self.preparing
-                                                && (response.double_clicked()
-                                                    || (response.has_focus()
-                                                        && context.input_mut(|input| {
-                                                            input.consume_key(
-                                                                Modifiers::NONE,
-                                                                Key::Enter,
-                                                            )
-                                                        })))
-                                            {
-                                                action = Some(Action::Start(drive.root.clone()));
-                                            }
-                                            response.on_hover_text(format!(
-                                                "{caption}\n{capacity}\n{capacity_detail}"
-                                            ));
-                                        }
-                                    });
+                                    if response.has_focus() {
+                                        paint::focus_ring(ui.painter(), rect.shrink(2.0), palette);
+                                    }
+                                    if response.clicked() {
+                                        self.selected = Some(position);
+                                        self.path = root.to_string();
+                                    }
+                                    if !self.preparing
+                                        && (response.double_clicked()
+                                            || (response.has_focus()
+                                                && context.input_mut(|input| {
+                                                    input.consume_key(Modifiers::NONE, Key::Enter)
+                                                })))
+                                    {
+                                        action = Some(Action::Start(drive.root.clone()));
+                                    }
+                                    response.on_hover_text(format!(
+                                        "{caption}\n{capacity}\n{capacity_detail}"
+                                    ));
                                 }
-                            });
-                        ui.separator();
-                        ui.horizontal(|ui| {
-                            let label = ui.label(text::PATH);
-                            let path = ui
-                                .add(
-                                    egui::TextEdit::singleline(&mut self.path)
-                                        .id_salt("scan-path")
-                                        .hint_text(text::PATH_HINT)
-                                        .desired_width((width - 116.0).max(120.0))
-                                        .char_limit(32767),
-                                )
-                                .labelled_by(label.id);
-                            if self.focus_path {
-                                path.request_focus();
-                                self.focus_path = false;
-                            }
-                            if path.changed() {
-                                self.selected = None;
-                                self.error = None;
-                            }
-                            let enter = path.lost_focus()
-                                && context.input(|input| input.key_pressed(Key::Enter));
-                            let start = ui
-                                .add_enabled(
-                                    !self.preparing && !self.path.trim().is_empty(),
-                                    egui::Button::new(text::START),
-                                )
-                                .clicked();
-                            if !self.preparing && (enter || start) && !self.path.trim().is_empty() {
-                                action = Some(Action::Start(PathBuf::from(self.path.trim())));
                             }
                         });
-                        if let Some(error) = &self.error {
-                            ui.colored_label(ui.visuals().error_fg_color, error);
-                        }
+                    let heading = egui::Rect::from_min_size(
+                        heading.min,
+                        egui::vec2(choices.inner_rect.width(), heading.height()),
+                    );
+                    let columns = DriveColumns::new(heading, capacity_width);
+                    for (area, label, align) in [
+                        (columns.name, text::DRIVE, egui::Align2::LEFT_CENTER),
+                        (columns.free, text::FREE, egui::Align2::RIGHT_CENTER),
+                        (columns.total, text::TOTAL, egui::Align2::RIGHT_CENTER),
+                    ] {
+                        let position = if align == egui::Align2::LEFT_CENTER {
+                            area.left_center()
+                        } else {
+                            area.right_center()
+                        };
+                        ui.painter().text(
+                            position,
+                            align,
+                            label,
+                            egui::FontId::proportional(12.0),
+                            palette.secondary_text,
+                        );
                     }
-                    Tab::Snapshots => {
-                        ui.allocate_ui(egui::vec2(width, 160.0), |ui| {
-                            ui.add_space(40.0);
-                            ui.vertical_centered(|ui| {
-                                ui.strong(text::NO_SNAPSHOTS);
-                                ui.label(text::SNAPSHOTS_UNAVAILABLE);
-                            });
-                        });
+                    if let Some(bar) = columns.bar {
+                        ui.painter().text(
+                            bar.center(),
+                            egui::Align2::CENTER_CENTER,
+                            text::USED_FREE,
+                            egui::FontId::proportional(12.0),
+                            palette.secondary_text,
+                        );
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        let label = ui.label(text::PATH);
+                        let path = ui
+                            .add(
+                                egui::TextEdit::singleline(&mut self.path)
+                                    .id_salt("scan-path")
+                                    .hint_text(text::PATH_HINT)
+                                    .desired_width((width - 116.0).max(120.0))
+                                    .char_limit(32767),
+                            )
+                            .labelled_by(label.id);
+                        if self.focus_path {
+                            path.request_focus();
+                            self.focus_path = false;
+                        }
+                        if path.changed() {
+                            self.selected = None;
+                            self.error = None;
+                        }
+                        let enter = path.lost_focus()
+                            && context.input(|input| input.key_pressed(Key::Enter));
+                        let start = ui
+                            .add_enabled(
+                                !self.preparing && !self.path.trim().is_empty(),
+                                egui::Button::new(text::START)
+                                    .fill(palette.tool_selected)
+                                    .stroke(Stroke::new(1.0, palette.accent)),
+                            )
+                            .clicked();
+                        if !self.preparing && (enter || start) && !self.path.trim().is_empty() {
+                            action = Some(Action::Start(PathBuf::from(self.path.trim())));
+                        }
+                    });
+                    if let Some(error) = &self.error {
+                        ui.colored_label(ui.visuals().error_fg_color, error);
                     }
                 }
                 ui.separator();
@@ -586,8 +677,169 @@ mod tests {
     }
 
     #[test]
-    fn enter_submits_the_path_only_from_the_drives_tab() {
-        for snapshots in [false, true] {
+    fn drive_rows_keep_capacity_visible_and_support_keyboard_selection() {
+        for theme in [Theme::Dark, Theme::Light] {
+            for size in [egui::vec2(1914.0, 1035.0), egui::vec2(1280.0, 720.0)] {
+                let context = egui::Context::default();
+                context.enable_accesskit();
+                super::super::theme::apply(&context, theme);
+                let mut dialog = SpaceDialog {
+                    open: true,
+                    path: String::new(),
+                    drives: vec![
+                        DriveChoice {
+                            root: r"X:\".into(),
+                            label: "Fixture".into(),
+                            free_bytes: Some(0),
+                            total_bytes: Some(8192),
+                            capacity: None,
+                        },
+                        DriveChoice {
+                            root: r"Y:\".into(),
+                            label: "Data".into(),
+                            free_bytes: Some(2048),
+                            total_bytes: Some(8192),
+                            capacity: None,
+                        },
+                        DriveChoice {
+                            root: r"Z:\".into(),
+                            label: "Unknown".into(),
+                            free_bytes: None,
+                            total_bytes: None,
+                            capacity: None,
+                        },
+                        DriveChoice {
+                            root: r"W:\".into(),
+                            label: "Capacity ceiling".into(),
+                            free_bytes: Some(u64::MAX),
+                            total_bytes: Some(u64::MAX),
+                            capacity: None,
+                        },
+                    ],
+                    drive_worker: None,
+                    preparing: false,
+                    selected: None,
+                    focus_path: true,
+                    drive_error: None,
+                    error: None,
+                };
+                let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+                let mut pass = |events: Vec<egui::Event>| {
+                    let mut action = None;
+                    let output = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(viewport),
+                            events,
+                            ..Default::default()
+                        },
+                        |_| {
+                            action = dialog.show(&context, false);
+                        },
+                    );
+                    (output, action)
+                };
+                pass(Vec::new());
+                let (output, _) = pass(Vec::new());
+                let nodes = &output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes;
+                let mut rows = Vec::new();
+                for prefix in [
+                    "X:\\  Fixture, 0 B free / 8.0 KiB total",
+                    "Y:\\  Data, 2.0 KiB free / 8.0 KiB total",
+                    "Z:\\  Unknown, unknown free / unknown total",
+                    "W:\\  Capacity ceiling, 17179869184.0 GiB free / 17179869184.0 GiB total",
+                ] {
+                    let node = nodes
+                        .iter()
+                        .map(|(_, node)| node)
+                        .find(|node| node.label().is_some_and(|label| label.starts_with(prefix)))
+                        .expect("drive row has a full accessible name");
+                    assert!(node.supports_action(egui::accesskit::Action::Focus));
+                    let bounds = node.bounds().unwrap();
+                    let rect = egui::Rect::from_min_max(
+                        egui::pos2(bounds.x0 as f32, bounds.y0 as f32),
+                        egui::pos2(bounds.x1 as f32, bounds.y1 as f32),
+                    );
+                    assert!(viewport.contains_rect(rect));
+                    assert_eq!(rect.height(), 40.0);
+                    rows.push(rect);
+                }
+                for pair in rows.windows(2) {
+                    assert_eq!(pair[0].left(), pair[1].left());
+                    assert_eq!(pair[1].top() - pair[0].top(), 44.0);
+                }
+                let labels: Vec<_> = nodes
+                    .iter()
+                    .filter_map(|(_, node)| node.label().or(node.value()))
+                    .collect();
+                assert!(!labels.iter().any(|label| label.contains("Snapshots")));
+                for expected in [
+                    "Start",
+                    "Refresh drives",
+                    "Explore synthetic sample",
+                    "Path",
+                ] {
+                    assert!(
+                        labels.iter().any(|label| label.contains(expected)),
+                        "{expected}: {labels:?}"
+                    );
+                }
+                for value in ["0 B", "2.0 KiB", "8.0 KiB", "unknown", "17179869184.0 GiB"] {
+                    let painted: Vec<_> = output
+                        .shapes
+                        .iter()
+                        .filter_map(|shape| match &shape.shape {
+                            egui::Shape::Text(text) if text.galley.job.text == value => {
+                                Some((shape.clip_rect, text))
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(!painted.is_empty(), "painted capacity {value}");
+                    for (clip, text) in painted {
+                        let bounds = egui::Rect::from_min_size(text.pos, text.galley.size());
+                        assert!(
+                            clip.contains_rect(bounds),
+                            "clipped {value}: {bounds:?} vs {clip:?}"
+                        );
+                        assert!(rows.iter().any(|row| row.contains_rect(bounds)));
+                    }
+                }
+                let point = rows[0].center();
+                for pressed in [true, false] {
+                    pass(vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ]);
+                }
+                let (_, action) = pass(vec![egui::Event::Key {
+                    key: Key::Enter,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::NONE,
+                }]);
+                assert!(matches!(action, Some(Action::Start(root)) if root == Path::new(r"X:\")));
+                println!(
+                    "unit67_chooser width={} height={} rows=4 row_height=40 spacing=4 capacities_unclipped=1 keyboard=1",
+                    size.x, size.y
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn enter_submits_the_path() {
+        {
             let context = egui::Context::default();
             let mut dialog = SpaceDialog {
                 path: r"X:\synthetic-fixture".into(),
@@ -596,9 +848,6 @@ mod tests {
             let _ = context.run_ui(egui::RawInput::default(), |_| {
                 dialog.show(&context, false);
             });
-            if snapshots {
-                dialog.tab = Tab::Snapshots;
-            }
             let mut action = None;
             let input = egui::RawInput {
                 events: vec![egui::Event::Key {
@@ -613,13 +862,9 @@ mod tests {
             let _ = context.run_ui(input, |_| {
                 action = dialog.show(&context, false);
             });
-            if snapshots {
-                assert!(action.is_none());
-            } else {
-                assert!(
-                    matches!(action, Some(Action::Start(root)) if root.as_path() == std::path::Path::new(r"X:\synthetic-fixture"))
-                );
-            }
+            assert!(
+                matches!(action, Some(Action::Start(root)) if root.as_path() == std::path::Path::new(r"X:\synthetic-fixture"))
+            );
         }
     }
 

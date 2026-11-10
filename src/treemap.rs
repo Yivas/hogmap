@@ -562,7 +562,9 @@ fn header_for_depth(depth: usize, max: f32) -> f32 {
     let scale = match depth {
         0 => 1.0,
         1 => 0.8,
-        _ => 0.65,
+        // At the desktop's 20-point base this leaves a 15-point strip: a measured 13-point
+        // text row plus one point of padding above and below, rather than an unlabeled band.
+        _ => 0.75,
     };
     max * scale
 }

@@ -126,6 +126,215 @@ fn assert_near(actual: f32, expected: f32) {
 }
 
 #[test]
+fn chrome_names_real_actions_and_selection_without_clipping_at_desktop_sizes() {
+    fn chrome_frame(
+        context: &egui::Context,
+        app: &mut HogMap,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        context.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                app.controls(ui);
+                app.status(ui);
+                app.volume_header(ui);
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::central_panel(ui.style()).inner_margin(2.0))
+                    .show(ui, |ui| app.map(ui));
+            },
+        )
+    }
+    for theme in [Theme::Dark, Theme::Light] {
+        for size in [egui::vec2(1914.0, 1035.0), egui::vec2(1280.0, 720.0)] {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            theme::apply(&context, theme);
+            let mut app = app(&context);
+            app.metric = SizeMetric::Logical;
+            app.scan_started = Some(Instant::now());
+            let mut output = chrome_frame(&context, &mut app, size, Vec::new());
+            for pass in 1..=3 {
+                if pass > 1 {
+                    output = chrome_frame(&context, &mut app, size, Vec::new());
+                }
+                for shape in &output.shapes {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.job.text == "New scan"
+                    {
+                        println!(
+                            "unit67_panel_pass={pass} width={} clip={:?} bounds={:?}",
+                            size.x,
+                            shape.clip_rect,
+                            egui::Rect::from_min_size(text.pos, text.galley.size())
+                        );
+                    }
+                }
+            }
+            let nodes = &output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes;
+            let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+            for name in [
+                "New scan",
+                "Back",
+                "Forward",
+                "Up",
+                "Home",
+                "Rescan",
+                "Stop",
+                "Highlight",
+            ] {
+                let node = nodes
+                    .iter()
+                    .map(|(_, node)| node)
+                    .find(|node| {
+                        node.role() == egui::accesskit::Role::Button && node.label() == Some(name)
+                    })
+                    .unwrap_or_else(|| panic!("missing toolbar {name}"));
+                let bounds = node.bounds().unwrap();
+                assert_eq!(bounds.y1 - bounds.y0, 32.0);
+                assert!(bounds.x0 >= 0.0 && bounds.x1 <= f64::from(size.x));
+                if !["New scan", "Rescan", "Stop"].contains(&name) {
+                    assert_eq!(bounds.x1 - bounds.x0, 32.0);
+                }
+            }
+            for absent in [
+                "Save / Export",
+                "View mode: nested / flat",
+                "Group by",
+                "Show ghosts",
+                "Options",
+                "Snapshots",
+            ] {
+                assert!(
+                    !nodes.iter().any(|(_, node)| node.label() == Some(absent)),
+                    "unimplemented {absent}"
+                );
+            }
+            for expected in [
+                "New scan",
+                "Stop",
+                "Rescan",
+                "Apparent size · counted per name · not recoverable space",
+            ] {
+                let text = output
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.job.text == expected => {
+                            Some((shape.clip_rect, text))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("not visible: {expected}"));
+                let bounds = egui::Rect::from_min_size(text.1.pos, text.1.galley.size());
+                assert!(
+                    text.0.contains_rect(bounds),
+                    "clipped {expected}: {bounds:?} vs {:?}",
+                    text.0
+                );
+                assert!(viewport.contains_rect(bounds));
+            }
+            let master = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.job.text.starts_with("Ready  ·  4 entries seen") =>
+                    {
+                        Some((shape.clip_rect, text))
+                    }
+                    _ => None,
+                })
+                .expect("short lifecycle/count line");
+            assert!(master.1.galley.job.text.contains("Complete metadata"));
+            assert!(!master.1.galley.job.text.contains("Estimated difference"));
+            assert!(master.0.contains_rect(egui::Rect::from_min_size(
+                master.1.pos,
+                master.1.galley.size()
+            )));
+            assert!(
+                nodes.iter().any(|(_, node)| node
+                    .label()
+                    .or(node.value())
+                    .is_some_and(|label| label.contains("Estimated difference unavailable"))),
+                "accounting detail remains accessible"
+            );
+            let index = app.reducer.index().unwrap();
+            let folder = index
+                .entries()
+                .find(|(_, entry)| entry.name == std::ffi::OsStr::new("folder"))
+                .unwrap()
+                .0;
+            let cell = app
+                .cache
+                .as_ref()
+                .unwrap()
+                .layout
+                .placed
+                .iter()
+                .find(|cell| cell.node == NodeRef::Entry(folder))
+                .unwrap();
+            let point = paint::rect(cell.header.unwrap()).center();
+            for pressed in [true, false] {
+                chrome_frame(
+                    &context,
+                    &mut app,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            let output = chrome_frame(&context, &mut app, size, Vec::new());
+            let expected = "Selected: Synthetic / folder · Apparent size: 100 B logical · Double-click to open";
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.label().or(node.value()) == Some(expected))
+            );
+            let text = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.job.text == expected => {
+                        Some((shape.clip_rect, text))
+                    }
+                    _ => None,
+                })
+                .expect("selected path is visibly painted");
+            assert!(
+                text.0
+                    .contains_rect(egui::Rect::from_min_size(text.1.pos, text.1.galley.size()))
+            );
+            println!(
+                "unit67_chrome width={} height={} actions=8 named=3 accounting_visible=1 selected_path_visible=1",
+                size.x, size.y
+            );
+        }
+    }
+}
+
+#[test]
 fn synthetic_channel_progress_reaches_rendered_status_without_losing_unknowns() {
     let context = egui::Context::default();
     context.enable_accesskit();

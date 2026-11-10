@@ -285,7 +285,10 @@ pub fn apply(context: &egui::Context, theme: Theme) {
             .insert(egui::TextStyle::Button, egui::FontId::proportional(13.0));
         style
             .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::proportional(11.0));
+            .insert(egui::TextStyle::Small, egui::FontId::proportional(12.0));
+        style
+            .text_styles
+            .insert(egui::TextStyle::Monospace, egui::FontId::monospace(13.0));
         style
             .text_styles
             .insert(egui::TextStyle::Heading, egui::FontId::proportional(18.0));

@@ -157,7 +157,8 @@ struct LabelFitter {
     font: FontId,
     line_height: f32,
     ellipsis: f32,
-    glyphs: HashMap<char, f32>,
+    number_ellipsis: f32,
+    glyphs: HashMap<(bool, char), f32>,
     chars: Vec<char>,
     widths: Vec<f32>,
 }
@@ -169,9 +170,23 @@ impl LabelFitter {
             line_height: painter
                 .layout_no_wrap("M".into(), font.clone(), Color32::BLACK)
                 .size()
-                .y,
+                .y
+                .max(
+                    painter
+                        .layout_no_wrap("M".into(), FontId::monospace(11.0), Color32::BLACK)
+                        .size()
+                        .y,
+                ),
             ellipsis: painter
                 .layout_no_wrap(text::ELLIPSIS.into(), font.clone(), Color32::BLACK)
+                .size()
+                .x,
+            number_ellipsis: painter
+                .layout_no_wrap(
+                    text::ELLIPSIS.into(),
+                    FontId::monospace(11.0),
+                    Color32::BLACK,
+                )
                 .size()
                 .x,
             font,
@@ -190,8 +205,20 @@ impl LabelFitter {
         if rect.height() < self.line_height * label.lines().count() as f32 {
             return None;
         }
-        let mut fitted = String::with_capacity(label.len());
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = f32::INFINITY;
         for (line_number, line) in label.lines().enumerate() {
+            let numeric = line_number > 0;
+            let font = if numeric {
+                FontId::monospace(11.0)
+            } else {
+                self.font.clone()
+            };
+            let ellipsis = if numeric {
+                self.number_ellipsis
+            } else {
+                self.ellipsis
+            };
             self.chars.clear();
             self.widths.clear();
             self.chars.extend(line.chars());
@@ -200,15 +227,11 @@ impl LabelFitter {
             // character: ask layout once and cache its actual result, including replacement glyphs.
             ui.fonts_mut(|fonts| {
                 for character in &self.chars {
-                    let width = *self.glyphs.entry(*character).or_insert_with(|| {
-                        let width = fonts.glyph_width(&self.font, *character);
+                    let width = *self.glyphs.entry((numeric, *character)).or_insert_with(|| {
+                        let width = fonts.glyph_width(&font, *character);
                         if width == 0.0 {
                             fonts
-                                .layout_no_wrap(
-                                    character.to_string(),
-                                    self.font.clone(),
-                                    Color32::BLACK,
-                                )
+                                .layout_no_wrap(character.to_string(), font.clone(), Color32::BLACK)
                                 .size()
                                 .x
                         } else {
@@ -218,11 +241,11 @@ impl LabelFitter {
                     self.widths.push(width);
                 }
             });
-            let (count, truncated) =
-                logic::fitting_prefix(&self.widths, rect.width(), self.ellipsis)?;
+            let (count, truncated) = logic::fitting_prefix(&self.widths, rect.width(), ellipsis)?;
             if count < MIN_LABEL_CHARS {
                 return None;
             }
+            let mut fitted = String::with_capacity(line.len());
             if line_number > 0 {
                 fitted.push('\n');
             }
@@ -230,10 +253,17 @@ impl LabelFitter {
             if truncated {
                 fitted.push_str(text::ELLIPSIS);
             }
+            job.append(
+                &fitted,
+                0.0,
+                egui::TextFormat {
+                    font_id: font,
+                    color: Color32::PLACEHOLDER,
+                    ..Default::default()
+                },
+            );
         }
-        let galley = ui
-            .painter()
-            .layout_no_wrap(fitted, self.font.clone(), Color32::PLACEHOLDER);
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
         // Shaping and rounding can differ from summed advances; the final renderer is authoritative.
         if galley.size().x > rect.width() || galley.size().y > rect.height() {
             return None;
@@ -491,7 +521,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn missing_glyph_labels_fit_the_rect_and_keep_the_three_character_minimum() {
+    fn labels_fit_bounds_headers_and_the_three_character_minimum() {
         let context = egui::Context::default();
         let _ = context.run_ui(egui::RawInput::default(), |ui| {
             let font = FontId::proportional(11.0);
@@ -557,6 +587,27 @@ mod tests {
                     "two characters stay hidden"
                 );
             }
+            let mut index = Index::new("Root header".into()).unwrap();
+            let root = index.root();
+            let first = index.insert(root, "First header".into(), Kind::Directory, Default::default(), None, State::Complete).unwrap();
+            let second = index.insert(first, "Second header".into(), Kind::Directory, Default::default(), None, State::Complete).unwrap();
+            index.insert(second, "leaf.bin".into(), Kind::File, hogmap::index::Sizes { logical: Some(4096), allocated: Some(4096) }, None, State::Complete).unwrap();
+            index.set_state(root, State::Complete).unwrap();
+            let layout = hogmap::treemap::layout(&index, root, Rect::new(0.0, 0.0, 800.0, 600.0), hogmap::treemap::LayoutParams { min_pixel_area: 1.0, header_height: 20.0, max_depth: 2 }).unwrap();
+            let cells = prepare(ui, &index, &layout, None, SizeMetric::Logical);
+            assert_eq!(cells.len(), 3);
+            for ((placed, cell), height) in layout.placed.iter().zip(&cells).zip([20.0, 16.0, 15.0]) {
+                let header = placed.header.unwrap();
+                assert_eq!(header.height, height);
+                let (galley, _) = cell.label.as_ref().expect("every reserved header fits its label");
+                assert!(galley.size().y + 2.0 <= header.height);
+                assert!(galley.size().x + 8.0 <= header.width);
+            }
+            let (size_label, _) = fit(ui, "Example.bin\n4.0 KiB", egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(128.0, 40.0)), true).unwrap();
+            assert_eq!(size_label.job.text, "Example.bin\n4.0 KiB");
+            assert_eq!(size_label.job.sections[0].format.font_id, FontId::proportional(11.0));
+            assert_eq!(size_label.job.sections[1].format.font_id, FontId::monospace(11.0));
+            println!("unit67_labels header_heights=20,16,15 header_labels=3 numeric_font_monospace=1 minimum_chars=3");
         });
     }
 }

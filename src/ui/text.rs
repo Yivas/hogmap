@@ -14,11 +14,10 @@ pub const TITLE: &str = "HogMap";
 pub const FILE: &str = "File";
 pub const NEW_SCAN: &str = "New scan";
 pub const SAMPLE_ACTION: &str = "Explore synthetic sample";
-pub const CHOOSE_SPACE: &str = "Choose your Space";
-pub const DRIVES_TAB: &str = "Drives or paths";
-pub const SNAPSHOTS_TAB: &str = "Snapshots";
-pub const NO_SNAPSHOTS: &str = "No saved snapshots yet";
-pub const SNAPSHOTS_UNAVAILABLE: &str = "Saving and opening snapshots is not implemented yet.";
+pub const CHOOSE_SPACE: &str = "Choose a drive or folder";
+pub const FREE: &str = "Free";
+pub const TOTAL: &str = "Total";
+pub const USED_FREE: &str = "Used / free";
 pub const DRIVES_UNAVAILABLE: &str = "No drives found. Enter an existing folder or drive root.";
 pub const LISTING_DRIVES: &str = "Listing drives…";
 pub const REFRESH_DRIVES: &str = "Refresh drives";
@@ -34,11 +33,8 @@ pub const START: &str = "Start";
 pub const CLOSE: &str = "Close";
 pub const DRIVE: &str = "Drive";
 pub const RESCAN: &str = "Rescan";
-pub const EXPORT: &str = "Save / Export";
-pub const VIEW_MODE: &str = "View mode: nested / flat";
-pub const GROUP_BY: &str = "Group by";
-pub const GHOSTS: &str = "Show ghosts";
-pub const OPTIONS: &str = "Options";
+pub const STOP: &str = "Stop";
+pub const ACCOUNTING_NOTE: &str = "Apparent size · counted per name · not recoverable space";
 pub const READY: &str = "Ready";
 pub const NO_SPACE: &str = "No space selected";
 pub const CHOOSE_HINT: &str = "Choose a drive or folder to begin, or explore the synthetic sample.";
@@ -52,12 +48,7 @@ pub const UP_TIP: &str = "Up · Backspace";
 pub const HOME_TIP: &str = "Home · Alt+Home";
 pub const RESCAN_TIP: &str = "Rescan selected scan root or sample · F5";
 pub const STOP_TIP: &str = "Stop scan or hard-link checks · Esc";
-pub const EXPORT_TIP: &str = "Save / Export — not implemented yet";
-pub const VIEW_MODE_TIP: &str = "Nested / flat view — not implemented yet; current map is nested";
-pub const GROUP_BY_TIP: &str = "Group by — not implemented yet";
 pub const HIGHLIGHT_TIP: &str = "Focus highlight filter · Ctrl+F";
-pub const GHOSTS_TIP: &str = "Ghosts — not implemented yet";
-pub const OPTIONS_TIP: &str = "Options — not implemented yet";
 pub const EXIT: &str = "Exit";
 pub const VIEW: &str = "View";
 pub const ZOOM_IN: &str = "Zoom into selection";
@@ -72,7 +63,6 @@ pub const BACK: &str = "Back";
 pub const FORWARD: &str = "Forward";
 pub const UP: &str = "Up";
 pub const HOME: &str = "Home";
-pub const CANCEL: &str = "Stop scan or hard-link checks";
 pub const FILTER: &str = "Highlight";
 pub const FILTER_HINT: &str = "Name or logical size: *.bin;>1mb";
 pub const SAMPLE: &str = "Synthetic sample";
@@ -107,12 +97,8 @@ fn metric_title(metric: SizeMetric) -> &'static str {
 /// The line under the highlight field. Highlight size conditions stay logical in either view.
 pub fn map_metric(metric: SizeMetric) -> &'static str {
     match metric {
-        SizeMetric::Logical => {
-            "Apparent size (map): logical · Each listed name counts · Can exceed disk capacity"
-        }
-        SizeMetric::Allocated => {
-            "Apparent size (map): observed allocated · Each listed name counts · Can exceed disk capacity · Highlight uses logical size"
-        }
+        SizeMetric::Logical => "Map: logical size",
+        SizeMetric::Allocated => "Map: observed allocated size · Highlight uses logical size",
     }
 }
 
@@ -411,14 +397,33 @@ pub fn master_status(
     )
 }
 
+pub fn selection(path: &str, bytes: u64, unknown: bool, metric: SizeMetric, opens: bool) -> String {
+    format!(
+        "Selected: {path} · Apparent size: {} {}{}",
+        size(bytes, unknown),
+        metric_bytes(metric),
+        if opens {
+            " · Double-click to open"
+        } else {
+            ""
+        }
+    )
+}
+
+pub fn capacity_value(value: Option<u64>) -> String {
+    value.map_or_else(|| "unknown".into(), |bytes| size(bytes, false))
+}
+
 pub fn match_count(matches: usize, unknown: usize) -> String {
     format!("{matches} matches · {unknown} unknown")
 }
 
 pub fn drive_capacity(free: Option<u64>, total: Option<u64>) -> String {
-    let known =
-        |value: Option<u64>| value.map_or_else(|| "unknown".into(), |bytes| size(bytes, false));
-    format!("{} free / {} total", known(free), known(total))
+    format!(
+        "{} free / {} total",
+        capacity_value(free),
+        capacity_value(total)
+    )
 }
 
 /// Detail shared by the chooser and header; wall-clock changes never invent a capture age.
