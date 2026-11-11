@@ -51,6 +51,8 @@ pub struct Palette {
     pub message: Color32,
     pub directories: [Tone; DEPTH_TONES],
     pub file: Tone,
+    pub free: Tone,
+    pub not_yet_scanned: Tone,
     pub aggregate: Tone,
     /// Partial, inaccessible and stale entries.
     pub incomplete: Tone,
@@ -123,6 +125,8 @@ const DARK: Palette = Palette {
         rgb(0x24405B),
         Some(DARK_STATE_MARK),
     ),
+    free: tone(rgb(0x315B3B), rgb(0xEEF5E8), None),
+    not_yet_scanned: tone(rgb(0x42464D), rgb(0xEEF1F5), None),
     aggregate: seamed(
         rgb(0x4F416E),
         rgb(0xF1ECF8),
@@ -178,6 +182,8 @@ const LIGHT: Palette = Palette {
         rgb(0x7BA6C4),
         Some(LIGHT_STATE_MARK),
     ),
+    free: tone(rgb(0x90B76C), Color32::BLACK, None),
+    not_yet_scanned: tone(rgb(0xCDCFD2), Color32::BLACK, None),
     aggregate: seamed(
         rgb(0xBEA6DA),
         Color32::BLACK,
@@ -430,8 +436,12 @@ mod tests {
     #[test]
     fn every_map_label_meets_aa_against_its_fill() {
         for theme in THEMES {
-            for (name, tone) in tones(theme.palette()) {
+            for (name, tone) in tones(theme.palette()).into_iter().chain([
+                ("Free space", theme.palette().free),
+                ("Not yet scanned estimate", theme.palette().not_yet_scanned),
+            ]) {
                 let ratio = contrast_ratio(tone.text, tone.fill);
+                println!("{theme:?} {name} label contrast={ratio:.3}:1");
                 assert!(ratio >= TEXT_MINIMUM, "{theme:?} {name}: {ratio:.2}");
             }
         }

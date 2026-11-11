@@ -12,6 +12,8 @@ pub enum Icon {
     Rescan,
     Stop,
     Highlight,
+    MoreDetail,
+    LessDetail,
     Drive,
 }
 
@@ -26,6 +28,8 @@ impl Icon {
             Self::Rescan => text::RESCAN,
             Self::Stop => text::STOP,
             Self::Highlight => text::FILTER,
+            Self::MoreDetail => text::MORE_DETAIL,
+            Self::LessDetail => text::LESS_DETAIL,
             Self::Drive => text::DRIVE,
         }
     }
@@ -200,6 +204,13 @@ pub fn draw(painter: &egui::Painter, icon: Icon, center: Pos2, size: f32, color:
                 })
                 .collect();
             painter.add(Shape::closed_line(points, stroke));
+        }
+        Icon::MoreDetail | Icon::LessDetail => {
+            box_at(2.0, 2.0, 20.0, 20.0);
+            line(&[(6.0, 11.0), (16.0, 11.0)]);
+            if matches!(icon, Icon::MoreDetail) {
+                line(&[(11.0, 6.0), (11.0, 16.0)]);
+            }
         }
         Icon::Drive => {
             box_at(2.0, 4.0, 20.0, 18.0);

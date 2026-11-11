@@ -18,6 +18,7 @@ pub struct DriveChoice {
     pub label: String,
     pub free_bytes: Option<u64>,
     pub total_bytes: Option<u64>,
+    pub storage_reserve_bytes: Option<u64>,
     pub capacity: Option<CapacityMetadata>,
 }
 
@@ -28,6 +29,9 @@ impl From<VolumeInfo> for DriveChoice {
             label: volume.label.unwrap_or_default(),
             free_bytes: volume.free_bytes,
             total_bytes: volume.total_bytes,
+            storage_reserve_bytes: volume
+                .storage_reserve_bytes
+                .filter(|_| volume.reserve_issue.is_none()),
             capacity: Some(volume.capacity),
         }
     }
@@ -56,6 +60,7 @@ pub fn volume_choice(
                 label: String::new(),
                 free_bytes: None,
                 total_bytes: None,
+                storage_reserve_bytes: None,
                 capacity: None,
             },
             DriveChoice::from,
@@ -150,23 +155,29 @@ pub struct SpaceDialog {
 
 impl Default for SpaceDialog {
     fn default() -> Self {
-        let mut dialog = Self {
-            open: true,
-            path: String::new(),
-            drives: Vec::new(),
-            drive_worker: None,
-            preparing: false,
-            selected: None,
-            focus_path: true,
-            drive_error: None,
-            error: None,
-        };
+        let mut dialog = Self::closed();
+        dialog.open = true;
+        dialog.focus_path = true;
         dialog.refresh_drives();
         dialog
     }
 }
 
 impl SpaceDialog {
+    /// A consumer of an existing in-memory scan does not enumerate drives on construction.
+    pub(super) fn closed() -> Self {
+        Self {
+            open: false,
+            path: String::new(),
+            drives: Vec::new(),
+            drive_worker: None,
+            preparing: false,
+            selected: None,
+            focus_path: false,
+            drive_error: None,
+            error: None,
+        }
+    }
     pub fn reopen(&mut self) {
         self.open = true;
         self.selected = None;
@@ -692,6 +703,7 @@ mod tests {
                             label: "Fixture".into(),
                             free_bytes: Some(0),
                             total_bytes: Some(8192),
+                            storage_reserve_bytes: None,
                             capacity: None,
                         },
                         DriveChoice {
@@ -699,6 +711,7 @@ mod tests {
                             label: "Data".into(),
                             free_bytes: Some(2048),
                             total_bytes: Some(8192),
+                            storage_reserve_bytes: None,
                             capacity: None,
                         },
                         DriveChoice {
@@ -706,6 +719,7 @@ mod tests {
                             label: "Unknown".into(),
                             free_bytes: None,
                             total_bytes: None,
+                            storage_reserve_bytes: None,
                             capacity: None,
                         },
                         DriveChoice {
@@ -713,6 +727,7 @@ mod tests {
                             label: "Capacity ceiling".into(),
                             free_bytes: Some(u64::MAX),
                             total_bytes: Some(u64::MAX),
+                            storage_reserve_bytes: None,
                             capacity: None,
                         },
                     ],

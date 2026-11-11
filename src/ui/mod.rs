@@ -3,10 +3,10 @@ mod composition;
 mod composition_tests;
 mod dialog;
 mod icons;
-mod logic;
-mod paint;
+pub(crate) mod logic;
+pub(crate) mod paint;
 pub mod text;
-mod theme;
+pub(crate) mod theme;
 
 use std::path::PathBuf;
 use std::thread::{self, JoinHandle};
@@ -31,11 +31,14 @@ use logic::{HighlightFilter, History, Location, Members};
 use theme::Theme;
 
 const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
-const FRAME_INTERVAL: Duration = Duration::from_millis(33);
-const DRAIN_BUDGET: Duration = Duration::from_millis(4);
-// Levels below the drawn root that the map tiles. Deeper folders stay whole blocks the user opens
-// by navigating, so the map never fills with cells too small to name.
-const MAP_MAX_DEPTH: usize = 2;
+const STATUS_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(67);
+const DRAIN_BUDGET: Duration = Duration::from_millis(6);
+// Detail controls area, not a two-level stop. The depth bound is only a safety limit;
+// deeper folders remain navigable without recursively growing the rendered tree forever.
+const DETAIL_AREAS: [f32; 5] = [4096.0, 2048.0, 1024.0, 640.0, 400.0];
+const DEFAULT_DETAIL: usize = 2;
+const SAFETY_DEPTH: usize = 64;
 // Hold a close request this long so returning threads can finish; then detach the rest.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
 
@@ -75,13 +78,19 @@ impl ConflictResolution {
 
 /// What a map was built for. The metric is part of the key, so geometry and labels built for one
 /// metric are never shown, even partly, while the other one is selected.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ViewKey {
     version: u64,
     resolution_revision: u64,
     location: Location,
     rect: Rect,
     metric: SizeMetric,
+    detail: usize,
+}
+
+struct VolumeMap {
+    key: ViewKey,
+    cells: Vec<composition::VolumeCell>,
 }
 
 struct Cache {
@@ -92,6 +101,50 @@ struct Cache {
     match_counts: (usize, usize),
     location_label: String,
     selection_readout: Option<(NodeRef, String)>,
+    paint: Option<paint::CachedMap>,
+}
+
+#[derive(Clone, PartialEq)]
+struct StatusKey {
+    version: u64,
+    revision: u64,
+    metric: SizeMetric,
+    location: Location,
+    selected: Option<NodeRef>,
+    shown: Option<ViewKey>,
+    elapsed: u64,
+    lifecycle: &'static str,
+    phase: std::mem::Discriminant<ConflictResolution>,
+    candidates: usize,
+    terminal: Option<Terminal>,
+    observed: bool,
+    detail: usize,
+    viewport: egui::Vec2,
+}
+impl StatusKey {
+    fn immediate_change(&self, other: &Self) -> bool {
+        self.metric != other.metric
+            || self.location != other.location
+            || self.selected != other.selected
+            || self.lifecycle != other.lifecycle
+            || self.phase != other.phase
+            || self.terminal != other.terminal
+            || self.observed != other.observed
+            || self.detail != other.detail
+            || self.viewport != other.viewport
+    }
+}
+struct StatusCache {
+    key: StatusKey,
+    error: Option<String>,
+    layout_error: Option<String>,
+    master: String,
+    readout: String,
+    brief: String,
+    detail: String,
+    accessible: String,
+    width: f32,
+    updated_at: Instant,
 }
 
 /// A map that could not be laid out for `key`. It stays apart from scan errors, so the scan keeps
@@ -129,8 +182,8 @@ pub struct HogMap {
     /// A choice from the View menu, applied at the start of the next frame so every panel of that
     /// frame uses the same palette.
     pending_theme: Option<Theme>,
-    reducer: ScanReducer,
-    receiver: Option<ScanReceiver>,
+    pub(crate) reducer: ScanReducer,
+    pub(crate) receiver: Option<ScanReceiver>,
     producer: Option<JoinHandle<ScanCompletion>>,
     // A replacement waits for retired scan/reread workers instead of accumulating blocked I/O.
     pending_producers: Vec<JoinHandle<ScanCompletion>>,
@@ -147,7 +200,7 @@ pub struct HogMap {
     scan_root: Option<PathBuf>,
     cancellation: ScanCancellation,
     cancelled: bool,
-    version: u64,
+    pub(crate) version: u64,
     history: History,
     selected: Option<NodeRef>,
     filter_text: String,
@@ -157,15 +210,21 @@ pub struct HogMap {
     /// The size the map weighs. Chosen in View for this session only: it survives a rescan but is
     /// never saved.
     metric: SizeMetric,
+    detail: usize,
     cache: Option<Cache>,
+    volume_map: Option<VolumeMap>,
+    status_cache: Option<StatusCache>,
     layout_failure: Option<LayoutFailure>,
-    last_layout: Option<Instant>,
-    last_layout_cost: Duration,
+    pub(crate) last_layout: Option<Instant>,
+    pub(crate) last_layout_cost: Duration,
     paint_dashes: Vec<egui::Shape>,
+    last_tick: Option<Instant>,
+    backlog_ticks: usize,
+    pub(crate) paint_rebuilds: usize,
     error: Option<String>,
     about: bool,
     chooser: dialog::SpaceDialog,
-    scan_started: Option<Instant>,
+    pub(crate) scan_started: Option<Instant>,
     scan_elapsed: Duration,
     focus_filter: bool,
     volume: Option<dialog::DriveChoice>,
@@ -182,10 +241,18 @@ impl HogMap {
     }
 
     fn with_context(context: egui::Context) -> Self {
+        let mut app = Self::with_reducer(context, ScanReducer::new(ScanGeneration::new(0)));
+        app.chooser = dialog::SpaceDialog::default();
+        app
+    }
+
+    /// Reuse the real renderer with an in-memory scan; no drive query or window is started.
+    pub(crate) fn with_reducer(context: egui::Context, reducer: ScanReducer) -> Self {
+        let scan_started = reducer.index().map(|_| Instant::now());
         Self {
             context,
             pending_theme: None,
-            reducer: ScanReducer::new(ScanGeneration::new(0)),
+            reducer,
             receiver: None,
             producer: None,
             pending_producers: Vec::new(),
@@ -210,15 +277,21 @@ impl HogMap {
             filter: HighlightFilter::default(),
             filter_changed: false,
             metric: SizeMetric::Logical,
+            detail: DEFAULT_DETAIL,
             cache: None,
+            volume_map: None,
+            status_cache: None,
             layout_failure: None,
             last_layout: None,
             last_layout_cost: Duration::ZERO,
             paint_dashes: Vec::new(),
+            last_tick: None,
+            backlog_ticks: 0,
+            paint_rebuilds: 0,
             error: None,
             about: false,
-            chooser: dialog::SpaceDialog::default(),
-            scan_started: None,
+            chooser: dialog::SpaceDialog::closed(),
+            scan_started,
             scan_elapsed: Duration::ZERO,
             focus_filter: false,
             volume: None,
@@ -252,6 +325,7 @@ impl HogMap {
         self.stop_producer();
         // Coalesce repeated requests instead of starting more threads behind blocked I/O.
         self.pending_scan = Some(request);
+        self.last_tick = None;
     }
 
     /// Whether a producer, a retired producer or the preparation task still owns a thread.
@@ -362,6 +436,7 @@ impl HogMap {
                         .as_ref()
                         .map(VolumeEvidence::from_observations);
                     self.observations = completion.observations;
+                    self.version = self.version.wrapping_add(1);
                 }
                 Ok(_) => {}
                 Err(_) => self.error = Some(text::PRODUCER_PANIC.into()),
@@ -378,7 +453,7 @@ impl HogMap {
         let generation = ScanGeneration::new(self.reducer.generation().value().wrapping_add(1));
         let (sender, receiver) = event_channel(DEFAULT_CHANNEL_CAPACITY);
         let context = self.context.clone();
-        sender.set_waker(move || context.request_repaint());
+        sender.set_waker(move || context.request_repaint_after(FRAME_INTERVAL));
         let cancellation = ScanCancellation::new();
         let flag = cancellation.clone();
         let scan_root = root.clone();
@@ -431,7 +506,7 @@ impl HogMap {
         let generation = ScanGeneration::new(self.reducer.generation().value().wrapping_add(1));
         let (sender, receiver) = event_channel(DEFAULT_CHANNEL_CAPACITY);
         let context = self.context.clone();
-        sender.set_waker(move || context.request_repaint());
+        sender.set_waker(move || context.request_repaint_after(FRAME_INTERVAL));
         let cancellation = ScanCancellation::new();
         let flag = cancellation.clone();
         let producer = thread::Builder::new()
@@ -495,9 +570,12 @@ impl HogMap {
         self.history = History::default();
         self.selected = None;
         self.cache = None;
+        self.volume_map = None;
         self.layout_failure = None;
         self.last_layout = None;
         self.last_layout_cost = Duration::ZERO;
+        self.last_tick = None;
+        self.backlog_ticks = 0;
         // A panic in the replaced producer is this scan's only report; do not hide it.
         if !previous_failed {
             self.error = None;
@@ -521,14 +599,31 @@ impl HogMap {
         }
     }
 
-    fn drain(&mut self, context: &egui::Context) {
+    pub(crate) fn drain(&mut self, context: &egui::Context) {
+        if (self.receiver.is_some() || self.work_pending())
+            && let Some(last) = self.last_tick
+            && last.elapsed() < FRAME_INTERVAL
+        {
+            context.request_repaint_after(FRAME_INTERVAL.saturating_sub(last.elapsed()));
+            return;
+        }
+        self.last_tick = Some(Instant::now());
         if let Some(receiver) = &self.receiver {
-            let report = self
-                .reducer
-                .drain_budgeted(receiver, usize::MAX, DRAIN_BUDGET);
-            if receiver.has_pending() {
-                context.request_repaint();
-            }
+            // Leave room for the cached frame. Sustained backlog gets sparse8/12ms slices,
+            // not a12ms p95, an immediate repaint loop or a single20ms burst.
+            let budget = if self.backlog_ticks >= 128 && self.backlog_ticks.is_multiple_of(128) {
+                Duration::from_millis(12)
+            } else if self.backlog_ticks >= 32 && self.backlog_ticks.is_multiple_of(32) {
+                Duration::from_millis(8)
+            } else {
+                DRAIN_BUDGET
+            };
+            let report = self.reducer.drain_budgeted(receiver, usize::MAX, budget);
+            self.backlog_ticks = if receiver.has_pending() {
+                self.backlog_ticks.saturating_add(1)
+            } else {
+                0
+            };
             if report.events > 0 || report.disconnected {
                 self.version += 1;
             }
@@ -691,6 +786,32 @@ impl HogMap {
         )
     }
 
+    fn visible_composition(
+        &self,
+        legacy: &CompositionEvaluation,
+    ) -> composition::VisibleEvaluation {
+        let scanned = self
+            .reducer
+            .index()
+            .and_then(|index| index.summary_for(self.metric).ok())
+            .and_then(|summary| summary.apparent_bytes().ok());
+        composition::visible(
+            CompositionView {
+                metric: self.metric,
+                unzoomed: self.history.current() == Location::default(),
+                finished: self.reducer.terminal() == Some(Terminal::Finished)
+                    && self.pending_scan.is_none()
+                    && !self.closing,
+            },
+            self.receiver.is_some() && self.reducer.terminal().is_none(),
+            self.scan_root.as_deref(),
+            self.volume.as_ref(),
+            self.volume_evidence.as_ref(),
+            legacy.components,
+            scanned,
+        )
+    }
+
     /// A layout failure of the selected metric. One left by the other metric is not reported while
     /// the map is being rebuilt after a switch.
     fn current_layout_failure(&self) -> Option<&LayoutFailure> {
@@ -702,6 +823,18 @@ impl HogMap {
     fn navigate(&mut self, location: Location) {
         self.history.visit(location);
         self.selected = None;
+    }
+
+    fn change_detail(&mut self, more: bool) {
+        let next = if more {
+            (self.detail + 1).min(DETAIL_AREAS.len() - 1)
+        } else {
+            self.detail.saturating_sub(1)
+        };
+        if next != self.detail {
+            self.detail = next;
+            self.last_layout = None;
+        }
     }
 
     fn can_zoom(&self) -> bool {
@@ -778,6 +911,17 @@ impl HogMap {
         if context.text_edit_focused() {
             return;
         }
+        if context.input_mut(|input| {
+            input.consume_key(Modifiers::CTRL, Key::Plus)
+                || input.consume_key(Modifiers::CTRL, Key::Equals)
+                || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Plus)
+                || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Equals)
+        }) {
+            self.change_detail(true);
+        }
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Minus)) {
+            self.change_detail(false);
+        }
         if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F5))
             && self.scan_started.is_some()
         {
@@ -838,6 +982,27 @@ impl HogMap {
                     }
                     if ui.button(text::HOME).clicked() {
                         self.navigate(Location::default());
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            self.detail + 1 < DETAIL_AREAS.len(),
+                            egui::Button::new(text::MORE_DETAIL).shortcut_text("Ctrl++"),
+                        )
+                        .clicked()
+                    {
+                        self.change_detail(true);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.detail > 0,
+                            egui::Button::new(text::LESS_DETAIL).shortcut_text("Ctrl+-"),
+                        )
+                        .clicked()
+                    {
+                        self.change_detail(false);
                         ui.close();
                     }
                     ui.separator();
@@ -921,6 +1086,29 @@ impl HogMap {
                 .clicked()
                 {
                     self.navigate(Location::default());
+                }
+                ui.separator();
+                if button(
+                    ui,
+                    Icon::MoreDetail,
+                    self.detail + 1 < DETAIL_AREAS.len(),
+                    false,
+                    text::MORE_DETAIL_TIP,
+                )
+                .clicked()
+                {
+                    self.change_detail(true);
+                }
+                if button(
+                    ui,
+                    Icon::LessDetail,
+                    self.detail > 0,
+                    false,
+                    text::LESS_DETAIL_TIP,
+                )
+                .clicked()
+                {
+                    self.change_detail(false);
                 }
                 ui.separator();
                 if button(
@@ -1073,167 +1261,287 @@ impl HogMap {
                     )
                 });
         }
-        egui::Panel::bottom("status")
-            .exact_size(72.0)
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-                ui.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
-                let state = logic::scan_state(
-                    self.receiver.is_some(),
-                    self.cancelled,
-                    self.reducer.terminal(),
-                );
-                let stopping = !self.pending_producers.is_empty()
-                    || !self.pending_rereads.is_empty()
-                    || self.closing
-                    || (self.cancelled && self.producer.is_some())
-                    || (self.preparation.is_some() && self.cancellation.is_cancelled());
-                let lifecycle = if self.resolution.active() && !stopping {
-                    if self.cancelled {
-                        text::STOPPING
-                    } else {
-                        text::RESOLVING_CONFLICTS
-                    }
-                } else if stopping {
-                    text::STOPPING
-                } else if self.preparation.is_some() {
-                    text::PREPARING_SCAN
-                } else if self.scan_started.is_none() {
-                    text::READY
-                } else {
-                    text::scan_state(state)
-                };
-                // Ready describes an idle producer, never the completeness of its metadata.
-                let master = match state {
-                    logic::ScanState::Finished
-                        if !stopping && self.preparation.is_none() && !self.resolution.active() =>
+        let state = logic::scan_state(
+            self.receiver.is_some(),
+            self.cancelled,
+            self.reducer.terminal(),
+        );
+        let stopping = !self.pending_producers.is_empty()
+            || !self.pending_rereads.is_empty()
+            || self.closing
+            || (self.cancelled && self.producer.is_some())
+            || (self.preparation.is_some() && self.cancellation.is_cancelled());
+        let lifecycle = if self.resolution.active() && !stopping {
+            if self.cancelled {
+                text::STOPPING
+            } else {
+                text::RESOLVING_CONFLICTS
+            }
+        } else if stopping {
+            text::STOPPING
+        } else if self.preparation.is_some() {
+            text::PREPARING_SCAN
+        } else if self.scan_started.is_none() {
+            text::READY
+        } else {
+            text::scan_state(state)
+        };
+        // Ready describes an idle producer, never the completeness of its metadata.
+        let master = match state {
+            logic::ScanState::Finished
+                if !stopping && self.preparation.is_none() && !self.resolution.active() =>
+            {
+                text::READY
+            }
+            _ => lifecycle,
+        };
+        let key = StatusKey {
+            version: self.version,
+            revision: self.resolution_revision,
+            metric: self.metric,
+            location: self.history.current(),
+            selected: self.selected,
+            shown: self.cache.as_ref().map(|cache| cache.key.clone()),
+            elapsed: self.scan_elapsed.as_secs(),
+            lifecycle,
+            phase: std::mem::discriminant(&self.resolution),
+            candidates: match &self.resolution {
+                ConflictResolution::Preparing(_, plan) => plan.candidate_count(),
+                _ => 0,
+            },
+            terminal: self.reducer.terminal(),
+            observed: self.volume_evidence.is_some(),
+            detail: self.detail,
+            viewport: ui.available_size(),
+        };
+        let layout_error = self
+            .current_layout_failure()
+            .map(|failure| failure.message.as_str());
+        if self.status_cache.as_ref().is_none_or(|cache| {
+            let urgent = cache.key.immediate_change(&key)
+                || cache.error.as_deref() != self.error.as_deref()
+                || cache.layout_error.as_deref() != layout_error;
+            urgent || (cache.key != key && cache.updated_at.elapsed() >= STATUS_INTERVAL)
+        }) {
+            let (master, readout, brief, detail) = if let Some(index) = self.reducer.index() {
+                let totals = logic::metric_totals(index, self.metric);
+                let location = match &self.cache {
+                    Some(cache)
+                        if cache.key.metric == self.metric
+                            && cache.key.location == key.location =>
                     {
-                        text::READY
+                        cache.location_label.clone()
                     }
-                    _ => lifecycle,
-                };
-                if let Some(index) = self.reducer.index() {
-                    let totals = logic::metric_totals(index, self.metric);
-                    let location = match &self.cache {
-                        Some(cache) if cache.key.metric == self.metric => {
-                            cache.location_label.clone()
-                        }
-                        // A metric chosen in this frame is laid out after the status is drawn;
-                        // caption the members for the new metric instead of repeating the old one.
-                        Some(_) => {
-                            let current = self.history.current();
-                            let members = current.resolve(index).and_then(|(_, members)| members);
-                            text::location(
-                                &entry_name(index, index.root()),
-                                &current.path,
-                                subset_caption(&current, members.as_deref(), self.metric),
-                            )
-                        }
-                        None => text::location(
+                    // A metric chosen in this frame is laid out after the status is drawn;
+                    // caption the members for the new metric instead of repeating the old one.
+                    Some(_) => {
+                        let current = self.history.current();
+                        let members = current.resolve(index).and_then(|(_, members)| members);
+                        text::location(
                             &entry_name(index, index.root()),
-                            &self.history.current().path,
-                            None,
-                        ),
-                    };
-                    let mut detail =
-                        text::status(lifecycle, &location, &totals, self.reducer.diagnostics());
-                    if let Some(report) = &self.scan_report {
-                        detail.push('\n');
-                        detail.push_str(&text::scan_report(report));
+                            &current.path,
+                            subset_caption(&current, members.as_deref(), self.metric),
+                        )
                     }
-                    let composition = self.composition();
-                    let composition_status = text::composition_status(
-                        &composition,
-                        index.summary_for(SizeMetric::Allocated).ok(),
-                    );
+                    None => text::location(
+                        &entry_name(index, index.root()),
+                        &self.history.current().path,
+                        None,
+                    ),
+                };
+                let mut detail =
+                    text::status(lifecycle, &location, &totals, self.reducer.diagnostics());
+                if let Some(report) = &self.scan_report {
                     detail.push('\n');
-                    detail.push_str(&composition_status);
-                    detail.push('\n');
-                    detail.push_str(&self.resolution_status());
-                    if let Some(observations) = &self.observations {
-                        detail.push('\n');
-                        detail.push_str(&text::observation_detail(observations));
-                    }
-                    if let Some(error) = &self.error {
-                        detail.push('\n');
-                        detail.push_str(error);
-                    }
-                    if let Some(failure) = self.current_layout_failure() {
-                        detail.push('\n');
-                        detail.push_str(&failure.message);
-                    }
-                    // Count what the snapshot actually holds. The producer's coalescable progress
-                    // events are dropped under backpressure, which showed "0 entries seen" beside a
-                    // map already holding gigabytes.
-                    let seen = self.reducer.index().map_or(0, |index| index.len());
-                    let master = text::master_status(master, seen, &totals, self.scan_elapsed);
-                    let master = format!("{master} · {}", text::completeness(&totals));
-                    let accessible = format!("{master}\n{detail}");
-                    let status = ui.add(egui::Label::new(master).truncate());
-                    status.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible)
-                    });
-                    status.on_hover_text(&detail);
-                    ui.label(text::ACCOUNTING_NOTE).on_hover_text(&detail);
-                    let selected = self
-                        .cache
-                        .as_ref()
-                        .filter(|cache| cache.key.metric == self.metric)
-                        .and_then(|cache| cache.selection_readout.as_ref())
-                        .filter(|(node, _)| Some(*node) == self.selected)
-                        .map(|(_, label)| label.as_str());
-                    let readout = selected.unwrap_or(&location);
-                    let response = ui.add(egui::Label::new(readout).truncate());
-                    response.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, readout)
-                    });
-                    response.on_hover_text(readout);
-                } else {
-                    let detail = self
-                        .scan_report
-                        .as_ref()
-                        .map(text::scan_report)
-                        .unwrap_or_else(|| master.to_owned());
-                    let accessible = format!("{master}\n{detail}");
-                    let status = ui.label(master);
-                    status.widget_info(|| {
-                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &accessible)
-                    });
-                    status.on_hover_text(&detail);
-                    ui.label(text::ACCOUNTING_NOTE);
-                    ui.label(
-                        egui::RichText::new(if let Some(error) = &self.error {
-                            error.as_str()
-                        } else if self.scan_started.is_some() {
-                            text::WAITING
-                        } else {
-                            text::NO_SCAN
-                        })
-                        .small(),
-                    );
+                    detail.push_str(&text::scan_report(report));
                 }
+                let composition = self.composition();
+                let composition_status = text::composition_status(
+                    &composition,
+                    index.summary_for(SizeMetric::Allocated).ok(),
+                );
+                detail.push('\n');
+                detail.push_str(&composition_status);
+                detail.push('\n');
+                detail.push_str(&self.visible_composition(&composition).detail);
+                detail.push('\n');
+                detail.push_str(&self.resolution_status());
+                if let Some(observations) = &self.observations {
+                    detail.push('\n');
+                    detail.push_str(&text::observation_detail(observations));
+                }
+                if let Some(error) = &self.error {
+                    detail.push('\n');
+                    detail.push_str(error);
+                }
+                if let Some(failure) = self.current_layout_failure() {
+                    detail.push('\n');
+                    detail.push_str(&failure.message);
+                }
+                // Count what the snapshot actually holds. The producer's coalescable progress
+                // events are dropped under backpressure, which showed "0 entries seen" beside a
+                // map already holding gigabytes.
+                let seen = self.reducer.index().map_or(0, |index| index.len());
+                detail = format!(
+                    "{}\n{}\n{detail}",
+                    text::master_status(master, seen, &totals, self.scan_elapsed),
+                    text::ACCOUNTING_NOTE
+                );
+                let bytes = totals
+                    .as_ref()
+                    .ok()
+                    .and_then(|summary| {
+                        summary
+                            .apparent_bytes()
+                            .ok()
+                            .map(|bytes| text::size(bytes, !summary.complete))
+                    })
+                    .unwrap_or_else(|| "Size unavailable".into());
+                let seconds = self.scan_elapsed.as_secs();
+                let master = format!(
+                    "{master} · {seen} entries · {bytes} · {} · {}:{:02} elapsed",
+                    text::completeness(&totals),
+                    seconds / 60,
+                    seconds % 60
+                );
+                let selected = self
+                    .cache
+                    .as_ref()
+                    .filter(|cache| cache.key.metric == self.metric)
+                    .and_then(|cache| cache.selection_readout.as_ref())
+                    .filter(|(node, _)| Some(*node) == self.selected)
+                    .map(|(_, label)| label.as_str());
+                let readout = selected.unwrap_or(&location).to_owned();
+                let brief = self
+                    .selected
+                    .and_then(|node| {
+                        self.cache.as_ref().and_then(|cache| {
+                            cache
+                                .layout
+                                .placed
+                                .iter()
+                                .find(|cell| cell.node == node)
+                                .map(|cell| {
+                                    let name = match node {
+                                        NodeRef::Entry(id) => entry_name(index, id),
+                                        NodeRef::Aggregate { .. } => {
+                                            text::aggregate_name(cell.members.len())
+                                        }
+                                    };
+                                    let open = if cell.header.is_some()
+                                        || matches!(node, NodeRef::Aggregate { .. })
+                                    {
+                                        " · Double-click to open"
+                                    } else {
+                                        ""
+                                    };
+                                    format!(
+                                        "Selected: {name} · {}{open}",
+                                        text::size(cell.known_sum, cell.has_unknown)
+                                    )
+                                })
+                        })
+                    })
+                    .unwrap_or_default();
+                (master, readout, brief, detail)
+            } else {
+                let detail = self
+                    .scan_report
+                    .as_ref()
+                    .map(text::scan_report)
+                    .unwrap_or_else(|| master.to_owned());
+                let readout = self
+                    .error
+                    .as_deref()
+                    .unwrap_or(if self.scan_started.is_some() {
+                        text::WAITING
+                    } else {
+                        text::NO_SCAN
+                    })
+                    .to_owned();
+                (
+                    master.to_owned(),
+                    readout.clone(),
+                    readout,
+                    format!("{}\n{detail}", text::ACCOUNTING_NOTE),
+                )
+            };
+            let accessible = format!("{master}\n{readout}\n{detail}");
+            let width = ui
+                .painter()
+                .layout_no_wrap(
+                    master.clone(),
+                    egui::FontId::proportional(12.0),
+                    ui.visuals().text_color(),
+                )
+                .size()
+                .x
+                + 12.0;
+            self.status_cache = Some(StatusCache {
+                key,
+                error: self.error.clone(),
+                layout_error: layout_error.map(str::to_owned),
+                master,
+                readout,
+                brief,
+                detail,
+                accessible,
+                width,
+                updated_at: Instant::now(),
+            });
+        }
+        let data = self.status_cache.as_ref().unwrap();
+        egui::Panel::bottom("status")
+            .exact_size(24.0)
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 3)))
+            .show(ui, |ui| {
+                ui.style_mut().override_font_id = Some(egui::FontId::proportional(12.0));
+                ui.horizontal(|ui| {
+                    let width = data.width.min(ui.available_width() * 0.58);
+                    let status = ui.add_sized(
+                        egui::vec2(width, 18.0),
+                        egui::Label::new(&data.master).truncate(),
+                    );
+                    status.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &data.accessible)
+                    });
+                    if status.hovered() {
+                        status.on_hover_text(&data.detail);
+                    }
+                    ui.separator();
+                    let selected = ui.add_sized(
+                        egui::vec2(ui.available_width(), 18.0),
+                        egui::Label::new(&data.brief).truncate(),
+                    );
+                    selected.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &data.readout)
+                    });
+                    if selected.hovered() {
+                        selected.on_hover_text(&data.readout);
+                    }
+                });
             });
     }
 
     fn volume_header(&self, ui: &mut egui::Ui) {
         let palette = Theme::current(ui.ctx()).palette();
         egui::Panel::top("volume-header")
-            .exact_size(32.0)
+            .exact_size(20.0)
             .frame(
                 egui::Frame::new()
                     .fill(palette.volume_header)
-                    .inner_margin(egui::Margin::symmetric(8, 4)),
+                    .inner_margin(egui::Margin::symmetric(8, 2)),
             )
             .show(ui, |ui| {
                 ui.visuals_mut().override_text_color = Some(palette.volume_text);
                 ui.horizontal(|ui| {
                     let (icon_rect, _) =
-                        ui.allocate_exact_size(egui::vec2(24.0, 24.0), egui::Sense::hover());
+                        ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
                     icons::draw(
                         ui.painter(),
                         icons::Icon::Drive,
                         icon_rect.center(),
-                        22.0,
+                        14.0,
                         palette.volume_text,
                     );
                     let root = self
@@ -1261,7 +1569,7 @@ impl HogMap {
                         .painter()
                         .layout_no_wrap(
                             capacity.clone(),
-                            egui::FontId::proportional(13.0),
+                            egui::FontId::monospace(13.0),
                             palette.volume_text,
                         )
                         .size()
@@ -1269,7 +1577,7 @@ impl HogMap {
                     ui.add_sized(
                         egui::vec2(
                             (ui.available_width() - capacity_width - 16.0).max(64.0),
-                            24.0,
+                            16.0,
                         ),
                         egui::Label::new(egui::RichText::new(&root).strong()).truncate(),
                     )
@@ -1280,7 +1588,7 @@ impl HogMap {
                             .and_then(|volume| volume.capacity.as_ref()),
                         std::time::SystemTime::now(),
                     );
-                    let response = ui.label(&capacity);
+                    let response = ui.label(egui::RichText::new(&capacity).monospace());
                     response.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Label,
@@ -1310,67 +1618,82 @@ impl HogMap {
             );
             return;
         };
-        let evaluation = self.composition();
-        let allocated = index.summary_for(SizeMetric::Allocated).ok();
-        let apparent = allocated.and_then(|summary| summary.apparent_bytes().ok());
-        // D can remain known when apparent geometry overflows; never draw volume cells
-        // against an unrepresentable tree total or substitute zero for that total.
-        let components = if apparent.is_some() {
-            evaluation.components
-        } else {
-            Default::default()
-        };
-        let (tree_area, volume_cells) =
-            composition::arrange(area, apparent.unwrap_or(0), components);
-        composition::draw(
-            ui,
-            palette,
-            &volume_cells,
-            &text::composition_status(&evaluation, allocated),
-        );
-        let rect = Rect::new(
-            tree_area.min.x,
-            tree_area.min.y,
-            tree_area.width(),
-            tree_area.height(),
-        );
-        if rect.width <= 1.0 || rect.height <= 1.0 {
-            return;
-        }
-        let key = ViewKey {
+        let rect = Rect::new(area.min.x, area.min.y, area.width(), area.height());
+        let mut key = ViewKey {
             version: self.version,
             resolution_revision: self.resolution_revision,
             location: self.history.current(),
             rect,
             metric: self.metric,
+            detail: self.detail,
         };
-        let shown = self
-            .cache
-            .as_ref()
-            .map(|cache| &cache.key)
-            .or(self.layout_failure.as_ref().map(|failure| &failure.key));
+        let shown = self.volume_map.as_ref().map(|map| &map.key);
         let dirty = shown != Some(&key);
         // The scan throttle limits growth updates; it never keeps the previous metric's cells on
         // screen once the other metric is chosen, so an explicit switch rebuilds at once.
-        let switched = shown.is_some_and(|shown| shown.metric != key.metric);
+        let switched = shown.is_some_and(|shown| {
+            shown.metric != key.metric
+                || shown.location != key.location
+                || shown.rect != key.rect
+                || shown.detail != key.detail
+        });
         let due = self.last_layout.is_none_or(|last| {
             last.elapsed() >= LAYOUT_INTERVAL.max(self.last_layout_cost.saturating_mul(4))
         });
+        let mut rebuild_started = None;
         if dirty && (self.receiver.is_none() || due || switched) {
-            let rebuild_started = Instant::now();
+            rebuild_started = Some(Instant::now());
+            let evaluation = self.composition();
+            let visible = self.visible_composition(&evaluation);
+            let allocated = index.summary_for(SizeMetric::Allocated).ok();
+            let apparent = index
+                .summary_for(self.metric)
+                .ok()
+                .and_then(|summary| summary.apparent_bytes().ok());
+            let detail = format!(
+                "{}\n{}",
+                visible.detail,
+                text::composition_status(&evaluation, allocated)
+            );
+            let (tree_area, volume_cells) = composition::arrange(
+                area,
+                apparent.unwrap_or(0),
+                visible.components,
+                visible.pending_bytes,
+                &detail,
+            );
+            self.volume_map = Some(VolumeMap {
+                key: key.clone(),
+                cells: volume_cells,
+            });
+            let rect = Rect::new(
+                tree_area.min.x,
+                tree_area.min.y,
+                tree_area.width(),
+                tree_area.height(),
+            );
+            key.rect = rect;
+            if rect.width <= 1.0 || rect.height <= 1.0 {
+                self.cache = None;
+                composition::draw(ui, palette, &mut self.volume_map.as_mut().unwrap().cells);
+                self.last_layout = Some(Instant::now());
+                self.last_layout_cost = rebuild_started.unwrap().elapsed();
+                return;
+            }
             let location = &key.location;
             // Resolve components against this generation; a missing path during rescan shows the
             // root temporarily, without replacing the history entry before its parent arrives.
             let (root, members) = location.resolve(index).unwrap_or((index.root(), None));
             let content_area = rect.area().max(1.0);
-            let min_area = members.as_ref().map_or(400.0, |members| {
+            let minimum = DETAIL_AREAS[self.detail];
+            let min_area = members.as_ref().map_or(minimum, |members| {
                 // At least one member must escape the next aggregate, even on a tiny viewport.
-                (content_area / (members.len().max(1) as f32 * 4.0)).clamp(0.001, 400.0)
+                (content_area / (members.len().max(1) as f32 * 4.0)).clamp(0.001, minimum)
             });
             let params = LayoutParams {
                 min_pixel_area: min_area,
                 header_height: 20.0,
-                max_depth: MAP_MAX_DEPTH,
+                max_depth: SAFETY_DEPTH,
             };
             let subset = members.as_deref().filter(|members| !members.is_empty());
             let caption = subset_caption(location, subset, self.metric);
@@ -1391,7 +1714,6 @@ impl HogMap {
             // only its highlight results can carry over.
             let previous = self.cache.take();
             self.layout_failure = None;
-            self.last_layout = Some(Instant::now());
             if switched {
                 self.selected = logic::retained_selection(
                     self.selected,
@@ -1401,7 +1723,7 @@ impl HogMap {
             }
             match result {
                 Ok(layout) => {
-                    let cells = paint::prepare(ui, index, &layout, caption, self.metric);
+                    // Labels and meshes share a font/atlas stamp, prepared once below.
                     // Highlight decisions depend on the snapshot and the filter, not on the
                     // metric or the location, so they are reused while both are unchanged.
                     let (matches, match_counts) = match previous {
@@ -1421,11 +1743,12 @@ impl HogMap {
                     self.cache = Some(Cache {
                         key,
                         layout,
-                        cells,
+                        cells: Vec::new(),
                         matches,
                         match_counts,
                         location_label,
                         selection_readout: None,
+                        paint: None,
                     });
                     self.filter_changed = false;
                 }
@@ -1441,9 +1764,10 @@ impl HogMap {
                     });
                 }
             }
-            // Keep scan-time rebuild work near a quarter of the interval when a frame is
-            // expensive. Navigation after completion and metric switches stay immediate.
-            self.last_layout_cost = rebuild_started.elapsed();
+            // The cost is recorded after labels and meshes below, not just the layout pass.
+        }
+        if let Some(map) = &mut self.volume_map {
+            composition::draw(ui, palette, &mut map.cells);
         }
         if self.filter_changed
             && let Some(cache) = &mut self.cache
@@ -1451,9 +1775,12 @@ impl HogMap {
             let results = self.filter.match_results(index);
             cache.matches = results.matches;
             cache.match_counts = (results.matched_files, results.unknown_files);
+            if let Some(paint) = &mut cache.paint {
+                paint.invalidate();
+            }
             self.filter_changed = false;
         }
-        let Some(cache) = &self.cache else {
+        let Some(cache) = &mut self.cache else {
             if let Some(failure) = &self.layout_failure {
                 ui.painter().text(
                     area.center(),
@@ -1463,8 +1790,25 @@ impl HogMap {
                     palette.message,
                 );
             }
+            if let Some(started) = rebuild_started {
+                self.last_layout_cost = started.elapsed();
+                self.last_layout = Some(Instant::now());
+            }
             return;
         };
+        let tree_area = paint::rect(cache.key.rect);
+        let probe = paint::font_probe(ui);
+        if cache
+            .paint
+            .as_ref()
+            .is_none_or(|paint| !paint.font_matches(ui, &probe))
+        {
+            let location = &cache.key.location;
+            let members = location.resolve(index).and_then(|(_, members)| members);
+            let caption = subset_caption(location, members.as_deref(), self.metric);
+            cache.cells = paint::prepare(ui, index, &cache.layout, caption, self.metric);
+            cache.paint = None;
+        }
         // The cell controls below cover the map, so its own response is not hovered; ask whether
         // the pointer is over the map layer instead.
         let pointed = ui
@@ -1472,24 +1816,13 @@ impl HogMap {
             .pointer_hover_pos()
             .filter(|_| ui.rect_contains_pointer(area))
             .and_then(|position| logic::hit_test(&cache.layout, position.x, position.y));
-        paint::draw(
-            ui,
-            palette,
-            &cache.layout,
-            &cache.cells,
-            &cache.matches,
-            (self.selected, pointed),
-            &mut self.paint_dashes,
-        );
-        if cache.layout.known_sum == 0 {
-            ui.painter().text(
-                tree_area.center(),
-                egui::Align2::CENTER_CENTER,
+        let empty_label = (cache.layout.known_sum == 0).then(|| {
+            ui.painter().layout_no_wrap(
                 text::empty_map(cache.key.metric),
                 egui::FontId::proportional(13.0),
                 palette.message,
-            );
-        }
+            )
+        });
         let hovered = response
             .hover_pos()
             .and_then(|position| logic::hit_test(&cache.layout, position.x, position.y));
@@ -1499,6 +1832,7 @@ impl HogMap {
                 .on_hover_text(&cache.cells[hovered].tooltip);
         }
         let mut zoom = None;
+        let mut focused = None;
         for (position, cell) in cache.layout.placed.iter().enumerate() {
             let interactive = paint::rect(cell.header.unwrap_or(cell.rect));
             let control = ui.interact(
@@ -1506,9 +1840,11 @@ impl HogMap {
                 ui.id().with(("cell", position)),
                 egui::Sense::click(),
             );
-            control
-                .clone()
-                .on_hover_text(&cache.cells[position].tooltip);
+            if control.hovered() {
+                control
+                    .clone()
+                    .on_hover_text(&cache.cells[position].tooltip);
+            }
             control.widget_info(|| {
                 egui::WidgetInfo::selected(
                     egui::WidgetType::Button,
@@ -1518,7 +1854,7 @@ impl HogMap {
                 )
             });
             if control.has_focus() {
-                paint::focus_ring(ui.painter(), interactive, palette);
+                focused = Some(interactive);
             }
             if control.clicked() {
                 self.selected = Some(cell.node);
@@ -1537,18 +1873,63 @@ impl HogMap {
                 zoom = Some(cache.layout.placed[position].node);
             }
         }
+        // Tooltips above may add glyphs. Tessellate only after they settle the font atlas;
+        // floating dialogs drawn later use the uncached painter to keep their first frame safe.
+        if self.chooser.open || self.about {
+            paint::draw(
+                ui.painter(),
+                palette,
+                &cache.layout,
+                &cache.cells,
+                &cache.matches,
+                (self.selected, pointed),
+                &mut self.paint_dashes,
+            );
+        } else {
+            if cache
+                .paint
+                .as_ref()
+                .is_none_or(|paint| !paint.valid(ui, &probe))
+            {
+                cache.paint = Some(paint::CachedMap::build(
+                    ui,
+                    &cache.layout,
+                    &cache.cells,
+                    &cache.matches,
+                    &mut self.paint_dashes,
+                    probe,
+                ));
+                self.paint_rebuilds += 1;
+            }
+            cache.paint.as_ref().unwrap().draw(ui);
+            paint::draw_interaction(
+                ui.painter(),
+                palette,
+                &cache.layout,
+                (self.selected, pointed),
+            );
+        }
+        if let Some(label) = empty_label {
+            ui.painter().galley(
+                tree_area.center() - label.size() / 2.0,
+                label,
+                palette.message,
+            );
+        }
+        if let Some(area) = focused {
+            paint::focus_ring(ui.painter(), area, palette);
+        }
+        if let Some(started) = rebuild_started {
+            // Include label preparation and mesh tessellation in the adaptive scan backoff.
+            self.last_layout_cost = started.elapsed();
+            self.last_layout = Some(Instant::now());
+        }
         if let Some(node) = zoom {
             self.zoom(node);
         }
     }
-}
 
-impl eframe::App for HogMap {
-    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
-        self.drain(context);
-    }
-
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    pub(crate) fn render(&mut self, ui: &mut egui::Ui) {
         let context = ui.ctx().clone();
         // Applying a menu choice here keeps the whole frame on one palette; applying it inside
         // `controls` would leave the menu and the top panel on the previous one.
@@ -1614,6 +1995,22 @@ impl eframe::App for HogMap {
                     ui.label(about);
                 });
         }
+        if self.receiver.is_some() || self.work_pending() {
+            let delay = self.last_tick.map_or(FRAME_INTERVAL, |last| {
+                FRAME_INTERVAL.saturating_sub(last.elapsed())
+            });
+            context.request_repaint_after(delay.max(Duration::from_millis(1)));
+        }
+    }
+}
+
+impl eframe::App for HogMap {
+    fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        self.drain(context);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.render(ui);
     }
 
     fn persist_egui_memory(&self) -> bool {
@@ -1791,9 +2188,9 @@ mod tests {
             index.root(),
             cache.key.rect,
             LayoutParams {
-                min_pixel_area: 400.0,
+                min_pixel_area: DETAIL_AREAS[app.detail],
                 header_height: 20.0,
-                max_depth: MAP_MAX_DEPTH,
+                max_depth: SAFETY_DEPTH,
             },
             SizeMetric::Allocated,
         )
@@ -1850,7 +2247,7 @@ mod tests {
             LayoutParams {
                 min_pixel_area: 1.0,
                 header_height: 20.0,
-                max_depth: MAP_MAX_DEPTH,
+                max_depth: SAFETY_DEPTH,
             },
             SizeMetric::Allocated,
         )
@@ -1914,6 +2311,7 @@ mod tests {
             label: "old".into(),
             free_bytes: Some(1),
             total_bytes: Some(2),
+            storage_reserve_bytes: None,
             capacity: None,
         });
         app.metric = SizeMetric::Allocated;

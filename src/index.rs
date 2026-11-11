@@ -194,7 +194,7 @@ pub struct Index {
     names: NameArena,
     identities: Vec<StoredIdentity>,
     totals: FileTotals,
-    identity_charges: HashMap<StoredIdentity, IdentityCharge>,
+    identity_charges: IdentityCharges,
     authoritative_sizes: HashMap<StoredIdentity, Sizes>,
     // Only conflicts retain a representative listed name; ordinary entries do not grow.
     conflict_names: HashMap<StoredIdentity, EntryId>,
@@ -222,7 +222,7 @@ impl Index {
             names,
             identities: Vec::new(),
             totals: FileTotals::default(),
-            identity_charges: HashMap::new(),
+            identity_charges: IdentityCharges::default(),
             authoritative_sizes: HashMap::new(),
             conflict_names: HashMap::new(),
             conflicting_identity_count: 0,
@@ -253,13 +253,9 @@ impl Index {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
                 .map_or(0, |cache| cache.memory_bytes()),
-            charged_identity_bytes: hash_bytes::<(StoredIdentity, IdentityCharge)>(
-                self.identity_charges.capacity(),
-            ) + hash_bytes::<(StoredIdentity, Sizes)>(
-                self.authoritative_sizes.capacity(),
-            ) + hash_bytes::<(StoredIdentity, EntryId)>(
-                self.conflict_names.capacity(),
-            ),
+            charged_identity_bytes: self.identity_charges.memory_bytes()
+                + hash_bytes::<(StoredIdentity, Sizes)>(self.authoritative_sizes.capacity())
+                + hash_bytes::<(StoredIdentity, EntryId)>(self.conflict_names.capacity()),
         }
     }
 
@@ -387,7 +383,7 @@ impl Index {
             accumulate(&mut totals.unique_bytes, bytes, &mut totals.overflowed);
             return false;
         };
-        let charge = self.identity_charges.entry(identity.into()).or_default();
+        let charge = self.identity_charges.charge_mut(identity.into());
         let was_conflicted = charge.logical.conflicted || charge.allocated.conflicted;
         let sample = charge.for_metric_mut(metric);
         let mut new_identity_conflict = false;
@@ -410,12 +406,16 @@ impl Index {
 
     /// Each still-conflicting identity once, regardless of which metrics disagree.
     pub fn conflicting_identities(&self) -> impl Iterator<Item = FileIdentity> + '_ {
-        self.identity_charges
+        let mut identities: Vec<FileIdentity> = self
+            .identity_charges
             .iter()
             .filter_map(|(identity, charge)| {
                 (charge.logical.conflicted || charge.allocated.conflicted)
                     .then_some((*identity).into())
             })
+            .collect();
+        identities.sort_unstable_by_key(|identity| (identity.volume, identity.file));
+        identities.into_iter()
     }
 
     /// Constant-time count of the union of unresolved logical/allocated identities.
@@ -426,9 +426,14 @@ impl Index {
     /// At most MAX_CONFLICT_REREADS listed names, selected when an identity first disagrees.
     /// Selection is not a promise to retain its first listed hardlink or retry another name.
     pub fn conflict_candidates(&self) -> impl Iterator<Item = (FileIdentity, EntryId)> + '_ {
-        self.conflict_names
+        let mut candidates: Vec<(FileIdentity, EntryId)> = self
+            .conflict_names
             .iter()
             .map(|(identity, id)| ((*identity).into(), *id))
+            .collect();
+        candidates
+            .sort_unstable_by_key(|(identity, id)| (identity.volume, identity.file, id.position()));
+        candidates.into_iter()
     }
 
     /// Apply verified handle sizes after the producer has finished. Listed records and their
@@ -546,6 +551,10 @@ impl Index {
 
     pub(crate) fn has_authoritative_sizes(&self) -> bool {
         !self.authoritative_sizes.is_empty()
+    }
+
+    pub(crate) fn all_entries_complete(&self) -> bool {
+        self.incomplete_entries == 0
     }
 
     pub fn len(&self) -> usize {
@@ -742,6 +751,49 @@ struct MetricCharge {
 struct IdentityCharge {
     logical: MetricCharge,
     allocated: MetricCharge,
+}
+
+type ChargeShard = HashMap<
+    StoredIdentity,
+    IdentityCharge,
+    std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>,
+>;
+
+/// Bound individual rehash work instead of moving the entire identity table in one UI tick.
+/// Identities come from the trusted filesystem worker, not arbitrary network/IPC input. Fixed
+/// std hashers reproduce lookup behaviour; callers sort observable conflict lists explicitly.
+#[derive(Debug)]
+struct IdentityCharges([ChargeShard; 64]);
+impl Default for IdentityCharges {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| ChargeShard::default()))
+    }
+}
+impl IdentityCharges {
+    fn slot(key: &StoredIdentity) -> usize {
+        let mixed = key.low ^ key.high.rotate_left(23) ^ key.volume.rotate_left(11);
+        (mixed.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize
+    }
+    fn charge_mut(&mut self, key: StoredIdentity) -> &mut IdentityCharge {
+        self.0[Self::slot(&key)].entry(key).or_default()
+    }
+    fn get(&self, key: &StoredIdentity) -> Option<&IdentityCharge> {
+        self.0[Self::slot(key)].get(key)
+    }
+    fn get_mut(&mut self, key: &StoredIdentity) -> Option<&mut IdentityCharge> {
+        self.0[Self::slot(key)].get_mut(key)
+    }
+    fn iter(&self) -> impl Iterator<Item = (&StoredIdentity, &IdentityCharge)> {
+        self.0.iter().flat_map(|shard| shard.iter())
+    }
+    fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self
+                .0
+                .iter()
+                .map(|shard| hash_bytes::<(StoredIdentity, IdentityCharge)>(shard.capacity()))
+                .sum::<usize>()
+    }
 }
 
 impl IdentityCharge {

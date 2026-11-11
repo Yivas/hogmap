@@ -49,6 +49,10 @@ pub const HOME_TIP: &str = "Home · Alt+Home";
 pub const RESCAN_TIP: &str = "Rescan selected scan root or sample · F5";
 pub const STOP_TIP: &str = "Stop scan or hard-link checks · Esc";
 pub const HIGHLIGHT_TIP: &str = "Focus highlight filter · Ctrl+F";
+pub const MORE_DETAIL: &str = "More detail";
+pub const LESS_DETAIL: &str = "Less detail";
+pub const MORE_DETAIL_TIP: &str = "More detail: smaller minimum cells · Ctrl++ or Ctrl+=";
+pub const LESS_DETAIL_TIP: &str = "Less detail: larger minimum cells · Ctrl+-";
 pub const EXIT: &str = "Exit";
 pub const VIEW: &str = "View";
 pub const ZOOM_IN: &str = "Zoom into selection";
@@ -111,7 +115,7 @@ pub fn empty_map(metric: SizeMetric) -> String {
 
 pub fn about(metric: SizeMetric) -> String {
     format!(
-        "Read-only Windows folder and drive scanning. No release yet.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt a finished whole-volume root in Allocated size, independently known Free space and Reserved by Windows cells share the scanned tree's byte scale. They have no file actions. The map is not a complete disk partition: estimated difference is diagnostic text only, never an inaccessible-space block.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
+        "Read-only Windows folder and drive scanning. No release yet.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt an unzoomed whole-volume root, independently known Free space is drawn in either size view, during scanning and after eligible final observations. Running capacity is provisional; Not yet scanned · estimate is a residual, not measured inaccessible space. Logical tree bytes and volume-capacity bytes are comparable only in order of magnitude. Reserved by Windows retains its allocated/Finished gates. These cells have no file actions. The map is not a complete disk partition: final estimated difference is diagnostic text only, never an inaccessible-space block. More/Less detail changes minimum cell area with a safety depth bound; it is not saved.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
         metric_bytes(metric)
     )
 }
@@ -673,7 +677,7 @@ pub fn volume_cell_detail(
         }
     };
     format!(
-        "{} ({bytes} B)\n{meaning} Final origin-bound capacity observation.\nNot a file; no file actions.\n{detail}",
+        "{} ({bytes} B)\n{meaning} Capture timing and eligibility are stated below.\nNot a file; no file actions.\n{detail}",
         volume_cell(part, bytes)
     )
 }

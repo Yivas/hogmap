@@ -7,6 +7,65 @@ use hogmap::volume::*;
 use std::sync::mpsc::channel;
 use std::time::SystemTime;
 
+#[test]
+fn provisional_reserve_uses_the_same_capacity_sample_without_assuming_unknown_zero() {
+    let mut drive = dialog::DriveChoice {
+        root: r"C:\".into(),
+        label: "Synthetic".into(),
+        total_bytes: Some(1000),
+        free_bytes: Some(200),
+        storage_reserve_bytes: Some(100),
+        capacity: None,
+    };
+    let visible = composition::visible(
+        CompositionView {
+            metric: SizeMetric::Allocated,
+            unzoomed: true,
+            finished: false,
+        },
+        true,
+        Some(std::path::Path::new(r"C:\")),
+        Some(&drive),
+        None,
+        VolumeComponents::default(),
+        Some(300),
+    );
+    assert_eq!(visible.components.free_bytes, Some(200));
+    assert_eq!(visible.pending_bytes, Some(400), "1000 - 200 - 100 - 300");
+    assert!(
+        visible
+            .detail
+            .contains("same capacity reading at scan start")
+    );
+    for (reserve, tree, pending, explanation) in [
+        (None, 300, Some(500), "Storage reserve is unknown"),
+        (Some(0), 300, Some(500), "same capacity reading"),
+        (Some(100), 700, None, "No positive drawable estimate"),
+        (Some(100), 800, None, "No positive drawable estimate"),
+    ] {
+        drive.storage_reserve_bytes = reserve;
+        let result = composition::visible(
+            CompositionView {
+                metric: SizeMetric::Logical,
+                unzoomed: true,
+                finished: false,
+            },
+            true,
+            Some(std::path::Path::new(r"C:\")),
+            Some(&drive),
+            None,
+            VolumeComponents::default(),
+            Some(tree),
+        );
+        assert_eq!(result.pending_bytes, pending);
+        assert_eq!(result.components.free_bytes, Some(200));
+        assert!(result.detail.contains(explanation), "{}", result.detail);
+        if reserve == Some(0) {
+            assert!(!result.detail.contains("Storage reserve is unknown"));
+        }
+    }
+}
+
 fn facts() -> VolumeEvidence {
     let sample = |free| OriginCapacitySample {
         total_bytes: Some(1200),
@@ -33,9 +92,8 @@ fn facts() -> VolumeEvidence {
     }
 }
 fn app(context: &egui::Context) -> HogMap {
-    let mut app = HogMap::with_context(context.clone());
     let generation = ScanGeneration::new(25);
-    app.reducer = ScanReducer::new(generation);
+    let mut app = HogMap::with_reducer(context.clone(), ScanReducer::new(generation));
     let mut batch = Batch::new();
     for (key, parent, name, kind, allocated) in [
         (1, None, "Synthetic", Kind::Directory, None),
@@ -105,6 +163,435 @@ fn frame(
     });
     (output, area, id)
 }
+fn desktop_frame(
+    context: &egui::Context,
+    app: &mut HogMap,
+    size: egui::Vec2,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+            events,
+            ..Default::default()
+        },
+        |ui| app.render(ui),
+    )
+}
+
+#[test]
+fn status_progress_is_coalesced_but_errors_terminal_and_selection_are_immediate() {
+    let context = egui::Context::default();
+    let mut app = app(&context);
+    let status_frame = |app: &mut HogMap| {
+        let _ = context.run_ui(egui::RawInput::default(), |ui| app.status(ui));
+    };
+    status_frame(&mut app);
+    let initial = app.status_cache.as_ref().unwrap().key.version;
+    assert_eq!(app.status_cache.as_ref().unwrap().brief, "");
+    assert_eq!(app.status_cache.as_ref().unwrap().readout, "Synthetic");
+    app.version += 1;
+    app.scan_elapsed = Duration::from_secs(61);
+    status_frame(&mut app);
+    assert_eq!(app.status_cache.as_ref().unwrap().key.version, initial);
+    app.status_cache.as_mut().unwrap().updated_at = Instant::now() - STATUS_INTERVAL;
+    status_frame(&mut app);
+    assert_eq!(app.status_cache.as_ref().unwrap().key.version, initial + 1);
+    assert!(
+        app.status_cache
+            .as_ref()
+            .unwrap()
+            .master
+            .contains("1:01 elapsed")
+    );
+    app.error = Some("Synthetic error".into());
+    status_frame(&mut app);
+    assert_eq!(
+        app.status_cache.as_ref().unwrap().error.as_deref(),
+        Some("Synthetic error")
+    );
+    let terminal_key = StatusKey {
+        version: 0,
+        revision: 0,
+        metric: SizeMetric::Logical,
+        location: Location::default(),
+        selected: None,
+        shown: None,
+        elapsed: 0,
+        lifecycle: text::STOPPING,
+        phase: std::mem::discriminant(&ConflictResolution::Waiting),
+        candidates: 0,
+        terminal: None,
+        observed: false,
+        detail: DEFAULT_DETAIL,
+        viewport: egui::vec2(800.0, 600.0),
+    };
+    let mut after = StatusKey {
+        terminal: Some(Terminal::Cancelled),
+        ..terminal_key.clone()
+    };
+    assert!(after.immediate_change(&terminal_key));
+    after.selected = Some(NodeRef::Entry(app.reducer.index().unwrap().root()));
+    assert!(after.immediate_change(&terminal_key));
+}
+
+#[test]
+fn live_volume_cells_have_independent_known_bytes_and_authoritative_final_eligibility() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for size in [egui::vec2(1914.0, 1035.0), egui::vec2(1280.0, 720.0)] {
+            for metric in [SizeMetric::Logical, SizeMetric::Allocated] {
+                let context = egui::Context::default();
+                context.enable_accesskit();
+                theme::apply(&context, theme);
+                let mut app = app(&context);
+                // Keep the indexed literal tree (logical300/allocated600), but start a fresh
+                // running generation without a terminal or fabricated origin observations.
+                let generation = ScanGeneration::new(681);
+                let (sender, receiver) = event_channel(4);
+                let mut batch = Batch::new();
+                for (key, parent, name, kind, logical, allocated) in [
+                    (
+                        1,
+                        None,
+                        "Live fixture (synthetic)",
+                        Kind::Directory,
+                        None,
+                        None,
+                    ),
+                    (2, Some(1), "file.bin", Kind::File, Some(300), Some(600)),
+                ] {
+                    assert!(batch.push(ScanRecord {
+                        key: NodeKey::new(key),
+                        parent: parent.map(NodeKey::new),
+                        name: name.into(),
+                        kind,
+                        sizes: Sizes { logical, allocated },
+                        identity: Some(FileIdentity {
+                            volume: 1,
+                            file: key as u128
+                        })
+                    }));
+                }
+                sender
+                    .send(ScanEvent {
+                        generation,
+                        event: ScanEventKind::Batch(batch),
+                    })
+                    .unwrap();
+                let mut reducer = ScanReducer::new(generation);
+                reducer.drain(&receiver, 4096);
+                app.reducer = reducer;
+                app.receiver = Some(receiver);
+                app.scan_started = Some(Instant::now());
+                app.volume_evidence = None;
+                app.metric = metric;
+                app.scan_root = Some(r"C:\".into());
+                app.volume = Some(dialog::DriveChoice {
+                    root: r"C:\".into(),
+                    label: "Synthetic".into(),
+                    total_bytes: Some(1200),
+                    free_bytes: Some(200),
+                    storage_reserve_bytes: Some(100),
+                    capacity: None,
+                });
+                let mut output = desktop_frame(&context, &mut app, size, Vec::new());
+                for _ in 0..2 {
+                    output = desktop_frame(&context, &mut app, size, Vec::new());
+                }
+                let labels = output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .filter_map(|(_, node)| node.label().or(node.value()))
+                    .collect::<Vec<_>>();
+                assert!(labels.iter().any(|label| label.starts_with("Free space\n")));
+                let expected = if metric == SizeMetric::Logical {
+                    "600 B"
+                } else {
+                    "300 B"
+                };
+                assert!(
+                    labels
+                        .iter()
+                        .any(|label| label.starts_with("Not yet scanned · estimate\n")
+                            && label.contains(expected)),
+                    "{labels:?}"
+                );
+                assert!(app.volume_evidence.is_none());
+                for cell in &app.volume_map.as_ref().unwrap().cells {
+                    assert!(
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(cell.rect)
+                    );
+                }
+                app.volume.as_mut().unwrap().total_bytes = None;
+                app.version += 1;
+                app.last_layout = None;
+                let output = desktop_frame(&context, &mut app, size, Vec::new());
+                assert_eq!(named_nodes(&output).len(), 1);
+                assert_eq!(app.volume_map.as_ref().unwrap().cells.len(), 1);
+                app.volume.as_mut().unwrap().free_bytes = None;
+                app.version += 1;
+                app.last_layout = None;
+                let output = desktop_frame(&context, &mut app, size, Vec::new());
+                assert!(named_nodes(&output).is_empty());
+                let mut done = Batch::new();
+                done.push_outcome(DirectoryOutcome {
+                    key: NodeKey::new(1),
+                    code: None,
+                });
+                sender
+                    .send(ScanEvent {
+                        generation,
+                        event: ScanEventKind::Batch(done),
+                    })
+                    .unwrap();
+                sender
+                    .send(ScanEvent {
+                        generation,
+                        event: ScanEventKind::Terminal(Terminal::Finished),
+                    })
+                    .unwrap();
+                app.last_tick = None;
+                app.drain(&context);
+                app.volume_evidence = Some(facts());
+                app.version += 1;
+                let output = desktop_frame(&context, &mut app, size, Vec::new());
+                assert_eq!(
+                    named_nodes(&output).len(),
+                    if metric == SizeMetric::Logical { 1 } else { 2 }
+                );
+                assert!(
+                    app.volume_map
+                        .as_ref()
+                        .unwrap()
+                        .cells
+                        .iter()
+                        .all(|cell| cell.part.is_some())
+                );
+                app.volume_evidence.as_mut().unwrap().filesystem =
+                    Ok(ObservedFilesystem::Other("exFAT".into()));
+                app.version += 1;
+                let output = desktop_frame(&context, &mut app, size, Vec::new());
+                assert!(!named_nodes(&output).iter().any(|node| {
+                    node.label()
+                        .or(node.value())
+                        .unwrap()
+                        .starts_with("Free space")
+                }));
+                println!(
+                    "unit68_live width={} metric={metric:?} theme={theme:?} running_and_final=1 unknown_independent=1",
+                    size.x
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn cached_map_meshes_match_the_live_painter_and_refresh_after_filter_or_theme_changes() {
+    use std::hash::{Hash, Hasher};
+    let context = egui::Context::default();
+    let mut app = app(&context);
+    let digest = |output: egui::FullOutput| {
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        for primitive in context.tessellate(output.shapes, output.pixels_per_point) {
+            for value in [
+                primitive.clip_rect.min.x,
+                primitive.clip_rect.min.y,
+                primitive.clip_rect.max.x,
+                primitive.clip_rect.max.y,
+            ] {
+                value.to_bits().hash(&mut hash);
+            }
+            if let egui::epaint::Primitive::Mesh(mesh) = primitive.primitive {
+                mesh.indices.hash(&mut hash);
+                for vertex in mesh.vertices {
+                    for value in [vertex.pos.x, vertex.pos.y, vertex.uv.x, vertex.uv.y] {
+                        value.to_bits().hash(&mut hash);
+                    }
+                    vertex.color.to_array().hash(&mut hash);
+                }
+            }
+        }
+        hash.finish()
+    };
+    for _ in 0..3 {
+        frame(&context, &mut app, Vec::new());
+    }
+    let count = app.paint_rebuilds;
+    let cached = digest(frame(&context, &mut app, Vec::new()).0);
+    assert_eq!(app.paint_rebuilds, count);
+    app.about = true;
+    let live = digest(frame(&context, &mut app, Vec::new()).0);
+    assert_eq!(
+        cached, live,
+        "cached meshes preserve clips, geometry, colours and texture coordinates"
+    );
+    app.about = false;
+    app.filter.set("missing-name");
+    app.filter_changed = true;
+    let filtered = digest(frame(&context, &mut app, Vec::new()).0);
+    assert_ne!(cached, filtered);
+    assert!(app.paint_rebuilds > count);
+    theme::apply(&context, Theme::Light);
+    let light = digest(frame(&context, &mut app, Vec::new()).0);
+    assert_ne!(light, filtered);
+}
+
+#[test]
+fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
+    for theme in [Theme::Dark, Theme::Light] {
+        for size in [egui::vec2(1914.0, 1035.0), egui::vec2(1280.0, 720.0)] {
+            let context = egui::Context::default();
+            context.enable_accesskit();
+            theme::apply(&context, theme);
+            let mut app = app(&context);
+            app.metric = SizeMetric::Logical;
+            let index = app.reducer.finished_index_mut().unwrap();
+            let mut parent = index.root();
+            for depth in 0..6 {
+                parent = index
+                    .insert(
+                        parent,
+                        format!("level-{depth}").into(),
+                        Kind::Directory,
+                        Sizes::default(),
+                        None,
+                        State::Complete,
+                    )
+                    .unwrap();
+            }
+            let leaf = index
+                .insert(
+                    parent,
+                    "deep.bin".into(),
+                    Kind::File,
+                    Sizes {
+                        logical: Some(5000),
+                        allocated: Some(5000),
+                    },
+                    None,
+                    State::Complete,
+                )
+                .unwrap();
+            for number in 0..12 {
+                index
+                    .insert(
+                        index.root(),
+                        format!("small-{number}.bin").into(),
+                        Kind::File,
+                        Sizes {
+                            logical: Some(10),
+                            allocated: Some(10),
+                        },
+                        None,
+                        State::Complete,
+                    )
+                    .unwrap();
+            }
+            for _ in 0..3 {
+                desktop_frame(&context, &mut app, size, Vec::new());
+            }
+            assert!(
+                app.cache
+                    .as_ref()
+                    .unwrap()
+                    .layout
+                    .placed
+                    .iter()
+                    .any(|cell| cell.node == NodeRef::Entry(leaf))
+            );
+            let detailed = app.cache.as_ref().unwrap().layout.placed.len();
+            let key = |key| egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::CTRL,
+            };
+            desktop_frame(&context, &mut app, size, vec![key(Key::Minus)]);
+            desktop_frame(&context, &mut app, size, vec![key(Key::Minus)]);
+            assert_eq!(app.detail, 0);
+            assert!(app.cache.as_ref().unwrap().layout.placed.len() < detailed);
+            desktop_frame(&context, &mut app, size, vec![key(Key::Plus)]);
+            desktop_frame(&context, &mut app, size, vec![key(Key::Equals)]);
+            assert_eq!(app.detail, 2);
+            assert_eq!(app.cache.as_ref().unwrap().layout.placed.len(), detailed);
+            let output = desktop_frame(&context, &mut app, size, Vec::new());
+            let more = output
+                .platform_output
+                .accesskit_update
+                .as_ref()
+                .unwrap()
+                .nodes
+                .iter()
+                .find(|(_, node)| node.label() == Some("More detail"))
+                .unwrap()
+                .1
+                .bounds()
+                .unwrap();
+            let point = egui::pos2(
+                ((more.x0 + more.x1) / 2.0) as f32,
+                ((more.y0 + more.y1) / 2.0) as f32,
+            );
+            for pressed in [true, false] {
+                desktop_frame(
+                    &context,
+                    &mut app,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(point),
+                        egui::Event::PointerButton {
+                            pos: point,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert_eq!(app.detail, 3);
+            for _ in 0..10 {
+                app.change_detail(true);
+            }
+            assert_eq!(app.detail, 4);
+            for _ in 0..10 {
+                app.change_detail(false);
+            }
+            assert_eq!(app.detail, 0);
+            app.change_detail(true);
+            // Move away from controls and allow egui's finite hover animation to settle.
+            let _ = desktop_frame(&context, &mut app, size, vec![egui::Event::PointerGone]);
+            let mut output = desktop_frame(&context, &mut app, size, Vec::new());
+            for _ in 0..12 {
+                output = desktop_frame(&context, &mut app, size, Vec::new());
+            }
+            assert_eq!(
+                output
+                    .viewport_output
+                    .get(&egui::ViewportId::ROOT)
+                    .unwrap()
+                    .repaint_delay,
+                Duration::MAX
+            );
+            let (_, receiver) = event_channel(1);
+            app.receiver = Some(receiver);
+            app.last_layout_cost = Duration::from_millis(100);
+            app.last_layout = Some(Instant::now() - Duration::from_millis(250));
+            app.version += 1;
+            let previous = app.volume_map.as_ref().unwrap().key.version;
+            desktop_frame(&context, &mut app, size, Vec::new());
+            assert_eq!(app.volume_map.as_ref().unwrap().key.version, previous);
+            app.last_layout = Some(Instant::now() - Duration::from_millis(401));
+            desktop_frame(&context, &mut app, size, Vec::new());
+            assert_eq!(app.volume_map.as_ref().unwrap().key.version, app.version);
+        }
+    }
+}
+
 fn named_nodes(output: &egui::FullOutput) -> Vec<&egui::accesskit::Node> {
     output
         .platform_output
@@ -191,6 +678,8 @@ fn chrome_names_real_actions_and_selection_without_clipping_at_desktop_sizes() {
                 "Rescan",
                 "Stop",
                 "Highlight",
+                "More detail",
+                "Less detail",
             ] {
                 let node = nodes
                     .iter()
@@ -219,12 +708,7 @@ fn chrome_names_real_actions_and_selection_without_clipping_at_desktop_sizes() {
                     "unimplemented {absent}"
                 );
             }
-            for expected in [
-                "New scan",
-                "Stop",
-                "Rescan",
-                "Apparent size · counted per name · not recoverable space",
-            ] {
+            for expected in ["New scan", "Stop", "Rescan"] {
                 let text = output
                     .shapes
                     .iter()
@@ -248,7 +732,7 @@ fn chrome_names_real_actions_and_selection_without_clipping_at_desktop_sizes() {
                 .iter()
                 .find_map(|shape| match &shape.shape {
                     egui::Shape::Text(text)
-                        if text.galley.job.text.starts_with("Ready  ·  4 entries seen") =>
+                        if text.galley.job.text.starts_with("Ready · 4 entries") =>
                     {
                         Some((shape.clip_rect, text))
                     }
@@ -256,6 +740,14 @@ fn chrome_names_real_actions_and_selection_without_clipping_at_desktop_sizes() {
                 })
                 .expect("short lifecycle/count line");
             assert!(master.1.galley.job.text.contains("Complete metadata"));
+            assert!(master.1.galley.job.text.contains("0:00 elapsed"));
+            let bounds = egui::Rect::from_min_size(master.1.pos, master.1.galley.size());
+            assert!(bounds.min.y >= size.y - 24.0 && bounds.max.y <= size.y);
+            assert!(nodes.iter().any(|(_, node)| {
+                node.label()
+                    .or(node.value())
+                    .is_some_and(|label| label.contains(text::ACCOUNTING_NOTE))
+            }));
             assert!(!master.1.galley.job.text.contains("Estimated difference"));
             assert!(master.0.contains_rect(egui::Rect::from_min_size(
                 master.1.pos,
@@ -316,18 +808,21 @@ fn chrome_names_real_actions_and_selection_without_clipping_at_desktop_sizes() {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.job.text == expected => {
+                    egui::Shape::Text(text)
+                        if text.galley.job.text
+                            == "Selected: folder · 100 B · Double-click to open" =>
+                    {
                         Some((shape.clip_rect, text))
                     }
                     _ => None,
                 })
-                .expect("selected path is visibly painted");
+                .expect("brief selection is visibly painted; full path remains accessible");
             assert!(
                 text.0
                     .contains_rect(egui::Rect::from_min_size(text.1.pos, text.1.galley.size()))
             );
             println!(
-                "unit67_chrome width={} height={} actions=8 named=3 accounting_visible=1 selected_path_visible=1",
+                "unit68_chrome width={} height={} actions=10 named=3 status_lines=1 accounting_accessible=1 selected_brief_visible=1",
                 size.x, size.y
             );
         }
@@ -421,6 +916,8 @@ fn synthetic_channel_progress_reaches_rendered_status_without_losing_unknowns() 
                 event: ScanEventKind::Batch(batch),
             })
             .unwrap();
+        // Each fixture phase is a due logic tick, not an extra native repaint.
+        app.last_tick = None;
         app.drain(&context);
         sender
             .send(ScanEvent {
@@ -432,6 +929,7 @@ fn synthetic_channel_progress_reaches_rendered_status_without_losing_unknowns() 
                 }),
             })
             .unwrap();
+        app.last_tick = None;
         app.drain(&context);
         if finished {
             sender
@@ -440,6 +938,7 @@ fn synthetic_channel_progress_reaches_rendered_status_without_losing_unknowns() 
                     event: ScanEventKind::Terminal(Terminal::Finished),
                 })
                 .unwrap();
+            app.last_tick = None;
             app.drain(&context);
         }
         let index = app.reducer.index().unwrap();
@@ -460,6 +959,10 @@ fn synthetic_channel_progress_reaches_rendered_status_without_losing_unknowns() 
             app.reducer.terminal(),
             finished.then_some(Terminal::Finished)
         );
+        // These literal observations are taken on a due status sample (4Hz), not every drain.
+        if let Some(status) = &mut app.status_cache {
+            status.updated_at = Instant::now() - STATUS_INTERVAL;
+        }
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -773,7 +1276,7 @@ fn whole_volume_cells_share_the_tree_scale_without_d_or_file_actions() {
 }
 
 #[test]
-fn logical_folder_zoom_and_unknown_capacity_never_inherit_volume_cells() {
+fn logical_free_is_independent_while_folder_zoom_and_unknown_capacity_stay_hidden() {
     let context = egui::Context::default();
     context.enable_accesskit();
     for mode in 0..5 {
@@ -800,8 +1303,24 @@ fn logical_folder_zoom_and_unknown_capacity_never_inherit_volume_cells() {
             }),
         }
         let (output, area, _) = frame(&context, &mut app, Vec::new());
-        assert!(named_nodes(&output).is_empty(), "mode {mode}");
-        assert_near(app.cache.as_ref().unwrap().key.rect.width, area.width());
+        if mode == 0 {
+            let cells = named_nodes(&output);
+            assert_eq!(cells.len(), 1);
+            assert!(
+                cells[0]
+                    .label()
+                    .or(cells[0].value())
+                    .unwrap()
+                    .starts_with("Free space")
+            );
+            assert_near(
+                app.cache.as_ref().unwrap().key.rect.width,
+                area.width() * 6.0 / 11.0,
+            );
+        } else {
+            assert!(named_nodes(&output).is_empty(), "mode {mode}");
+            assert_near(app.cache.as_ref().unwrap().key.rect.width, area.width());
+        }
     }
     let mut app = app(&context);
     app.volume_evidence

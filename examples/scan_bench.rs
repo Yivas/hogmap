@@ -11,21 +11,12 @@ use hogmap::index::{FileIdentity, Kind, SizeMetric, Sizes, State};
 use hogmap::scan::{
     Batch, DirectoryOutcome, NodeKey, ScanEvent, ScanEventKind, ScanRecord, ScanSender,
 };
+#[cfg(not(feature = "desktop"))]
 #[allow(dead_code)]
 #[path = "../src/ui/logic.rs"]
 mod logic;
 #[cfg(feature = "desktop")]
-#[allow(dead_code)]
-#[path = "../src/ui/paint.rs"]
-mod paint;
-#[cfg(feature = "desktop")]
-#[allow(dead_code)]
-#[path = "../src/ui/text.rs"]
-mod text;
-#[cfg(feature = "desktop")]
-#[allow(dead_code)]
-#[path = "../src/ui/theme.rs"]
-mod theme;
+use desktop_ui::{logic, paint, theme};
 use hogmap::scan::{
     DEFAULT_CHANNEL_CAPACITY, ScanCancellation, ScanGeneration, ScanReducer, Terminal,
     event_channel,
@@ -34,6 +25,11 @@ use hogmap::scan_win::{
     ScanOptions, run_win_scan_observed_with_options, run_win_scan_with_options,
 };
 use hogmap::volume::{list_drives, volume_root_for};
+
+// The example compiles the actual desktop module, not a separate drawing model.
+#[cfg(feature = "desktop")]
+#[path = "../src/ui/mod.rs"]
+pub mod desktop_ui;
 
 const DRAIN_BUDGET: Duration = Duration::from_millis(4);
 const FRAME_INTERVAL: Duration = Duration::from_millis(33);
@@ -262,6 +258,11 @@ fn print_origin_diagnostics(
 }
 
 fn run(args: Arguments) -> Result<bool, &'static str> {
+    if args.synthetic_million && env::var_os("HOGMAP_BENCH_EXTRA").is_some_and(|value| value == "1")
+    {
+        extra_bench()?;
+        return Ok(true);
+    }
     #[cfg(feature = "desktop")]
     if args.synthetic_million && env::var_os("HOGMAP_BENCH_UI").is_some_and(|value| value == "1") {
         return ui_bench();
@@ -847,6 +848,16 @@ fn synthetic_million(
     sender: ScanSender,
     cancel: &ScanCancellation,
 ) -> hogmap::synthetic::ProducerOutcome {
+    synthetic_entries(generation, sender, cancel, 1_000_000, true)
+}
+
+fn synthetic_entries(
+    generation: ScanGeneration,
+    sender: ScanSender,
+    cancel: &ScanCancellation,
+    entries: u64,
+    directory_outcomes: bool,
+) -> hogmap::synthetic::ProducerOutcome {
     use hogmap::synthetic::ProducerOutcome;
     let flush = |batch: &mut Batch| -> Result<(), ProducerOutcome> {
         match hogmap::scan::send_event(
@@ -869,7 +880,7 @@ fn synthetic_million(
         }
     };
     let mut batch = Batch::new();
-    for key in 0..1_000_000_u64 {
+    for key in 0..entries {
         let directory = key <= 1000;
         let record = ScanRecord {
             key: NodeKey::new(key),
@@ -910,7 +921,7 @@ fn synthetic_million(
             assert!(batch.push(record));
         }
     }
-    for key in 0..=1000 {
+    for key in (0..=1000).filter(|_| directory_outcomes) {
         let outcome = DirectoryOutcome {
             key: NodeKey::new(key),
             code: None,
@@ -955,6 +966,10 @@ fn ui_bench() -> Result<bool, &'static str> {
         worker.join().unwrap(),
         hogmap::synthetic::ProducerOutcome::Finished
     );
+    if env::var_os("HOGMAP_BENCH_LIVE_FRAME").is_some_and(|value| value == "1") {
+        live_frame_bench(reducer)?;
+        return Ok(true);
+    }
     let index = reducer
         .finished_index_mut()
         .ok_or("ui_fixture_not_finished")?;
@@ -1059,7 +1074,7 @@ fn ui_bench() -> Result<bool, &'static str> {
         let start = Instant::now();
         let _ = context.run_ui(input(), |ui| {
             paint::draw(
-                ui,
+                ui.painter(),
                 theme::Theme::Dark.palette(),
                 &first,
                 &cells,
@@ -1109,7 +1124,7 @@ fn ui_bench() -> Result<bool, &'static str> {
                 let matches = results.matches;
                 let prepared = paint::prepare(ui, index, &map, None, SizeMetric::Logical);
                 paint::draw(
-                    ui,
+                    ui.painter(),
                     theme::Theme::Dark.palette(),
                     &map,
                     &prepared,
@@ -1182,6 +1197,446 @@ fn ui_bench() -> Result<bool, &'static str> {
     thread::sleep(SAMPLE_HOLD);
     std::hint::black_box((&reducer, first, grown, cells, context));
     Ok(true)
+}
+
+#[cfg(feature = "desktop")]
+struct FrameSample {
+    ms: f64,
+    shapes: usize,
+    vertices: usize,
+    repaint_ms: f64,
+    ui_ms: f64,
+    tess_ms: f64,
+}
+
+#[cfg(feature = "desktop")]
+fn rendered_frame(
+    context: &eframe::egui::Context,
+    app: &mut desktop_ui::HogMap,
+    events: Vec<eframe::egui::Event>,
+    time: f64,
+) -> FrameSample {
+    use eframe::egui;
+    let start = Instant::now();
+    let output = context.run_ui(
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1920.0, 1000.0),
+            )),
+            time: Some(time),
+            events,
+            ..Default::default()
+        },
+        |ui| app.render(ui),
+    );
+    let shapes = output.shapes.len();
+    let repaint_ms = output
+        .viewport_output
+        .get(&egui::ViewportId::ROOT)
+        .map_or(f64::INFINITY, |viewport| {
+            viewport.repaint_delay.as_secs_f64() * 1000.0
+        });
+    let ui_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let primitives = context.tessellate(output.shapes, output.pixels_per_point);
+    let vertices = primitives
+        .iter()
+        .map(|primitive| match &primitive.primitive {
+            egui::epaint::Primitive::Mesh(mesh) => mesh.vertices.len(),
+            egui::epaint::Primitive::Callback(_) => 0,
+        })
+        .sum();
+    let ms = start.elapsed().as_secs_f64() * 1000.0;
+    std::hint::black_box(primitives);
+    FrameSample {
+        ms,
+        shapes,
+        vertices,
+        repaint_ms,
+        ui_ms,
+        tess_ms: ms - ui_ms,
+    }
+}
+
+#[cfg(feature = "desktop")]
+fn report_frames(tag: &str, samples: &[FrameSample]) {
+    let mut times: Vec<_> = samples.iter().map(|sample| sample.ms).collect();
+    times.sort_by(f64::total_cmp);
+    let mean = times.iter().sum::<f64>() / times.len() as f64;
+    let p95 = times[(times.len() * 95).div_ceil(100).saturating_sub(1)];
+    let sample = &samples[samples.len() - 1];
+    println!(
+        "live_frame_{tag}_components ui_mean_ms={:.3} tess_mean_ms={:.3}",
+        samples.iter().map(|sample| sample.ui_ms).sum::<f64>() / samples.len() as f64,
+        samples.iter().map(|sample| sample.tess_ms).sum::<f64>() / samples.len() as f64
+    );
+    println!(
+        "live_frame_{tag} n={} mean_ms={mean:.3} median_ms={:.3} p95_ms={p95:.3} max_ms={:.3} shapes={} vertices={} repaint_ms={:.3}",
+        times.len(),
+        times[times.len() / 2],
+        times[times.len() - 1],
+        sample.shapes,
+        sample.vertices,
+        sample.repaint_ms
+    );
+}
+
+#[cfg(feature = "desktop")]
+fn live_frame_bench(reducer: ScanReducer) -> Result<(), &'static str> {
+    use eframe::egui;
+    let context = egui::Context::default();
+    theme::apply(&context, theme::Theme::Dark);
+    let mut app = desktop_ui::HogMap::with_reducer(context.clone(), reducer);
+    let mut time = 0.0;
+    for _ in 0..8 {
+        rendered_frame(&context, &mut app, Vec::new(), time);
+        time += 0.25;
+    }
+    println!(
+        "live_frame_fixture entries={} width=1920 height=1000 native_window=0 accesskit_active=0 includes=real_chrome_status_map_and_tessellation",
+        app.reducer.index().unwrap().len()
+    );
+    let mut stable = Vec::new();
+    for _ in 0..20 {
+        stable.push(rendered_frame(&context, &mut app, Vec::new(), time));
+        time += 0.25;
+    }
+    report_frames("stable", &stable);
+    println!(
+        "live_frame_complete_rebuild_cost_ms={:.3}",
+        app.last_layout_cost.as_secs_f64() * 1000.0
+    );
+    let mut hover = Vec::new();
+    for number in 0..20 {
+        hover.push(rendered_frame(
+            &context,
+            &mut app,
+            vec![egui::Event::PointerMoved(egui::pos2(
+                100.0 + (number % 10) as f32 * 96.0,
+                300.0,
+            ))],
+            time,
+        ));
+        time += 0.25;
+    }
+    report_frames("hover", &hover);
+    let parent = app
+        .reducer
+        .index()
+        .unwrap()
+        .entries()
+        .find(|(id, entry)| {
+            *id != app.reducer.index().unwrap().root() && entry.kind == Kind::Directory
+        })
+        .unwrap()
+        .0;
+    let (hold_sender, receiver) = event_channel(1);
+    app.receiver = Some(receiver);
+    let mut growth = Vec::new();
+    for number in 0..10 {
+        for offset in 0..64 {
+            app.reducer
+                .finished_index_mut()
+                .unwrap()
+                .insert(
+                    parent,
+                    format!("live-growth-{number}-{offset}").into(),
+                    Kind::File,
+                    Sizes {
+                        logical: Some(17),
+                        allocated: Some(32),
+                    },
+                    None,
+                    State::Complete,
+                )
+                .map_err(|_| "live_growth_failed")?;
+        }
+        app.version += 1;
+        // Measure an eligible growth rebuild separately from throttled intermediate frames.
+        app.last_layout = None;
+        let previous = app.last_layout;
+        growth.push(rendered_frame(&context, &mut app, Vec::new(), time));
+        time += 0.26;
+        assert_ne!(
+            app.last_layout, previous,
+            "growth sample must actually rebuild"
+        );
+    }
+    std::hint::black_box(hold_sender);
+    report_frames("growth_rebuild", &growth);
+    drop(app);
+
+    // A separate real-channel synthetic scan measures ingestion and UI backpressure together.
+    let context = egui::Context::default();
+    theme::apply(&context, theme::Theme::Dark);
+    let generation = ScanGeneration::new(680);
+    let (sender, receiver) = event_channel(DEFAULT_CHANNEL_CAPACITY);
+    let wake_context = context.clone();
+    sender.set_waker(move || wake_context.request_repaint_after(desktop_ui::FRAME_INTERVAL));
+    let producer =
+        thread::spawn(move || synthetic_million(generation, sender, &ScanCancellation::new()));
+    let mut app = desktop_ui::HogMap::with_reducer(context.clone(), ScanReducer::new(generation));
+    app.scan_started = Some(Instant::now());
+    app.receiver = Some(receiver);
+    let start = Instant::now();
+    let mut next = start;
+    let mut ordinary = Vec::new();
+    let mut rebuilds = Vec::new();
+    let mut ordinary_drains = Vec::new();
+    let mut rebuild_drains = Vec::new();
+    let mut drain_over8 = 0;
+    let mut drain_over12 = 0;
+    let mut over8 = 0;
+    let mut over12 = 0;
+    while app.receiver.is_some() {
+        let now = Instant::now();
+        if next > now {
+            thread::sleep(next - now);
+        }
+        let tick = Instant::now();
+        let previous = app.last_layout;
+        app.drain(&context);
+        let drain_ms = tick.elapsed().as_secs_f64() * 1000.0;
+        drain_over8 += usize::from(drain_ms > 8.0);
+        drain_over12 += usize::from(drain_ms > 12.0);
+        let drain_sample = FrameSample {
+            ms: drain_ms,
+            shapes: 0,
+            vertices: 0,
+            repaint_ms: 0.0,
+            ui_ms: 0.0,
+            tess_ms: 0.0,
+        };
+        let mut sample = rendered_frame(
+            &context,
+            &mut app,
+            Vec::new(),
+            start.elapsed().as_secs_f64(),
+        );
+        sample.ms = tick.elapsed().as_secs_f64() * 1000.0;
+        over8 += usize::from(sample.ms > 8.0);
+        over12 += usize::from(sample.ms > 12.0);
+        if app.last_layout != previous {
+            rebuilds.push(sample);
+            rebuild_drains.push(drain_sample);
+        } else {
+            ordinary.push(sample);
+            ordinary_drains.push(drain_sample);
+        }
+        next = tick + desktop_ui::FRAME_INTERVAL;
+        if start.elapsed() > Duration::from_secs(120) {
+            return Err("live_stream_timeout");
+        }
+    }
+    let elapsed = start.elapsed();
+    assert_eq!(
+        producer.join().unwrap(),
+        hogmap::synthetic::ProducerOutcome::Finished
+    );
+    assert_eq!(app.reducer.index().unwrap().len(), 1_000_000);
+    if !ordinary.is_empty() {
+        report_frames("stream_ordinary_drain_plus_frame", &ordinary);
+    }
+    if !rebuilds.is_empty() {
+        report_frames("stream_rebuild_drain_plus_frame", &rebuilds);
+    }
+    println!(
+        "live_stream wall_ms={:.3} ticks={} rebuilds={} ticks_over8={} ticks_over12={} nominal_tick_hz={:.3} entries=1000000",
+        elapsed.as_secs_f64() * 1000.0,
+        ordinary.len() + rebuilds.len(),
+        rebuilds.len(),
+        over8,
+        over12,
+        1.0 / desktop_ui::FRAME_INTERVAL.as_secs_f64()
+    );
+    if !ordinary_drains.is_empty() {
+        report_frames("stream_ordinary_drain_only", &ordinary_drains);
+    }
+    if !rebuild_drains.is_empty() {
+        report_frames("stream_rebuild_drain_only", &rebuild_drains);
+    }
+    println!(
+        "live_stream_rates entries_per_second={:.3} map_layout_hz={:.3} mesh_builds={} drain_over8={} drain_over12={}",
+        1_000_000.0 / elapsed.as_secs_f64(),
+        rebuilds.len() as f64 / elapsed.as_secs_f64(),
+        app.paint_rebuilds,
+        drain_over8,
+        drain_over12
+    );
+    println!("scan_done=1\nentries=1000000\nsample_hold_ms=1500");
+    io::stdout().flush().map_err(|_| "stdout_failed")?;
+    thread::sleep(SAMPLE_HOLD);
+    std::hint::black_box((&app, context));
+    Ok(())
+}
+
+/// Separate diagnostics: no filesystem query, and no change to the million-entry sentinel.
+fn extra_bench() -> Result<(), &'static str> {
+    use hogmap::index::Index;
+    use hogmap::treemap::{LayoutParams, Rect};
+    for complete in [true, false] {
+        let generation = ScanGeneration::new(682);
+        let (sender, receiver) = event_channel(DEFAULT_CHANNEL_CAPACITY);
+        let worker = thread::spawn(move || {
+            synthetic_entries(
+                generation,
+                sender,
+                &ScanCancellation::new(),
+                1_000_000,
+                complete,
+            )
+        });
+        let mut reducer = ScanReducer::new(generation);
+        loop {
+            receiver.wait_ready();
+            let start = Instant::now();
+            let report = reducer.drain(&receiver, 1);
+            let ms = start.elapsed().as_secs_f64() * 1000.0;
+            if report.terminal.is_some() {
+                println!(
+                    "terminal_fixture complete={complete} terminal_records={} terminal_ms={ms:.3} partial_directories={}",
+                    report.records,
+                    reducer.diagnostics().partial_directories
+                );
+                assert_eq!(report.records, 0);
+                assert_eq!(
+                    reducer.diagnostics().partial_directories,
+                    if complete { 0 } else { 1001 }
+                );
+                #[cfg(feature = "desktop")]
+                {
+                    let context = eframe::egui::Context::default();
+                    theme::apply(&context, theme::Theme::Dark);
+                    let mut app = desktop_ui::HogMap::with_reducer(context.clone(), reducer);
+                    let sample = rendered_frame(&context, &mut app, Vec::new(), 0.0);
+                    report_frames(
+                        if complete {
+                            "terminal_complete_rebuild"
+                        } else {
+                            "terminal_incomplete_rebuild"
+                        },
+                        &[sample],
+                    );
+                }
+                break;
+            }
+            if reducer
+                .index()
+                .is_some_and(|index| index.len() == 1_000_000)
+            {
+                let index = reducer.index().unwrap();
+                let _ = hogmap::treemap::layout(
+                    index,
+                    index.root(),
+                    Rect::new(0.0, 0.0, 1920.0, 1000.0),
+                    LayoutParams {
+                        min_pixel_area: 1024.0,
+                        header_height: 20.0,
+                        max_depth: 64,
+                    },
+                )
+                .map_err(|_| "extra_layout")?;
+                let _ = logic::HighlightFilter::default().match_results(index);
+            }
+        }
+        assert_eq!(
+            worker.join().unwrap(),
+            hogmap::synthetic::ProducerOutcome::Finished
+        );
+    }
+    let mut index = Index::new("Synthetic million".into()).map_err(|_| "extra_index")?;
+    let mut parents = vec![index.root()];
+    let mut previous = index.memory_estimate().charged_identity_bytes;
+    let mut growths = [(0_usize, Duration::ZERO); 64];
+    for key in 1..3_800_000_u64 {
+        let directory = key <= 1000;
+        let parent = if directory {
+            index.root()
+        } else {
+            parents[(1 + (key - 1001) % 1000) as usize]
+        };
+        let sizes = if directory || key % 10000 == 0 {
+            Sizes::default()
+        } else {
+            Sizes {
+                logical: Some(key % 65536),
+                allocated: Some(65536),
+            }
+        };
+        let name = format!("entry-{key:07}.bin").into();
+        let start = Instant::now();
+        let id = index
+            .insert(
+                parent,
+                name,
+                if directory {
+                    Kind::Directory
+                } else {
+                    Kind::File
+                },
+                sizes,
+                Some(FileIdentity {
+                    volume: 1,
+                    file: u128::from(key),
+                }),
+                if directory {
+                    State::Pending
+                } else {
+                    State::Complete
+                },
+            )
+            .map_err(|_| "extra_insert")?;
+        let elapsed = start.elapsed();
+        if directory {
+            parents.push(id);
+        }
+        let memory = index.memory_estimate();
+        if memory.charged_identity_bytes > previous {
+            // Mirrors the private routing solely to label measured capacity changes. The time is
+            // an upper bound on rehash cost: the whole insertion, not a claimed allocator timer.
+            let shard =
+                ((key ^ 1_u64.rotate_left(11)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 58) as usize;
+            growths[shard].0 += 1;
+            growths[shard].1 = growths[shard].1.max(elapsed);
+        }
+        previous = memory.charged_identity_bytes;
+        if key + 1 == 1_000_000 || key + 1 == 3_800_000 {
+            let map = hogmap::treemap::layout(
+                &index,
+                index.root(),
+                Rect::new(0.0, 0.0, 1920.0, 1000.0),
+                LayoutParams {
+                    min_pixel_area: 1024.0,
+                    header_height: 20.0,
+                    max_depth: 64,
+                },
+            )
+            .map_err(|_| "extra_layout")?;
+            let matches = logic::HighlightFilter::default().match_results(&index);
+            let memory = index.memory_estimate();
+            println!(
+                "memory_fixture entries={} index_bytes={} charge_bytes={} layout_bytes={} filter_bytes={} drawn_cells={} output_matches_capacity={}",
+                index.len(),
+                memory.total_bytes(),
+                memory.charged_identity_bytes,
+                memory.layout_cache_bytes,
+                memory.filter_cache_bytes,
+                map.placed.len(),
+                matches.matches.capacity()
+            );
+        }
+    }
+    for (shard, (count, max)) in growths.into_iter().enumerate() {
+        println!(
+            "identity_shard={shard} growths={count} max_growing_insert_ms={:.3}",
+            max.as_secs_f64() * 1000.0
+        );
+    }
+    println!("scan_done=1\nentries=3800000\nsample_hold_ms=1500");
+    io::stdout().flush().map_err(|_| "stdout_failed")?;
+    thread::sleep(SAMPLE_HOLD);
+    std::hint::black_box(index);
+    Ok(())
 }
 
 fn main() -> ExitCode {

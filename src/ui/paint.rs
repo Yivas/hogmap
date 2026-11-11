@@ -6,7 +6,7 @@ use hogmap::filter::Match;
 use hogmap::index::{EntryId, Index, Kind, SizeMetric, State};
 use hogmap::treemap::{Layout, NodeRef, Placed, Rect};
 
-use super::theme::{DEPTH_TONES, Palette, Tone};
+use super::theme::{DEPTH_TONES, Palette, Theme, Tone};
 use super::{logic, text};
 
 /// Cells smaller than this on either side keep their fill and tooltip but skip state marks, which
@@ -308,7 +308,7 @@ fn markable(area: egui::Rect) -> bool {
 /// dashed state mark in one batch, then hover and selection. Hover and selection are outlines
 /// only, so the state fill and label colours underneath stay as measured.
 pub fn draw(
-    ui: &egui::Ui,
+    painter: &egui::Painter,
     palette: &Palette,
     layout: &Layout,
     cells: &[Cell],
@@ -316,14 +316,13 @@ pub fn draw(
     interaction: (Option<NodeRef>, Option<usize>),
     scratch: &mut Vec<Shape>,
 ) {
-    let (selected, hovered) = interaction;
-    let clip = ui.clip_rect();
+    let clip = painter.clip_rect();
     // Retain the frame scratch allocation; egui receives the shapes, not this Vec's capacity.
     let mut dashes = std::mem::take(scratch);
     dashes.clear();
     for (placed, cell) in layout.placed.iter().zip(cells) {
         let area = rect(placed.rect);
-        let painter = ui.painter().with_clip_rect(area.intersect(clip));
+        let painter = painter.with_clip_rect(area.intersect(clip));
         let tone = painted_tone(palette, cell.surface, matches, placed);
         let inaccessible = cell.surface == Surface::Incomplete { inaccessible: true };
         painter.rect_filled(area, 0, tone.fill);
@@ -376,7 +375,7 @@ pub fn draw(
     }
     for (placed, cell) in layout.placed.iter().zip(cells) {
         let area = rect(placed.rect);
-        let painter = ui.painter().with_clip_rect(area.intersect(clip));
+        let painter = painter.with_clip_rect(area.intersect(clip));
         if cell.directory {
             painter.rect_stroke(
                 area,
@@ -398,19 +397,121 @@ pub fn draw(
             }
         }
     }
-    let painter = ui.painter().with_clip_rect(clip);
     painter.extend(dashes.drain(..));
     *scratch = dashes;
+    draw_interaction(painter, palette, layout, interaction);
+}
+
+pub fn draw_interaction(
+    painter: &egui::Painter,
+    palette: &Palette,
+    layout: &Layout,
+    interaction: (Option<NodeRef>, Option<usize>),
+) {
+    let (selected, hovered) = interaction;
     if let Some(position) = hovered
         && let Some(cell) = layout.placed.get(position)
         && Some(cell.node) != selected
     {
-        outline(&painter, rect(cell.rect), 1.0, 1.0, palette.hover);
+        outline(painter, rect(cell.rect), 1.0, 1.0, palette.hover);
     }
     if let Some(selected) = selected
         && let Some(cell) = layout.placed.iter().find(|cell| cell.node == selected)
     {
-        outline(&painter, rect(cell.rect), 2.0, 0.0, palette.selection);
+        outline(painter, rect(cell.rect), 2.0, 0.0, palette.selection);
+    }
+}
+
+/// A memoized galley also detects atlas resets: egui clears this cache when it recreates fonts.
+pub fn font_probe(ui: &egui::Ui) -> Arc<egui::Galley> {
+    ui.painter()
+        .layout_no_wrap("M".into(), FontId::proportional(11.0), Color32::BLACK)
+}
+
+pub struct CachedMap {
+    theme: Theme,
+    pixels_per_point: f32,
+    font_image_size: [usize; 2],
+    probe: Arc<egui::Galley>,
+    shapes: Vec<egui::epaint::ClippedShape>,
+    dirty: bool,
+}
+impl CachedMap {
+    pub fn font_matches(&self, ui: &egui::Ui, probe: &Arc<egui::Galley>) -> bool {
+        self.pixels_per_point == ui.ctx().pixels_per_point() && Arc::ptr_eq(&self.probe, probe)
+    }
+    pub fn valid(&self, ui: &egui::Ui, probe: &Arc<egui::Galley>) -> bool {
+        !self.dirty
+            && self.font_matches(ui, probe)
+            && self.theme == Theme::current(ui.ctx())
+            && self.font_image_size == ui.fonts(|fonts| fonts.font_image_size())
+    }
+    pub fn invalidate(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Record through the real painter and tessellator, then detach the scratch layer. Per-cell
+    /// clips, texture coordinates and paint order survive exactly; only overlays remain dynamic.
+    /// Build after widget/tooltip text has populated the atlas, never before new glyphs are laid out.
+    pub fn build(
+        ui: &egui::Ui,
+        layout: &Layout,
+        cells: &[Cell],
+        matches: &[Match],
+        scratch: &mut Vec<Shape>,
+        probe: Arc<egui::Galley>,
+    ) -> Self {
+        let theme = Theme::current(ui.ctx());
+        let layer = egui::LayerId::new(egui::Order::Background, ui.id().with("map-mesh-scratch"));
+        let painter = ui.painter().clone().with_layer_id(layer);
+        draw(
+            &painter,
+            theme.palette(),
+            layout,
+            cells,
+            matches,
+            (None, None),
+            scratch,
+        );
+        let recorded = ui
+            .ctx()
+            .graphics_mut(|layers| std::mem::take(layers.entry(layer)));
+        let shapes = recorded.all_entries().cloned().collect();
+        let pixels_per_point = ui.ctx().pixels_per_point();
+        let shapes = ui
+            .ctx()
+            .tessellate(shapes, pixels_per_point)
+            .into_iter()
+            .map(|primitive| {
+                let shape = match primitive.primitive {
+                    egui::epaint::Primitive::Mesh(mesh) => Shape::Mesh(Arc::new(mesh)),
+                    egui::epaint::Primitive::Callback(callback) => Shape::Callback(callback),
+                };
+                egui::epaint::ClippedShape {
+                    clip_rect: primitive.clip_rect,
+                    shape,
+                }
+            })
+            .collect();
+        Self {
+            theme,
+            pixels_per_point,
+            font_image_size: ui.fonts(|fonts| fonts.font_image_size()),
+            probe,
+            shapes,
+            dirty: false,
+        }
+    }
+    pub fn draw(&self, ui: &egui::Ui) {
+        ui.ctx().graphics_mut(|layers| {
+            let list = layers.entry(ui.layer_id());
+            for shape in &self.shapes {
+                list.add(
+                    shape.clip_rect.intersect(ui.clip_rect()),
+                    shape.shape.clone(),
+                );
+            }
+        });
     }
 }
 

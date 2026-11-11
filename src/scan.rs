@@ -241,6 +241,7 @@ pub struct ScanDiagnostics {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DrainReport {
+    /// Applied events or resumed batch slices, not unique channel messages.
     pub events: usize,
     pub records: usize,
     pub directories: usize,
@@ -261,6 +262,17 @@ pub struct ScanReducer {
     progress: Progress,
     terminal: Option<Terminal>,
     memory_before_release: (usize, usize),
+    pending_batch: Option<PendingBatch>,
+}
+
+/// A cursor never overtakes its records: all parents precede children, outcomes follow every
+/// record in this batch, and no later event (including the single terminal) is consumed until
+/// it is empty. Replacing the generation drops this cursor with the old reducer and receiver.
+#[derive(Debug)]
+struct PendingBatch {
+    batch: Batch,
+    record: usize,
+    outcome: usize,
 }
 
 /// Dense built-in producer keys use four-byte slots. Sparse/untrusted keys never dictate
@@ -313,6 +325,7 @@ impl ScanReducer {
             progress: Progress::default(),
             terminal: None,
             memory_before_release: (0, 0),
+            pending_batch: None,
         }
     }
 
@@ -358,9 +371,9 @@ impl ScanReducer {
         self.drain_limited(receiver, record_budget, event_budget, None)
     }
 
-    /// Drains at most `max_events` events, checking elapsed time between whole events.
-    /// One batch is indivisible and can exceed the time budget; a nonempty queue always
-    /// makes progress, even with a zero budget.
+    /// Drains at most `max_events` events/slices, checking a positive deadline every 32 records
+    /// and after each outcome. A single record can exceed it; a nonempty queue always advances.
+    /// A zero budget retains the original whole-event progress guarantee.
     pub fn drain_budgeted(
         &mut self,
         receiver: &ScanReceiver,
@@ -383,9 +396,34 @@ impl ScanReducer {
             if report.events > 0 && time_budget.is_some_and(|budget| started.elapsed() >= budget) {
                 break;
             }
+            if let Some(mut pending) = self.pending_batch.take() {
+                let apply_started = Instant::now();
+                let complete = self.resume_batch(&mut pending, started, time_budget, &mut report);
+                report.apply_time += apply_started.elapsed();
+                report.events += 1;
+                if !complete {
+                    self.pending_batch = Some(pending);
+                    break;
+                }
+                continue;
+            }
             match receiver.try_recv() {
                 Ok(event) => {
                     let belongs = event.generation == self.generation;
+                    if belongs
+                        && self.terminal.is_none()
+                        && time_budget.is_some_and(|budget| !budget.is_zero())
+                        && matches!(event.event, ScanEventKind::Batch(_))
+                    {
+                        if let ScanEventKind::Batch(batch) = event.event {
+                            self.pending_batch = Some(PendingBatch {
+                                batch,
+                                record: 0,
+                                outcome: 0,
+                            });
+                        }
+                        continue;
+                    }
                     let records = match &event.event {
                         ScanEventKind::Batch(batch) => {
                             if belongs {
@@ -425,6 +463,34 @@ impl ScanReducer {
         }
         report.terminal = self.terminal;
         report
+    }
+
+    fn resume_batch(
+        &mut self,
+        pending: &mut PendingBatch,
+        started: Instant,
+        budget: Option<Duration>,
+        report: &mut DrainReport,
+    ) -> bool {
+        while let Some(record) = pending.batch.records().get(pending.record) {
+            self.apply_record(record);
+            report.records += 1;
+            report.directories += usize::from(record.kind == Kind::Directory);
+            pending.record += 1;
+            if pending.record.is_multiple_of(32)
+                && budget.is_some_and(|budget| !budget.is_zero() && started.elapsed() >= budget)
+            {
+                return false;
+            }
+        }
+        while let Some(outcome) = pending.batch.outcomes().get(pending.outcome) {
+            self.finish_directory(outcome.key, outcome.code);
+            pending.outcome += 1;
+            if budget.is_some_and(|budget| !budget.is_zero() && started.elapsed() >= budget) {
+                return pending.outcome == pending.batch.outcomes().len();
+            }
+        }
+        true
     }
 
     fn apply(&mut self, event: ScanEvent) {
@@ -573,6 +639,11 @@ impl ScanReducer {
     }
 
     fn partialize_pending(&mut self) {
+        // Unknown sizes do not require state changes. The common successful terminal must not
+        // walk millions of complete files merely to discover there is nothing to partialize.
+        if self.index.as_ref().is_none_or(Index::all_entries_complete) {
+            return;
+        }
         let count = self.index.as_ref().map_or(0, Index::len);
         let mut partial = 0;
         for position in 0..count {

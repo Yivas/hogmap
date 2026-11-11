@@ -386,10 +386,10 @@ impl LayoutData {
     }
     pub(crate) fn append(&mut self, index: &Index, id: EntryId) -> Result<(), LayoutError> {
         if self.children.len() == self.children.capacity() {
-            self.children.reserve_exact(4096);
+            self.children.reserve(4096);
         }
         if self.totals.len() == self.totals.capacity() {
-            self.totals.reserve_exact(4096);
+            self.totals.reserve(4096);
         }
         let entry = index.get(id).expect("new index entry");
         let value = Totals {
@@ -405,7 +405,7 @@ impl LayoutData {
         };
         self.children.push(Vec::new());
         if self.sorted.len() == self.sorted.capacity() {
-            self.sorted.reserve_exact(4096);
+            self.sorted.reserve(4096);
         }
         self.sorted.push(false);
         self.totals.push(value);
@@ -508,11 +508,12 @@ fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, Layo
 }
 
 fn compare_children(index: &Index, a: &(EntryId, u64), b: &(EntryId, u64)) -> Ordering {
-    let name_order = match (index.get(a.0), index.get(b.0)) {
-        (Some(a), Some(b)) => a.name.cmp(b.name),
-        _ => a.0.cmp(&b.0),
-    };
-    b.1.cmp(&a.1).then(name_order).then_with(|| a.0.cmp(&b.0))
+    b.1.cmp(&a.1)
+        .then_with(|| match (index.get(a.0), index.get(b.0)) {
+            (Some(a), Some(b)) => a.name.cmp(b.name),
+            _ => a.0.cmp(&b.0),
+        })
+        .then_with(|| a.0.cmp(&b.0))
 }
 
 fn place(
