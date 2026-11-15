@@ -9,6 +9,7 @@ mod dialog;
 mod file_dialog;
 mod files;
 mod icons;
+mod live;
 pub(crate) mod logic;
 mod options;
 pub(crate) mod paint;
@@ -114,6 +115,7 @@ struct Cache {
     location_label: String,
     selection_readout: Option<(NodeRef, String)>,
     paint: Option<paint::CachedMap>,
+    coverage: Vec<live::Coverage>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -232,6 +234,18 @@ pub struct HogMap {
     selected: Option<NodeRef>,
     pending_menu: Option<ContextMenuRequest>,
     menu_notice: Option<String>,
+    notices: hogmap::notices::Notices,
+    last_console_notice: Option<String>,
+    last_console_error: Option<String>,
+    watch_enabled: bool,
+    watch_active: bool,
+    watcher: Option<hogmap::watch::Watch>,
+    retired_watch: Option<hogmap::watch::Watch>,
+    rescan_reason: Option<String>,
+    bookmarks: Vec<hogmap::bookmarks::Bookmark>,
+    bookmark_file: Option<PathBuf>,
+    bookmark_name: Option<String>,
+    pending_bookmark: Option<(Option<PathBuf>, Location)>,
     filter_text: String,
     filter_focused: bool,
     filter: HighlightFilter,
@@ -285,6 +299,7 @@ impl HogMap {
             .unwrap_or_default();
         theme::apply(&context.egui_ctx, theme);
         let mut app = Self::with_context(context.egui_ctx.clone());
+        app.load_bookmarks();
         if let (Some(path), Some(snapshot)) = (startup.open, snapshot) {
             app.install_snapshot(path, snapshot);
         }
@@ -341,6 +356,18 @@ impl HogMap {
             selected: None,
             pending_menu: None,
             menu_notice: None,
+            notices: Default::default(),
+            last_console_notice: None,
+            last_console_error: None,
+            watch_enabled: false,
+            watch_active: false,
+            watcher: None,
+            retired_watch: None,
+            rescan_reason: None,
+            bookmarks: Vec::new(),
+            bookmark_file: None,
+            bookmark_name: None,
+            pending_bookmark: None,
             filter_text: String::new(),
             filter_focused: false,
             filter: HighlightFilter::default(),
@@ -446,6 +473,7 @@ impl HogMap {
     }
 
     fn stop_producer(&mut self) {
+        self.stop_watch();
         self.cancellation.cancel();
         // A terminal send ignores cancellation, so disconnect before retiring the producer.
         self.receiver.take();
@@ -461,6 +489,7 @@ impl HogMap {
 
     fn request_close(&mut self) {
         self.closing = true;
+        self.watch_enabled = false;
         self.pending_menu = None;
         self.pending_scan = None;
         self.stop_producer();
@@ -471,6 +500,8 @@ impl HogMap {
             return;
         }
         self.pending_menu = None;
+        self.pending_bookmark = None;
+        self.rescan_reason = None;
         self.stop_producer();
         // Coalesce repeated requests instead of starting more threads behind blocked I/O.
         self.pending_scan = Some(request);
@@ -485,6 +516,7 @@ impl HogMap {
             || self.resolution.active()
             || self.preparation.is_some()
             || self.pending_scan.is_some()
+            || self.retired_watch.is_some()
     }
 
     fn poll_pending(&mut self) {
@@ -534,6 +566,7 @@ impl HogMap {
         if !self.pending_producers.is_empty()
             || !self.pending_rereads.is_empty()
             || self.preparation.is_some()
+            || self.retired_watch.is_some()
             || self.closing
         {
             return;
@@ -580,6 +613,10 @@ impl HogMap {
             match producer.join() {
                 Ok(completion) if completion.generation == self.reducer.generation() => {
                     self.scan_report = completion.report;
+                    if let Some(report) = &self.scan_report {
+                        let detail = text::scan_report(report);
+                        self.notices.push(text::SCAN_NOTICES, &detail);
+                    }
                     self.volume_evidence = completion
                         .observations
                         .as_ref()
@@ -691,6 +728,7 @@ impl HogMap {
             })?;
         self.volume = None;
         self.scan_root = None;
+        self.watch_enabled = false;
         self.ghost_baseline = None;
         self.reset_scan(
             generation,
@@ -731,7 +769,7 @@ impl HogMap {
         self.history = History::default();
         self.selected = None;
         self.pending_menu = None;
-        self.menu_notice = None;
+        self.menu_notice = self.rescan_reason.clone();
         self.cache = None;
         self.volume_map = None;
         self.layout_failure = None;
@@ -747,6 +785,15 @@ impl HogMap {
     }
 
     fn cancel(&mut self) {
+        // Read before clearing: the option can be on before the watcher exists (the scan has not
+        // finished) or after one was retired by Rescan, and that is still a stop the user asked
+        // for. The View checkbox records the same stop; Stop must not do it silently.
+        let was_watching = self.watch_enabled || self.watcher.is_some();
+        self.watch_enabled = false;
+        if was_watching {
+            self.record_notice(text::WATCH_STOPPED.into());
+        }
+        self.stop_watch();
         if !(self.receiver.is_some()
             || self.preparation.is_some()
             || self.pending_scan.is_some()
@@ -771,6 +818,7 @@ impl HogMap {
             return;
         }
         self.last_tick = Some(Instant::now());
+        self.poll_watch(context);
         if let Some(receiver) = &self.receiver {
             // Leave room for the cached frame. Sustained backlog gets sparse8/12ms slices,
             // not a12ms p95, an immediate repaint loop or a single20ms burst.
@@ -805,12 +853,28 @@ impl HogMap {
         }
         // The terminal may arrive just before the thread returns its counts-only report.
         // `collect_producer` joins only an already finished thread.
+        for code in self.reducer.take_directory_failures() {
+            self.notices.directory_failure(code);
+        }
         self.collect_producer();
+        self.finish_bookmark_navigation();
         self.advance_resolution();
         self.finish_ghost_comparison();
         self.poll_pending();
         self.chooser.poll_drives(context);
         self.advance_scan();
+        if self.menu_notice != self.last_console_notice {
+            if let Some(message) = &self.menu_notice {
+                self.notices.push(message, message);
+            }
+            self.last_console_notice = self.menu_notice.clone();
+        }
+        if self.error != self.last_console_error {
+            if let Some(message) = &self.error {
+                self.notices.push(message, message);
+            }
+            self.last_console_error = self.error.clone();
+        }
         if self.work_pending() {
             context.request_repaint_after(FRAME_INTERVAL);
         } else if self.closing {
@@ -1150,6 +1214,7 @@ impl HogMap {
         if self.chooser.open
             || self.class_editor.open
             || self.options_open
+            || self.bookmark_name.is_some()
             || self.export_preview.is_some()
             || self.pending_file.is_some()
         {
@@ -1218,6 +1283,13 @@ impl HogMap {
         }
         if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Minus)) {
             self.change_detail(false);
+        }
+        // Same gate as View → Rescan this folder: without a scan it would start the sample.
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F5))
+            && self.scan_started.is_some()
+            && self.snapshot_file.is_none()
+        {
+            self.rescan_folder();
         }
         if context.input_mut(|input| input.consume_key(Modifiers::NONE, Key::F5))
             && self.scan_started.is_some()
@@ -1290,6 +1362,31 @@ impl HogMap {
                     }
                 });
                 ui.menu_button(text::VIEW, |ui| {
+                    if ui
+                        .add_enabled(
+                            self.scan_root.is_some() && self.snapshot_file.is_none(),
+                            egui::Checkbox::new(&mut self.watch_enabled, text::WATCH_CHANGES),
+                        )
+                        .on_hover_text(text::WATCH_TIP)
+                        .changed()
+                        && !self.watch_enabled
+                    {
+                        self.stop_watch();
+                        self.record_notice(text::WATCH_STOPPED.into());
+                    }
+                    if ui
+                        .add_enabled(
+                            self.scan_started.is_some() && self.snapshot_file.is_none(),
+                            egui::Button::new(text::RESCAN_FOLDER).shortcut_text("Ctrl+F5"),
+                        )
+                        .on_hover_text(text::RESCAN_FOLDER_TIP)
+                        .clicked()
+                    {
+                        self.rescan_folder();
+                        ui.close();
+                    }
+                    self.bookmark_menu(ui);
+                    ui.separator();
                     if ui
                         .add_enabled(self.can_zoom(), egui::Button::new(text::ZOOM_IN))
                         .clicked()
@@ -1515,7 +1612,8 @@ impl HogMap {
                     self.rescan();
                 }
                 let can_stop = !self.cancelled
-                    && (self.receiver.is_some()
+                    && (self.watcher.is_some()
+                        || self.receiver.is_some()
                         || self.preparation.is_some()
                         || self.pending_scan.is_some()
                         || self.resolution.active());
@@ -1822,6 +1920,10 @@ impl HogMap {
                     detail.push_str(&self.visible_composition(&composition).detail);
                     detail.push('\n');
                     detail.push_str(&self.resolution_status());
+                    if let Some(reason) = &self.rescan_reason {
+                        detail.push('\n');
+                        detail.push_str(reason);
+                    }
                     if let Some(observations) = &self.observations {
                         detail.push('\n');
                         detail.push_str(&text::observation_detail(observations));
@@ -1961,6 +2063,14 @@ impl HogMap {
             });
         }
         let data = self.status_cache.as_ref().unwrap();
+        let scanning = self.receiver.is_some();
+        let progress = text::progress(
+            self.reducer.observed_progress(),
+            self.reducer
+                .index()
+                .and_then(|index| index.summary_for(self.metric).ok())
+                .map(|summary| summary.known_bytes),
+        );
         egui::Panel::bottom("status")
             .exact_size(24.0)
             .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(8, 3)))
@@ -1981,7 +2091,12 @@ impl HogMap {
                     ui.separator();
                     let selected = ui.add_sized(
                         egui::vec2(ui.available_width(), 18.0),
-                        egui::Label::new(&data.brief).truncate(),
+                        egui::Label::new(if scanning && data.brief.is_empty() {
+                            &progress
+                        } else {
+                            &data.brief
+                        })
+                        .truncate(),
                     );
                     selected.widget_info(|| {
                         egui::WidgetInfo::labeled(egui::WidgetType::Label, true, &data.readout)
@@ -1990,6 +2105,21 @@ impl HogMap {
                         selected.on_hover_text(&data.readout);
                     }
                 });
+                if scanning {
+                    let rect = ui.max_rect();
+                    let bar = egui::Rect::from_min_size(
+                        egui::pos2(rect.min.x, rect.max.y - 2.0),
+                        egui::vec2(rect.width(), 2.0),
+                    );
+                    ui.put(
+                        bar,
+                        egui::ProgressBar::new(0.0)
+                            .animate(true)
+                            .desired_height(2.0)
+                            .desired_width(rect.width()),
+                    )
+                    .on_hover_text(format!("{progress}\n{}", text::PROGRESS_UNKNOWN_TOTAL));
+                }
             });
     }
 
@@ -2268,6 +2398,7 @@ impl HogMap {
                     let matches = results.matches;
                     self.cache = Some(Cache {
                         key,
+                        coverage: live::coverage(index, &layout),
                         layout,
                         cells: Vec::new(),
                         matches,
@@ -2344,10 +2475,10 @@ impl HogMap {
             );
             for (placed, cell) in cache.layout.placed.iter().zip(&mut cache.cells) {
                 if let NodeRef::Entry(id) = placed.node {
-                    if index
+                    let stale = index
                         .get(id)
-                        .is_some_and(|entry| entry.state == hogmap::index::State::Stale)
-                    {
+                        .is_some_and(|entry| entry.state == hogmap::index::State::Stale);
+                    if stale && self.ghosts.count > 0 {
                         cell.tooltip.push_str(&format!(
                             "\n{}\n{}",
                             text::GHOST_TOOLTIP,
@@ -2356,6 +2487,10 @@ impl HogMap {
                         if index.get(id).is_some_and(|entry| entry.identity.is_none()) {
                             cell.tooltip.push_str(&format!("\n{}", text::WEAK_IDENTITY));
                         }
+                    } else if stale {
+                        // The painter marks stale cells with the dashed border whether or not a
+                        // ghost view is active, so the mark has to say what it means.
+                        cell.tooltip.push_str(&format!("\n{}", text::STALE_TOOLTIP));
                     } else if self.ghosts.weak_matches.contains(&id) {
                         cell.tooltip.push_str(&format!("\n{}", text::WEAK_IDENTITY));
                     }
@@ -2473,6 +2608,7 @@ impl HogMap {
             || self.class_editor.open
             || self.export_preview.is_some()
             || self.options_open
+            || self.bookmark_name.is_some()
         {
             paint::draw(
                 ui.painter(),
@@ -2571,6 +2707,7 @@ impl HogMap {
             self.shortcuts(&context);
         }
         self.controls(ui);
+        self.notices_panel(ui);
         self.status(ui);
         self.volume_header(ui);
         let map_background = Theme::current(&context).palette().map_background;
@@ -2580,7 +2717,10 @@ impl HogMap {
                     .fill(map_background)
                     .inner_margin(2.0),
             )
-            .show(ui, |ui| self.map(ui));
+            .show(ui, |ui| {
+                self.map(ui);
+                self.coverage_strip(ui);
+            });
         if let Some(action) = self.chooser.show(&context, self.scan_started.is_some()) {
             match action {
                 dialog::Action::Start(root) => self.start_real_scan(root),
@@ -2602,6 +2742,7 @@ impl HogMap {
         }
         self.show_export_preview(&context);
         self.show_options(&context);
+        self.show_bookmark_name(&context);
         if self.about {
             let mut about = text::about(self.metric);
             if let Some(index) = self.reducer.index() {

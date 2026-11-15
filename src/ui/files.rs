@@ -172,6 +172,8 @@ impl HogMap {
         self.status_cache = None;
     }
     pub(super) fn install_snapshot(&mut self, path: PathBuf, snapshot: snapshot::Snapshot) {
+        self.watch_enabled = false;
+        self.stop_watch();
         let generation = ScanGeneration::new(self.reducer.generation().value().wrapping_add(1));
         self.reducer =
             hogmap::scan::ScanReducer::from_snapshot(generation, snapshot.index, snapshot.terminal);

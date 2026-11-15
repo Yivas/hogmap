@@ -272,6 +272,8 @@ pub struct ScanReducer {
     keys: ProducerKeys,
     diagnostics: ScanDiagnostics,
     progress: Progress,
+    observed_progress: Progress,
+    directory_failures: std::collections::VecDeque<u32>,
     terminal: Option<Terminal>,
     memory_before_release: (usize, usize),
     pending_batch: Option<PendingBatch>,
@@ -335,6 +337,8 @@ impl ScanReducer {
             keys: ProducerKeys::default(),
             diagnostics: ScanDiagnostics::default(),
             progress: Progress::default(),
+            observed_progress: Progress::default(),
+            directory_failures: Default::default(),
             terminal: None,
             memory_before_release: (0, 0),
             pending_batch: None,
@@ -388,6 +392,16 @@ impl ScanReducer {
 
     pub fn progress(&self) -> Progress {
         self.progress
+    }
+
+    /// Accepted records/outcomes, independent of lossy producer progress messages.
+    pub fn observed_progress(&self) -> Progress {
+        self.observed_progress
+    }
+
+    /// At most 256 recent failure codes, including outcomes carried inside batches.
+    pub fn take_directory_failures(&mut self) -> impl Iterator<Item = u32> + '_ {
+        self.directory_failures.drain(..)
     }
 
     pub fn terminal(&self) -> Option<Terminal> {
@@ -600,6 +614,7 @@ impl ScanReducer {
                         .expect("inserted metadata ID");
                 }
                 self.keys.insert(record.key, id);
+                self.observed_progress.records += 1;
             }
             Err(_) => self.diagnostics.invalid_records += 1,
         }
@@ -619,6 +634,7 @@ impl ScanReducer {
                 let root = index.root();
                 self.index = Some(index);
                 self.keys.insert(record.key, root);
+                self.observed_progress.records += 1;
             }
             Err(_) => self.diagnostics.invalid_records += 1,
         }
@@ -661,8 +677,15 @@ impl ScanReducer {
             return;
         }
         if let Some(code) = failure_code {
+            self.observed_progress.directories_failed += 1;
+            if self.directory_failures.len() == crate::notices::MAX_NOTICES {
+                self.directory_failures.pop_front();
+            }
+            self.directory_failures.push_back(code);
             self.diagnostics.directory_failures += 1;
             self.diagnostics.last_directory_failure_code = Some(code);
+        } else {
+            self.observed_progress.directories_done += 1;
         }
     }
 

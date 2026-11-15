@@ -24,7 +24,7 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [lints.rust]
-# Audited unsafe is isolated to scan_win/volume/shell_menu FFI and name_arena's whole-name accessor.
+# Audited unsafe is isolated to scan_win/volume/shell_menu/file_dialog/watch FFI and name_arena's whole-name accessor.
 unsafe_code = "deny"
 
 [lints.clippy]

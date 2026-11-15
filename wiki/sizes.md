@@ -56,6 +56,10 @@ The provisional tooltip says “Capacity read when the scan started; confirmed a
 
 The window gives area to known logical bytes by default, or to known allocated bytes when that view is chosen. A folder with no known apparent bytes in the selected metric gets no rectangle. Known nonzero hardlink names do get area even if another name of that identity appears elsewhere. Its entries stay in the index, and any unknown sizes keep their unknown signal rather than becoming zero. Whether such a folder should keep a navigable empty cell is a product decision for the window and is not implemented.
 
+## Coverage counts entries, not bytes
+
+The strip on the map's left edge counts entries, not bytes. Each one-pixel column is one visible depth band of the drawn layout, divided by entry count into complete, partial/stale/inaccessible and pending/unknown entries, and hovering a column gives the three counts. A complete directory means its immediate children were enumerated, not that its descendants are complete. The counts cover the drawn cells and the members an aggregate groups, so an entry with no area that belongs to no group is not counted at all. The strip is not a volume percentage and changes no size.
+
 ## Item actions do not measure recoverable space
 
 Right-clicking a real file or folder selects it and opens Windows' classic shell context menu; Shift requests extended verbs. Windows and installed extensions execute only the command you choose, with their configured confirmations. This is the menu behind “Show more options” in Windows 11, not the compact modern menu. Rename can be absent or unsupported without Explorer's editable view. HogMap adds no file-changing or free-space command. A displayed apparent/allocated size is still not a promise about the space any shell command will recover.

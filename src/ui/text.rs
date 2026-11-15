@@ -26,6 +26,7 @@ pub const GHOST_TOTALS: &str = "Map includes ghosts at last listed sizes; its to
 pub const GHOST_TOOLTIP: &str = "Ghost: not found in the latest scan; last known listed size.";
 pub const WEAK_IDENTITY: &str =
     "Path comparison only: a file identity was unavailable, so this match is less reliable.";
+pub const STALE_TOOLTIP: &str = "Changed since the scan; Rescan to refresh.";
 pub const OPTIONS: &str = "Options…";
 pub const OPTIONS_SESSION: &str =
     "Changes apply immediately, for this session only. Area: 1–1,000,000 px²; header: 0–64 px.";
@@ -33,6 +34,73 @@ pub const MINIMUM_AREA: &str = "Minimum cell area";
 pub const HEADER_HEIGHT: &str = "Header height";
 pub const GROUP_SMALL: &str = "Group small siblings";
 pub const CLOSE_OPTIONS: &str = "Close";
+
+pub const WATCH_CHANGES: &str = "Watch for changes";
+pub const WATCH_TIP: &str = "Session only. Local root notifications mark metadata stale; no automatic rescans. Stops on Stop or close; restarts after a rescan.";
+pub const WATCH_STARTING: &str = "Starting watch… scan unchanged until notifications arrive.";
+pub const WATCH_ACTIVE: &str = "Watching for changes; Rescan applies them.";
+pub const WATCH_STOPPED: &str = "Watching stopped; metadata is not refreshed automatically.";
+pub const WATCH_PANIC: &str = "Watch thread stopped unexpectedly; use Rescan.";
+pub const WATCH_START_ERROR: &str = "Watch thread could not start; scan unchanged. Use Rescan.";
+pub const WATCH_OVERFLOW: &str = "Watch overflow or notification limit: change count and affected paths unknown. Entire root is stale; Rescan to refresh.";
+pub const RESCAN_FOLDER: &str = "Rescan this folder";
+pub const RESCAN_FOLDER_TIP: &str = "Ctrl+F5. Requests this location; falls back visibly to a full rescan when the append-only index cannot merge safely.";
+pub const RESCAN_FOLDER_APPEND_ONLY: &str = "Full rescan: this append-only index has no transactional subtree replacement; identity charges and corrections cannot be merged safely.";
+pub const RESCAN_FOLDER_GHOSTS: &str =
+    "Full rescan: a ghost view cannot be merged with a live subtree.";
+pub const RESCAN_FOLDER_MEMBERS: &str =
+    "Full rescan: grouped members are not one filesystem folder.";
+pub const RESCAN_FOLDER_MISSING: &str =
+    "Full rescan: this location does not resolve in the current root.";
+pub const SCAN_NOTICES: &str = "Scan fallback and skip summary";
+pub const PROGRESS_UNKNOWN_TOTAL: &str = "Total entry count is unknown: indeterminate activity, not a percentage of the volume. Counts are accepted records and immediate directory outcomes. Known bytes belong to the current scan root, not volume-used bytes.";
+pub const ADD_BOOKMARK: &str = "Add bookmark…";
+pub const BOOKMARKS: &str = "Bookmarks";
+pub const BOOKMARK_NAME: &str = "Name (up to 128 characters)";
+pub const SAVE_BOOKMARK: &str = "Add bookmark";
+pub const REMOVE_BOOKMARK: &str = "Remove";
+pub const CLEAR_BOOKMARKS: &str = "Clear all";
+pub const NO_BOOKMARKS: &str = "No bookmarks. Add the current location from View.";
+pub const BOOKMARK_MISSING: &str = "Bookmark location or members are absent from this scan. The bookmark is retained; choose another location or Rescan.";
+pub const BOOKMARK_PRIVACY: &str = "Bookmarks save chosen names and paths in bookmarks.json beside preferences. Remove or Clear all to delete them.";
+pub const BOOKMARK_STORAGE_UNAVAILABLE: &str =
+    "Bookmark storage unavailable; no bookmarks were saved.";
+pub const SILENCE_NOTICES: &str = "Silence";
+pub const NOTICES_SESSION: &str = "Stops new notices, keeping existing entries. Last 256 notices, in memory only; detail is bounded to 2048 characters.";
+pub fn notice_count(count: usize) -> String {
+    format!("Notices ({count})")
+}
+pub fn watch_changes(count: u64) -> String {
+    format!("Watch: {count} change notifications; affected folders are stale. Rescan to refresh.")
+}
+pub fn progress(progress: hogmap::scan::Progress, bytes: Option<u64>) -> String {
+    format!(
+        "{} entries seen · {} directories complete · {} failed · {} known root bytes · total entries unknown",
+        progress.records,
+        progress.directories_done,
+        progress.directories_failed,
+        bytes.map_or_else(|| "unknown".into(), |b| b.to_string())
+    )
+}
+pub fn coverage(depth: usize, complete: usize, partial: usize, unknown: usize) -> String {
+    format!(
+        "Visible depth {depth}: {complete} complete, {partial} partial/stale/inaccessible, {unknown} pending/unknown. Counts describe visible entries (including grouped members), not bytes or a volume percentage. Directory completion covers immediate children only."
+    )
+}
+pub fn bookmark_detail(bookmark: &hogmap::bookmarks::Bookmark) -> String {
+    let root = bookmark
+        .root
+        .as_ref()
+        .map_or_else(|| SAMPLE.into(), |root| root.display().to_string());
+    location(
+        &root,
+        &bookmark.path,
+        bookmark.members.as_ref().map(|members| Subset {
+            members: members.len(),
+            small: false,
+        }),
+    )
+}
 
 pub const TITLE: &str = "HogMap";
 pub const FILE: &str = "File";
@@ -111,7 +179,7 @@ pub const FORWARD_TIP: &str = "Forward · Alt+Right";
 pub const UP_TIP: &str = "Up · Backspace";
 pub const HOME_TIP: &str = "Home · Alt+Home";
 pub const RESCAN_TIP: &str = "Rescan selected scan root or sample · F5";
-pub const STOP_TIP: &str = "Stop scan or hard-link checks · Esc";
+pub const STOP_TIP: &str = "Stop scan, hard-link checks or watching · Esc";
 pub const HIGHLIGHT_TIP: &str = "Focus filter expression · Ctrl+F";
 pub const MORE_DETAIL: &str = "More detail";
 pub const LESS_DETAIL: &str = "Less detail";
@@ -236,7 +304,7 @@ pub fn empty_map(metric: SizeMetric) -> String {
 
 pub fn about(metric: SizeMetric) -> String {
     format!(
-        "Read-only Windows folder and drive scanning. No release yet.\nRight-click a real file or folder for Windows' classic shell menu; Shift requests extended commands. Windows and installed shell extensions own these actions and their confirmations, including any Delete action. HogMap implements no changes to analyzed items and never invokes a command automatically. Rename may be absent or unsupported without Explorer's editable view. The menu can block or crash through third-party extensions. Rescan after changes; the index is not refreshed automatically.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nFilter syntax: * and ? name masks; \\temp folder components; | excludes masks; s>1mb or >1mb logical, d<16k allocated; c/m/a age with s/m/h/d/w; + or - :attr:hidden, :class:images and :red / :1..:4 / :tag:. Positive masks, classes and tags OR; exclusions and other conditions AND. Age reference is fixed when applied. Highlight dims non-matches and keeps full geometry. Filter hides non-matches and reports matched, undecided and full snapshot bytes separately; volume cells are omitted. Unknown decisions stay visible, never counted as matches. Select a file or folder, then Ctrl+1/2/3/4 assigns tag 1 Red/2 Yellow/3 Green/4 Blue; Ctrl+0 clears it, including inheritance. View lists these actions. Numbered marks and accessible cell names identify effective tags. View → File classes… adds/edits extensions and fixed colours or deletes classes, reparsing the active expression after each change. Deleting a class in use asks for confirmation; a missing-class warning offers Clear filter. View → Flat Colors / File Classes or Ctrl+T changes file fills, never geometry. Fuzzy keywords are not implemented.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt an unzoomed whole-volume root, independently known Free space is drawn in either size view, during scanning and after eligible final observations. Running capacity is provisional; Not yet scanned · estimate is a residual, not measured inaccessible space. Logical tree bytes and volume-capacity bytes are comparable only in order of magnitude. Reserved by Windows retains its allocated/Finished gates. These cells have no file actions. The map is not a complete disk partition: final estimated difference is diagnostic text only, never an inaccessible-space block. More/Less detail changes minimum cell area with a safety depth bound; it is not saved.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nAutomatic persistence saves only window geometry and theme. File → Save snapshot… (Ctrl+S) explicitly saves metadata, tags, origin observations and the metric to a versioned .hogmap file. File → Open snapshot… (Ctrl+O) opens it without checking stored paths: the header says not live, shell actions and Rescan are disabled. Save/Open wait until scanning and hard-link checks stop. File → Export view as text… (Ctrl+E) previews the drawn cells and current zoom/filter before saving plain text; unknown sizes are not zero. File shortcuts do not intercept expression typing. Snapshots and exports contain private names and paths; share only sanitized files. No file contents, filters, navigation, classes or map style are stored in snapshots.",
+        "Read-only Windows folder and drive scanning. No release yet.\nRight-click a real file or folder for Windows' classic shell menu; Shift requests extended commands. Windows and installed shell extensions own these actions and their confirmations, including any Delete action. HogMap implements no changes to analyzed items and never invokes a command automatically. Rename may be absent or unsupported without Explorer's editable view. The menu can block or crash through third-party extensions. Rescan after changes; the index is not refreshed automatically.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nFilter syntax: * and ? name masks; \\temp folder components; | excludes masks; s>1mb or >1mb logical, d<16k allocated; c/m/a age with s/m/h/d/w; + or - :attr:hidden, :class:images and :red / :1..:4 / :tag:. Positive masks, classes and tags OR; exclusions and other conditions AND. Age reference is fixed when applied. Highlight dims non-matches and keeps full geometry. Filter hides non-matches and reports matched, undecided and full snapshot bytes separately; volume cells are omitted. Unknown decisions stay visible, never counted as matches. Select a file or folder, then Ctrl+1/2/3/4 assigns tag 1 Red/2 Yellow/3 Green/4 Blue; Ctrl+0 clears it, including inheritance. View lists these actions. Numbered marks and accessible cell names identify effective tags. View → File classes… adds/edits extensions and fixed colours or deletes classes, reparsing the active expression after each change. Deleting a class in use asks for confirmation; a missing-class warning offers Clear filter. View → Flat Colors / File Classes or Ctrl+T changes file fills, never geometry. Fuzzy keywords are not implemented.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt an unzoomed whole-volume root, independently known Free space is drawn in either size view, during scanning and after eligible final observations. Running capacity is provisional; Not yet scanned · estimate is a residual, not measured inaccessible space. Logical tree bytes and volume-capacity bytes are comparable only in order of magnitude. Reserved by Windows retains its allocated/Finished gates. These cells have no file actions. The map is not a complete disk partition: final estimated difference is diagnostic text only, never an inaccessible-space block. More/Less detail changes minimum cell area with a safety depth bound; it is not saved.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nAutomatic preferences save only window geometry and theme. View → Add bookmark explicitly saves a named location to a separate bounded bookmarks.json containing chosen paths; Remove and Clear all delete entries. View → Watch for changes is session-only and marks changed folders stale; it never rescans automatically. Rescan this folder (Ctrl+F5) falls back visibly to a full rescan because the index cannot safely merge a subtree. Notices is a bounded in-memory console; Silence stops new entries. File → Save snapshot… (Ctrl+S) explicitly saves metadata, tags, origin observations and the metric to a versioned .hogmap file. File → Open snapshot… (Ctrl+O) opens it without checking stored paths: the header says not live, shell actions and Rescan are disabled. Save/Open wait until scanning and hard-link checks stop. File → Export view as text… (Ctrl+E) previews the drawn cells and current zoom/filter before saving plain text; unknown sizes are not zero. File shortcuts do not intercept expression typing. Snapshots and exports contain private names and paths; share only sanitized files. No file contents, filters, navigation, classes or map style are stored in snapshots.",
         metric_bytes(metric)
     )
 }
