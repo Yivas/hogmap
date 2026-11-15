@@ -46,6 +46,25 @@ fn filters_follow_the_documented_name_size_and_combination_rules() {
 }
 
 #[test]
+fn leading_signs_remain_literal_name_mask_characters() {
+    for (expression, name, expected) in [
+        ("-report.txt", "-report.txt", Match::Yes),
+        ("-report.txt", "report.txt", Match::No),
+        ("+report.txt", "+report.txt", Match::Yes),
+        ("+report.txt", "report.txt", Match::No),
+        ("+*.bin", "+a.bin", Match::Yes),
+        ("+*.bin", "a.bin", Match::No),
+    ] {
+        assert_eq!(
+            Filter::parse(expression)
+                .unwrap()
+                .evaluate(OsStr::new(name), Some(100)),
+            expected
+        );
+    }
+}
+
+#[test]
 fn invalid_or_excessive_filters_are_rejected_before_use() {
     for expression in [
         "*.jpg;",
@@ -53,9 +72,18 @@ fn invalid_or_excessive_filters_are_rejected_before_use() {
         "*.jpg;;>1mb",
         "|",
         "||*.jpg",
-        "\\temp",
+        "\\\\temp",
         "a/b",
-        ":red",
+        ":purple",
+        ":attr:bogus",
+        ":class:missing",
+        "m<10",
+        "m<1.5d",
+        "c>-1s",
+        "a<18446744073709551615w",
+        "s>1",
+        "d<2xb",
+        "-:tag:missing",
         ">1year",
         ">1 mb",
         ">-1mb",

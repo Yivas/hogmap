@@ -4,7 +4,7 @@ HogMap is a Windows 11 x64 disk-space analyzer in development. Its intended inte
 
 ## What exists today
 
-**The desktop window can scan real Windows folders and drive roots read-only. There is no downloadable release or installer yet.** The drive/path chooser lists real drives and also offers a separate synthetic sample generated in memory. The window supports progressive updates, selection, directory and aggregate zoom, navigation history, cancellation and filter highlighting. New scan, Rescan and Stop have visible names. Drives use aligned free/total rows. A one-line status shows progress, elapsed time and brief selection feedback, with full paths/accounting in hover and accessible text. More/Less detail in the toolbar, View and Ctrl++/Ctrl+- adjusts density without a two-level cap or saved preference. The Cargo version `0.0.0` is an unpublished development marker.
+**The desktop window can scan real Windows folders and drive roots read-only. There is no downloadable release or installer yet.** The drive/path chooser lists real drives and also offers a separate synthetic sample generated in memory. The window supports progressive updates, selection, directory and aggregate zoom, navigation history, cancellation, highlighting and filtered geometry. New scan, Rescan and Stop have visible names. Drives use aligned free/total rows. A one-line status shows progress, elapsed time and brief selection feedback, with full paths/accounting in hover and accessible text. More/Less detail in the toolbar, View and Ctrl++/Ctrl+- adjusts density without a two-level cap or saved preference. The Cargo version `0.0.0` is an unpublished development marker.
 
 The engine reads directory metadata, never file contents. Totals are labelled **Apparent size**, counting each listed name with a correction only to the charged record; aliases retain listed sizes. This can exceed disk capacity, with no full per-name authoritative correction or error bound. Corrected unique allocated bytes per identity determine the separate estimated difference, not map area. **Cell sizes and areas use that same apparent total in both views**, including each hardlink name; the [size guide](./sizes.md) explains how the charged record and listed aliases contribute. The header shows queried volume free/total capacity, or unknown, separately from map bytes. The status tooltip and its accessible label show completeness, directory failures and the engine's fallback/skip counts once scanning returns. Passing tests does not establish scan speed, graphical compatibility, physical attribution or portable distribution. The [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md) describes the implemented behavior.
 
@@ -13,7 +13,7 @@ Right-click a real file or folder for Windows' **classic shell menu** (“Show m
 ## Find what you need
 
 - [Understand sizes](./sizes.md): why logical bytes, physical attribution and Windows used/free space differ.
-- [Work with filters](./filters.md): examples from the implemented name and logical-size subset.
+- [Filters](./filters.md): masks, folders, sizes, ages, attributes, classes and tags, with highlighting and filtered geometry.
 - [Run a scan or sample and develop the core](./development.md): requirements, checks and contribution links.
 
 ## What the application will do

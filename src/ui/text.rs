@@ -52,7 +52,7 @@ pub const UP_TIP: &str = "Up · Backspace";
 pub const HOME_TIP: &str = "Home · Alt+Home";
 pub const RESCAN_TIP: &str = "Rescan selected scan root or sample · F5";
 pub const STOP_TIP: &str = "Stop scan or hard-link checks · Esc";
-pub const HIGHLIGHT_TIP: &str = "Focus highlight filter · Ctrl+F";
+pub const HIGHLIGHT_TIP: &str = "Focus filter expression · Ctrl+F";
 pub const MORE_DETAIL: &str = "More detail";
 pub const LESS_DETAIL: &str = "Less detail";
 pub const MORE_DETAIL_TIP: &str = "More detail: smaller minimum cells · Ctrl++ or Ctrl+=";
@@ -71,8 +71,21 @@ pub const BACK: &str = "Back";
 pub const FORWARD: &str = "Forward";
 pub const UP: &str = "Up";
 pub const HOME: &str = "Home";
-pub const FILTER: &str = "Highlight";
-pub const FILTER_HINT: &str = "Name or logical size: *.bin;>1mb";
+pub const FILTER: &str = "Expression";
+pub const HIGHLIGHT_MODE: &str = "Highlight";
+pub const FILTER_MODE: &str = "Filter";
+pub const FILTER_MODE_TIP: &str = "Highlight keeps full geometry. Filter hides non-matches; undecided files stay visible. Ctrl+Shift+F switches mode. Session only.";
+pub const FILTER_HINT: &str = r"*.bin;\temp;s>1mb;d<16k;m<2d;:attr:hidden;:class:images;:red";
+pub fn filter_mode(filtered: bool) -> String {
+    format!(
+        "Filter mode: {}",
+        if filtered {
+            FILTER_MODE
+        } else {
+            HIGHLIGHT_MODE
+        }
+    )
+}
 pub const SAMPLE: &str = "Synthetic sample";
 pub const WAITING: &str = "Waiting for metadata…";
 pub const PARTIAL: &str = "Partial";
@@ -102,11 +115,13 @@ fn metric_title(metric: SizeMetric) -> &'static str {
     }
 }
 
-/// The line under the highlight field. Highlight size conditions stay logical in either view.
+/// Map metric and filter metrics are independent.
 pub fn map_metric(metric: SizeMetric) -> &'static str {
     match metric {
         SizeMetric::Logical => "Map: logical size",
-        SizeMetric::Allocated => "Map: observed allocated size · Highlight uses logical size",
+        SizeMetric::Allocated => {
+            "Map: observed allocated size · s / bare size = logical; d = allocated"
+        }
     }
 }
 
@@ -119,7 +134,7 @@ pub fn empty_map(metric: SizeMetric) -> String {
 
 pub fn about(metric: SizeMetric) -> String {
     format!(
-        "Read-only Windows folder and drive scanning. No release yet.\nRight-click a real file or folder for Windows' classic shell menu; Shift requests extended commands. Windows and installed shell extensions own these actions and their confirmations, including any Delete action. HogMap implements no file changes and never invokes a command automatically. Rename may be absent or unsupported without Explorer's editable view. The menu can block or crash through third-party extensions. Rescan after changes; the index is not refreshed automatically.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nHighlight size conditions always use logical size.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt an unzoomed whole-volume root, independently known Free space is drawn in either size view, during scanning and after eligible final observations. Running capacity is provisional; Not yet scanned · estimate is a residual, not measured inaccessible space. Logical tree bytes and volume-capacity bytes are comparable only in order of magnitude. Reserved by Windows retains its allocated/Finished gates. These cells have no file actions. The map is not a complete disk partition: final estimated difference is diagnostic text only, never an inaccessible-space block. More/Less detail changes minimum cell area with a safety depth bound; it is not saved.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
+        "Read-only Windows folder and drive scanning. No release yet.\nRight-click a real file or folder for Windows' classic shell menu; Shift requests extended commands. Windows and installed shell extensions own these actions and their confirmations, including any Delete action. HogMap implements no file changes and never invokes a command automatically. Rename may be absent or unsupported without Explorer's editable view. The menu can block or crash through third-party extensions. Rescan after changes; the index is not refreshed automatically.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nFilter syntax: * and ? name masks; \\temp folder components; | excludes masks; s>1mb or >1mb logical, d<16k allocated; c/m/a age with s/m/h/d/w; + or - :attr:hidden, :class:images and :red / :1..:4 / :tag:. Positive masks, classes and tags OR; exclusions and other conditions AND. Age reference is fixed when applied. Highlight dims non-matches and keeps full geometry. Filter hides non-matches and reports matched, undecided and full snapshot bytes separately; volume cells are omitted. Unknown decisions stay visible, never counted as matches. Tags/classes are in memory; editing UI and fuzzy keywords are not implemented.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt an unzoomed whole-volume root, independently known Free space is drawn in either size view, during scanning and after eligible final observations. Running capacity is provisional; Not yet scanned · estimate is a residual, not measured inaccessible space. Logical tree bytes and volume-capacity bytes are comparable only in order of magnitude. Reserved by Windows retains its allocated/Finished gates. These cells have no file actions. The map is not a complete disk partition: final estimated difference is diagnostic text only, never an inaccessible-space block. More/Less detail changes minimum cell area with a safety depth bound; it is not saved.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
         metric_bytes(metric)
     )
 }
@@ -272,22 +287,46 @@ pub fn size(bytes: u64, unknown: bool) -> String {
 
 pub fn filter_error(error: FilterError) -> &'static str {
     match error {
-        FilterError::TooLong => {
-            "Filter exceeds 4096 bytes. Previous valid highlight is still active."
-        }
+        FilterError::TooLong => "Filter exceeds 4096 bytes. Previous valid filter is still active.",
         FilterError::TooManyConditions => {
-            "Filter exceeds 64 conditions. Previous valid highlight is still active."
+            "Filter exceeds 64 conditions. Previous valid filter is still active."
         }
         FilterError::EmptyCondition => {
-            "Empty filter condition. Previous valid highlight is still active."
+            "Empty filter condition. Previous valid filter is still active."
         }
         FilterError::UnsupportedSyntax => {
-            "Unsupported filter syntax. Previous valid highlight is still active."
+            "Unsupported filter syntax. Previous valid filter is still active."
         }
         FilterError::InvalidSize => {
-            "Use an integer size such as >100mb. Previous valid highlight is still active."
+            "Use an integer size such as s>100mb or d<16k. Previous valid filter is still active."
+        }
+        FilterError::InvalidDuration => {
+            "Use an integer age with s/m/h/d/w, such as m<10s. Previous valid filter is still active."
+        }
+        FilterError::UnknownAttribute => {
+            "Unknown attribute; use :attr:hidden, for example. Previous valid filter is still active."
+        }
+        FilterError::UnknownClass => "Unknown class. Previous valid filter is still active.",
+        FilterError::UnknownTag => {
+            "Unknown tag; use :1..:4, :red, :yellow, :green, :blue or :tag:. Previous valid filter is still active."
         }
     }
+}
+
+pub fn filter_totals(totals: hogmap::filter::FilterTotals, full: Option<MetricSummary>) -> String {
+    let bytes = |value: Option<u64>| {
+        value.map_or_else(
+            || "overflow / unavailable".into(),
+            |bytes| size(bytes, false),
+        )
+    };
+    format!(
+        "Filtered matches: {} | Undecided: {} ({} unknown sizes) | Full snapshot: {}",
+        bytes(totals.matched_bytes),
+        bytes(totals.undecided_bytes),
+        totals.unknown_size_files,
+        bytes(full.and_then(|summary| summary.apparent_bytes().ok()))
+    )
 }
 
 /// Format the apparent total without narrowing or concealing arithmetic overflow.

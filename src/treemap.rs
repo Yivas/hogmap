@@ -123,7 +123,7 @@ pub fn layout_with_metric(
     params: LayoutParams,
     metric: SizeMetric,
 ) -> Result<Layout, LayoutError> {
-    layout_selection(index, root, None, rect, params, metric)
+    layout_selection(index, root, None, rect, params, metric, None)
 }
 
 /// Lays out selected siblings by logical bytes, keeping their original IDs and descendant trees.
@@ -158,7 +158,39 @@ pub fn layout_members_with_metric(
     {
         return Err(LayoutError::UnknownRoot);
     }
-    layout_selection(index, parent, Some(members), rect, params, metric)
+    layout_selection(index, parent, Some(members), rect, params, metric, None)
+}
+
+/// Filters geometry using previously evaluated decisions. Unknown files retain their observed
+/// area and undecided tone; they are not matches. No names or expressions are evaluated here.
+pub fn layout_filtered(
+    index: &Index,
+    root: EntryId,
+    members: Option<&[EntryId]>,
+    rect: Rect,
+    params: LayoutParams,
+    metric: SizeMetric,
+    matches: &[crate::filter::Match],
+) -> Result<Layout, LayoutError> {
+    if matches.len() != index.len()
+        || members.is_some_and(|members| {
+            members.is_empty()
+                || members.iter().any(|id| {
+                    index
+                        .get(*id)
+                        .is_none_or(|entry| entry.parent != Some(root))
+                })
+        })
+    {
+        return Err(LayoutError::UnknownRoot);
+    }
+    if let Some(members) = members {
+        let mut seen = HashSet::new();
+        if members.iter().any(|id| !seen.insert(*id)) {
+            return Err(LayoutError::UnknownRoot);
+        }
+    }
+    layout_selection(index, root, members, rect, params, metric, Some(matches))
 }
 
 fn layout_selection(
@@ -168,6 +200,7 @@ fn layout_selection(
     rect: Rect,
     params: LayoutParams,
     metric: SizeMetric,
+    matches: Option<&[crate::filter::Match]>,
 ) -> Result<Layout, LayoutError> {
     validate_rect(rect)?;
     if !params.min_pixel_area.is_finite() || params.min_pixel_area <= 0.0 {
@@ -181,8 +214,11 @@ fn layout_selection(
         .layout_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if storage.as_ref().is_none_or(|cache| cache.metric != metric) {
-        *storage = Some(LayoutData::build(index, metric)?);
+    if storage
+        .as_ref()
+        .is_none_or(|cache| cache.metric != metric || cache.matches.as_deref() != matches)
+    {
+        *storage = Some(LayoutData::build(index, metric, matches)?);
     }
     let data = storage.as_mut().expect("initialized layout data");
     let mut selected_children = members.map(<[EntryId]>::to_vec);
@@ -261,12 +297,17 @@ fn layout_selection(
             content_area * totals[id.position()].known_sum as f64 / total as f64
                 >= f64::from(params.min_pixel_area)
         });
-        let aggregate_members = child_ids[keep..].to_vec();
-        let aggregate_weight = aggregate_members
+        let mut aggregate_members = child_ids[keep..].to_vec();
+        // Parent totals already include all children. Visit only the retained prefix for its
+        // complement, rather than summing a potentially million-entry small-item aggregate.
+        let retained_weight = child_ids[..keep]
             .iter()
             .try_fold(0_u64, |sum, id| {
                 sum.checked_add(totals[id.position()].known_sum)
             })
+            .ok_or(LayoutError::SizeOverflow)?;
+        let aggregate_weight = total
+            .checked_sub(retained_weight)
             .ok_or(LayoutError::SizeOverflow)?;
         let mut cells: Vec<Cell> = child_ids[..keep]
             .iter()
@@ -314,7 +355,7 @@ fn layout_selection(
                         content: cell_rect,
                         known_sum: aggregate_weight,
                         has_unknown,
-                        members: aggregate_members.clone(),
+                        members: std::mem::take(&mut aggregate_members),
                     });
                 }
             }
@@ -350,13 +391,18 @@ struct Totals {
 #[derive(Debug)]
 pub(crate) struct LayoutData {
     metric: SizeMetric,
+    matches: Option<Vec<crate::filter::Match>>,
     children: Vec<Vec<EntryId>>,
     totals: Vec<Totals>,
     sorted: Vec<bool>,
     child_capacity_bytes: usize,
 }
 impl LayoutData {
-    fn build(index: &Index, metric: SizeMetric) -> Result<Self, LayoutError> {
+    fn build(
+        index: &Index,
+        metric: SizeMetric,
+        matches: Option<&[crate::filter::Match]>,
+    ) -> Result<Self, LayoutError> {
         let mut children = Vec::with_capacity(index.len() + 4096);
         children.resize_with(index.len(), Vec::new);
         for (id, entry) in index.entries() {
@@ -372,8 +418,9 @@ impl LayoutData {
         sorted.resize(index.len(), false);
         Ok(Self {
             metric,
+            matches: matches.map(<[_]>::to_vec),
             children,
-            totals: subtree_totals(index, metric)?,
+            totals: subtree_totals(index, metric, matches)?,
             sorted,
             child_capacity_bytes,
         })
@@ -383,8 +430,14 @@ impl LayoutData {
             + self.totals.capacity() * std::mem::size_of::<Totals>()
             + self.sorted.capacity() * std::mem::size_of::<bool>()
             + self.child_capacity_bytes
+            + self.matches.as_ref().map_or(0, |matches| {
+                matches.capacity() * std::mem::size_of::<crate::filter::Match>()
+            })
     }
     pub(crate) fn append(&mut self, index: &Index, id: EntryId) -> Result<(), LayoutError> {
+        if self.matches.is_some() {
+            return Err(LayoutError::UnknownRoot);
+        }
         if self.children.len() == self.children.capacity() {
             self.children.reserve(4096);
         }
@@ -437,7 +490,15 @@ impl LayoutData {
         next: State,
     ) {
         let entry = index.get(id).expect("existing state entry");
-        if previous == next || (entry.kind == Kind::File && self.metric.of(entry.sizes).is_none()) {
+        if previous == next
+            || (entry.kind == Kind::File
+                && (self.metric.of(entry.sizes).is_none()
+                    || self.matches.as_ref().is_some_and(|matches| {
+                        matches[id.position()] != crate::filter::Match::Yes
+                    })))
+        {
+            // Excluded files contribute no uncertainty; undecided files always contribute one.
+            // Neither contribution changes when their scan state changes.
             return;
         }
         let before = previous != State::Complete;
@@ -457,7 +518,11 @@ impl LayoutData {
     }
 }
 
-fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, LayoutError> {
+fn subtree_totals(
+    index: &Index,
+    metric: SizeMetric,
+    matches: Option<&[crate::filter::Match]>,
+) -> Result<Vec<Totals>, LayoutError> {
     let mut seen_identities: HashSet<FileIdentity> = HashSet::new();
     let mut totals = Vec::with_capacity(index.len() + 4096);
     totals.resize(index.len(), Totals::default());
@@ -481,6 +546,18 @@ fn subtree_totals(index: &Index, metric: SizeMetric) -> Result<Vec<Totals>, Layo
                     };
                 }
                 None => has_unknown = true,
+            }
+        }
+        if entry.kind == Kind::File
+            && let Some(matches) = matches
+        {
+            match matches[id.position()] {
+                crate::filter::Match::No => {
+                    known_sum = 0;
+                    has_unknown = false;
+                }
+                crate::filter::Match::Unknown => has_unknown = true,
+                crate::filter::Match::Yes => {}
             }
         }
         totals[id.position()] = Totals {

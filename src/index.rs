@@ -203,6 +203,8 @@ pub struct Index {
     // One lazy metric cache belongs to this snapshot; mutations maintain it or invalidate it.
     pub(crate) layout_cache: std::sync::Mutex<Option<crate::treemap::LayoutData>>,
     pub(crate) filter_cache: std::sync::Mutex<Option<crate::filter::MatchCache>>,
+    filter_metadata: Vec<crate::filter::Metadata>,
+    pub(crate) tags: crate::filter::TagTable,
 }
 
 impl Index {
@@ -229,6 +231,8 @@ impl Index {
             incomplete_entries: 1,
             layout_cache: std::sync::Mutex::new(None),
             filter_cache: std::sync::Mutex::new(None),
+            filter_metadata: Vec::new(),
+            tags: crate::filter::TagTable::default(),
         })
     }
 
@@ -252,11 +256,54 @@ impl Index {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .as_ref()
-                .map_or(0, |cache| cache.memory_bytes()),
+                .map_or(0, |cache| cache.memory_bytes())
+                + self.filter_metadata.capacity() * std::mem::size_of::<crate::filter::Metadata>()
+                + self.tags.memory_bytes(),
             charged_identity_bytes: self.identity_charges.memory_bytes()
                 + hash_bytes::<(StoredIdentity, Sizes)>(self.authoritative_sizes.capacity())
                 + hash_bytes::<(StoredIdentity, EntryId)>(self.conflict_names.capacity()),
         }
+    }
+
+    /// Supplemental listed metadata; absent observations remain unknown.
+    pub fn filter_metadata(&self, id: EntryId) -> crate::filter::Metadata {
+        self.filter_metadata
+            .get(id.position())
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub fn set_filter_metadata(
+        &mut self,
+        id: EntryId,
+        metadata: crate::filter::Metadata,
+    ) -> Result<(), IndexError> {
+        if self.get(id).is_none() {
+            return Err(IndexError::InvalidParent);
+        }
+        if self.filter_metadata.len() <= id.position() {
+            self.filter_metadata
+                .resize(id.position() + 1, crate::filter::Metadata::default());
+        }
+        self.filter_metadata[id.position()] = metadata;
+        *self
+            .filter_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        Ok(())
+    }
+
+    /// Session-only tag assignment. Zero explicitly clears inherited directory tags.
+    pub fn set_tags(&mut self, id: EntryId, bits: u8) -> Result<(), crate::filter::FilterError> {
+        if self.get(id).is_none() {
+            return Err(crate::filter::FilterError::UnsupportedSyntax);
+        }
+        self.tags.set(id, bits)?;
+        *self
+            .filter_cache
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        Ok(())
     }
 
     pub fn root(&self) -> EntryId {

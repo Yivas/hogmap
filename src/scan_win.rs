@@ -861,13 +861,20 @@ mod platform {
             sent
         }
         fn record(&self, record: ScanRecord) -> bool {
+            self.record_metadata(record, None)
+        }
+        fn record_metadata(
+            &self,
+            record: ScanRecord,
+            metadata: Option<crate::filter::Metadata>,
+        ) -> bool {
             let mut output = self.output.lock().unwrap();
-            if !output.batch.push(record.clone()) {
+            if !output.batch.push_with_metadata(record.clone(), metadata) {
                 if !self.flush(&mut output) {
                     return false;
                 }
                 // An empty batch accepts even one oversized record.
-                assert!(output.batch.push(record));
+                assert!(output.batch.push_with_metadata(record, metadata));
             }
             output.progress.records += 1;
             metrics(|m| m.records += 1);
@@ -1338,6 +1345,7 @@ mod platform {
     }
 
     struct Child {
+        metadata: crate::filter::Metadata,
         name: Vec<u16>,
         attributes: u32,
         tag: u32,
@@ -1368,18 +1376,21 @@ mod platform {
         let name = OsString::from_wide(&child.name);
         // The shared output lock orders this record before any descendant can be appended,
         // even when another worker takes the directory before the batch is flushed.
-        if !shared.record(ScanRecord {
-            key,
-            parent: Some(work.key),
-            name: name.clone(),
-            kind,
-            sizes: if skip.is_some() {
-                Sizes::default()
-            } else {
-                child.sizes
+        if !shared.record_metadata(
+            ScanRecord {
+                key,
+                parent: Some(work.key),
+                name: name.clone(),
+                kind,
+                sizes: if skip.is_some() {
+                    Sizes::default()
+                } else {
+                    child.sizes
+                },
+                identity: child.identity,
             },
-            identity: child.identity,
-        }) {
+            Some(child.metadata),
+        ) {
             return false;
         }
         if kind == Kind::Directory {
@@ -1714,6 +1725,13 @@ mod platform {
                 )
             };
             let child = Child {
+                metadata: crate::filter::Metadata {
+                    created: u64::try_from(entry.CreationTime).unwrap_or(0),
+                    modified: u64::try_from(entry.LastWriteTime).unwrap_or(0),
+                    accessed: u64::try_from(entry.LastAccessTime).unwrap_or(0),
+                    attributes: Some(entry.FileAttributes),
+                    ads: None,
+                },
                 name: name.to_vec(),
                 attributes: entry.FileAttributes,
                 tag: entry.ReparsePointTag,
@@ -1785,6 +1803,16 @@ mod platform {
                 shared,
                 local,
                 Child {
+                    metadata: crate::filter::Metadata {
+                        created: (u64::from(entry.ftCreationTime.dwHighDateTime) << 32)
+                            | u64::from(entry.ftCreationTime.dwLowDateTime),
+                        modified: (u64::from(entry.ftLastWriteTime.dwHighDateTime) << 32)
+                            | u64::from(entry.ftLastWriteTime.dwLowDateTime),
+                        accessed: (u64::from(entry.ftLastAccessTime.dwHighDateTime) << 32)
+                            | u64::from(entry.ftLastAccessTime.dwLowDateTime),
+                        attributes: Some(entry.dwFileAttributes),
+                        ads: None,
+                    },
                     name: entry.cFileName[..end].to_vec(),
                     attributes: entry.dwFileAttributes,
                     tag: entry.dwReserved0,

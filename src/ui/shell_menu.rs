@@ -656,6 +656,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "spawns shell extensions in-process; run manually with cargo test -- --ignored"]
+    // A shell-extension thread can remain in a kernel wait after the deadline and block process
+    // shutdown. A timeout thread alone cannot make this machine-dependent probe suite-safe.
     fn owned_file_parses_binds_and_exposes_an_open_like_verb_without_tracking_or_invoking() {
         struct Fixture(std::path::PathBuf);
         impl Drop for Fixture {
@@ -663,7 +666,6 @@ mod tests {
                 std::fs::remove_dir_all(&self.0).expect("owned shell fixture cleanup");
             }
         }
-        let _apartment = Apartment::enter().expect("COM apartment");
         let root = std::env::temp_dir().join(format!(
             "hogmap-shell-{}-{}",
             std::process::id(),
@@ -676,38 +678,60 @@ mod tests {
         let fixture = Fixture(root);
         let path = fixture.0.join("sample.txt");
         std::fs::write(&path, []).expect("create empty owned item");
-        let menu = PreparedMenu::new(&path, null_mut(), false)
-            .expect("parse, bind, GetUIObjectOf, QueryContextMenu");
-        assert!(unsafe { GetMenuItemCount(menu.popup.0) } > 0);
-        let mut verbs = Vec::new();
-        for offset in 0..menu.command_count.min(512) {
-            let mut name = [0u16; 256];
-            let code = unsafe {
-                (menu.context.table::<MenuVtable>()._command_string)(
-                    menu.context.0.as_ptr(),
-                    offset as usize,
-                    windows_sys::Win32::UI::Shell::GCS_VERBW,
-                    null_mut(),
-                    name.as_mut_ptr().cast(),
-                    name.len() as u32,
-                )
-            };
-            if code >= 0 {
-                let end = name
-                    .iter()
-                    .position(|value| *value == 0)
-                    .unwrap_or(name.len());
-                verbs.push(String::from_utf16_lossy(&name[..end]).to_ascii_lowercase());
+        let worker_root = fixture.0.clone();
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        // Third-party shell extensions can block even a metadata-only context-menu query.
+        // Keep all COM owners on this worker; never join it after the observation deadline.
+        let worker = std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(|| {
+                let _apartment = Apartment::enter().expect("COM apartment");
+                let menu = PreparedMenu::new(&path, null_mut(), false)
+                    .expect("parse, bind, GetUIObjectOf, QueryContextMenu");
+                assert!(unsafe { GetMenuItemCount(menu.popup.0) } > 0);
+                let mut verbs = Vec::new();
+                for offset in 0..menu.command_count.min(512) {
+                    let mut name = [0u16; 256];
+                    let code = unsafe {
+                        (menu.context.table::<MenuVtable>()._command_string)(
+                            menu.context.0.as_ptr(),
+                            offset as usize,
+                            windows_sys::Win32::UI::Shell::GCS_VERBW,
+                            null_mut(),
+                            name.as_mut_ptr().cast(),
+                            name.len() as u32,
+                        )
+                    };
+                    if code >= 0 {
+                        let end = name
+                            .iter()
+                            .position(|value| *value == 0)
+                            .unwrap_or(name.len());
+                        verbs.push(String::from_utf16_lossy(&name[..end]).to_ascii_lowercase());
+                    }
+                }
+                assert!(
+                    verbs.iter().any(|verb| verb.starts_with("open")),
+                    "canonical verbs: {verbs:?}"
+                );
+                assert!(matches!(
+                    metadata(&worker_root.join("missing.txt")),
+                    Err(Error::Missing)
+                ));
+                // No helper HWND, TrackPopupMenuEx, InvokeCommand or content read occurs in this test.
+            });
+            let _ = sender.send(outcome);
+        });
+        match receiver.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(Ok(())) => worker.join().expect("shell observation worker"),
+            Ok(Err(panic)) => std::panic::resume_unwind(panic),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!(
+                    "native shell observation failed: machine-dependent shell extensions exceeded the 10-second deadline, so the menu items, the open-like verb and the missing-path case were never checked; the COM worker stays detached"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("shell observation worker disconnected")
             }
         }
-        assert!(
-            verbs.iter().any(|verb| verb.starts_with("open")),
-            "canonical verbs: {verbs:?}"
-        );
-        assert!(matches!(
-            metadata(&fixture.0.join("missing.txt")),
-            Err(Error::Missing)
-        ));
-        // No helper HWND, TrackPopupMenuEx, InvokeCommand or content read occurs in this test.
     }
 }

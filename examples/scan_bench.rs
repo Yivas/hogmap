@@ -1114,6 +1114,29 @@ fn ui_bench() -> Result<bool, &'static str> {
             counts.1,
             hash.finish()
         );
+        if tag == "real" {
+            let mut evaluations = Vec::new();
+            let mut cached = Vec::new();
+            for _ in 0..5 {
+                std::hint::black_box(hogmap::filter::Filter::default().matches(index));
+                let start = Instant::now();
+                let repeated = filter.match_results(index);
+                evaluations.push(start.elapsed().as_secs_f64() * 1000.0);
+                assert_eq!(repeated.matches, values);
+                let start = Instant::now();
+                std::hint::black_box(filter.match_results(index));
+                cached.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            println!("ui_filter_real_warm_samples_ms={evaluations:?} cached_samples_ms={cached:?}");
+            evaluations.sort_by(f64::total_cmp);
+            cached.sort_by(f64::total_cmp);
+            println!(
+                "ui_filter_real_warm_median_ms={:.3} cached_median_ms={:.3} decision_capacity_bytes={}",
+                evaluations[2],
+                cached[2],
+                values.capacity() * size_of::<hogmap::filter::Match>()
+            );
+        }
         let mut frames = Vec::new();
         for _ in 0..5 {
             let start = Instant::now();
@@ -1136,8 +1159,93 @@ fn ui_bench() -> Result<bool, &'static str> {
             });
             frames.push(start.elapsed().as_secs_f64() * 1000.0);
         }
+        println!("ui_rebuild_full_{tag}_samples_ms={frames:?}");
         frames.sort_by(f64::total_cmp);
         println!("ui_rebuild_full_{tag}_median_ms={:.3}", frames[2]);
+    }
+    // Both consumers use the same cached decisions; this measures cold evaluation separately
+    // from geometry rebuilds, without adding any filesystem work or native window.
+    for (tag, expression) in [
+        ("real", "*.bin;>32kb"),
+        (
+            "complex",
+            r"*.bin;\directory*;s>32kb;d<1gb;m<2w;-:attr:hidden",
+        ),
+    ] {
+        let complex = hogmap::filter::Filter::parse(expression).unwrap();
+        let start = Instant::now();
+        let decisions = complex.matches(index);
+        println!(
+            "ui_filter_{tag}_geometry_evaluation_ms={:.3} matched={} unknown={}",
+            start.elapsed().as_secs_f64() * 1000.0,
+            decisions.matched_files,
+            decisions.unknown_files
+        );
+        let mut filtered_times = Vec::new();
+        let mut filtered_digest = None;
+        for sample in 0..6 {
+            let start = Instant::now();
+            let matches = complex.matches(index);
+            let geometry = hogmap::treemap::layout_filtered(
+                index,
+                index.root(),
+                None,
+                area,
+                params,
+                SizeMetric::Logical,
+                &matches.matches,
+            )
+            .map_err(|_| "ui_filtered_layout_failed")?;
+            let current = digest(&geometry);
+            if let Some(previous) = filtered_digest {
+                assert_eq!(current, previous);
+            }
+            filtered_digest = Some(current);
+            let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+            if sample == 0 {
+                println!("ui_filter_{tag}_geometry_cold_ms={elapsed:.3}");
+            } else {
+                filtered_times.push(elapsed);
+            }
+            std::hint::black_box(geometry);
+        }
+        println!("ui_filter_{tag}_geometry_warm_samples_ms={filtered_times:?}");
+        filtered_times.sort_by(f64::total_cmp);
+        println!(
+            "ui_filter_{tag}_geometry_warm_median_ms={:.3} digest={}",
+            filtered_times[2],
+            filtered_digest.unwrap()
+        );
+    }
+    for (tag, expression) in [
+        ("folder", r"\entry-0000001.bin"),
+        ("class", ":class:documents"),
+        ("wildcard", "*e*n*t*r*y*?.bin"),
+    ] {
+        let filter = hogmap::filter::Filter::parse(expression).unwrap();
+        let start = Instant::now();
+        let direct: Vec<_> = index
+            .entries()
+            .filter(|(_, entry)| entry.kind == Kind::File)
+            .map(|(id, _)| filter.evaluate_entry(index, id))
+            .collect();
+        let direct_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let mut times = Vec::new();
+        for _ in 0..5 {
+            std::hint::black_box(hogmap::filter::Filter::default().matches(index));
+            let start = Instant::now();
+            let results = filter.matches(index);
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            assert!(
+                index
+                    .entries()
+                    .filter(|(_, entry)| entry.kind == Kind::File)
+                    .zip(&direct)
+                    .all(|((id, _), direct)| results.matches[id.position()] == *direct)
+            );
+            std::hint::black_box(results);
+        }
+        println!("ui_filter_{tag}_warm_samples_ms={times:?} direct_sequential_ms={direct_ms:.3}");
     }
     let parent = index
         .entries()

@@ -103,6 +103,7 @@ struct Cache {
     cells: Vec<paint::Cell>,
     matches: Vec<Match>,
     match_counts: (usize, usize),
+    filter_totals: Option<String>,
     location_label: String,
     selection_readout: Option<(NodeRef, String)>,
     paint: Option<paint::CachedMap>,
@@ -222,6 +223,7 @@ pub struct HogMap {
     filter_focused: bool,
     filter: HighlightFilter,
     filter_changed: bool,
+    geometry_filter: bool,
     /// The size the map weighs. Chosen in View for this session only: it survives a rescan but is
     /// never saved.
     metric: SizeMetric,
@@ -293,6 +295,7 @@ impl HogMap {
             filter_focused: false,
             filter: HighlightFilter::default(),
             filter_changed: false,
+            geometry_filter: false,
             metric: SizeMetric::Logical,
             detail: DEFAULT_DETAIL,
             cache: None,
@@ -905,6 +908,14 @@ impl HogMap {
         self.navigate(location);
     }
 
+    fn set_filter_mode(&mut self, filtered: bool) {
+        self.geometry_filter = filtered;
+        self.cache = None;
+        self.volume_map = None;
+        self.last_layout = None;
+        self.filter_changed = true;
+    }
+
     fn shortcuts(&mut self, context: &egui::Context) {
         if self.chooser.open {
             return;
@@ -913,7 +924,10 @@ impl HogMap {
             self.chooser.reopen();
             return;
         }
-        if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F)) {
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::F))
+        {
+            self.set_filter_mode(!self.geometry_filter);
+        } else if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F)) {
             self.focus_filter = true;
         }
         if context.input_mut(|input| {
@@ -1166,6 +1180,30 @@ impl HogMap {
             });
             ui.separator();
             ui.horizontal(|ui| {
+                let before = self.geometry_filter;
+                let mode_response = egui::ComboBox::from_id_salt("filter-mode")
+                    .selected_text(if self.geometry_filter {
+                        text::FILTER_MODE
+                    } else {
+                        text::HIGHLIGHT_MODE
+                    })
+                    .width(86.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.geometry_filter, false, text::HIGHLIGHT_MODE);
+                        ui.selectable_value(&mut self.geometry_filter, true, text::FILTER_MODE);
+                    })
+                    .response
+                    .on_hover_text(text::FILTER_MODE_TIP);
+                mode_response.widget_info(|| {
+                    egui::WidgetInfo::labeled(
+                        egui::WidgetType::Button,
+                        true,
+                        text::filter_mode(self.geometry_filter),
+                    )
+                });
+                if before != self.geometry_filter {
+                    self.set_filter_mode(self.geometry_filter);
+                }
                 let label = ui.label(text::FILTER);
                 let (matches, unknown) = self
                     .cache
@@ -1227,9 +1265,14 @@ impl HogMap {
                     .on_hover_text(&failure.message);
                 } else {
                     ui.label(
-                        egui::RichText::new(text::map_metric(self.metric))
-                            .small()
-                            .color(Theme::current(ui.ctx()).palette().secondary_text),
+                        egui::RichText::new(
+                            self.cache
+                                .as_ref()
+                                .and_then(|cache| cache.filter_totals.as_deref())
+                                .unwrap_or(text::map_metric(self.metric)),
+                        )
+                        .small()
+                        .color(Theme::current(ui.ctx()).palette().secondary_text),
                     );
                 }
             });
@@ -1658,7 +1701,7 @@ impl HogMap {
             detail: self.detail,
         };
         let shown = self.volume_map.as_ref().map(|map| &map.key);
-        let dirty = shown != Some(&key);
+        let dirty = shown != Some(&key) || (self.geometry_filter && self.filter_changed);
         // The scan throttle limits growth updates; it never keeps the previous metric's cells on
         // screen once the other metric is chosen, so an explicit switch rebuilds at once.
         let switched = shown.is_some_and(|shown| {
@@ -1671,8 +1714,15 @@ impl HogMap {
             last.elapsed() >= LAYOUT_INTERVAL.max(self.last_layout_cost.saturating_mul(4))
         });
         let mut rebuild_started = None;
-        if dirty && (self.receiver.is_none() || due || switched) {
+        if dirty && (self.receiver.is_none() || due || switched || self.filter_changed) {
             rebuild_started = Some(Instant::now());
+            let results = self.filter.match_results(index);
+            let filter_totals = self.geometry_filter.then(|| {
+                text::filter_totals(
+                    results.totals(index, self.metric),
+                    index.summary_for(self.metric).ok(),
+                )
+            });
             let evaluation = self.composition();
             let visible = self.visible_composition(&evaluation);
             let allocated = index.summary_for(SizeMetric::Allocated).ok();
@@ -1688,8 +1738,19 @@ impl HogMap {
             let (tree_area, volume_cells) = composition::arrange(
                 area,
                 apparent.unwrap_or(0),
-                visible.components,
-                visible.pending_bytes,
+                if self.geometry_filter {
+                    hogmap::composition::VolumeComponents {
+                        free_bytes: None,
+                        reserve_bytes: None,
+                    }
+                } else {
+                    visible.components
+                },
+                if self.geometry_filter {
+                    None
+                } else {
+                    visible.pending_bytes
+                },
                 &detail,
             );
             self.volume_map = Some(VolumeMap {
@@ -1729,16 +1790,28 @@ impl HogMap {
             let caption = subset_caption(location, subset, self.metric);
             let location_label =
                 text::location(&entry_name(index, index.root()), &location.path, caption);
-            let result = match subset {
-                Some(members) => treemap::layout_members_with_metric(
+            let result = if self.geometry_filter {
+                treemap::layout_filtered(
                     index,
                     root,
-                    members,
+                    subset,
                     rect,
                     params,
                     self.metric,
-                ),
-                None => treemap::layout_with_metric(index, root, rect, params, self.metric),
+                    &results.matches,
+                )
+            } else {
+                match subset {
+                    Some(members) => treemap::layout_members_with_metric(
+                        index,
+                        root,
+                        members,
+                        rect,
+                        params,
+                        self.metric,
+                    ),
+                    None => treemap::layout_with_metric(index, root, rect, params, self.metric),
+                }
             };
             // A single map is cached: the previous one is dropped once this one replaces it, and
             // only its highlight results can carry over.
@@ -1756,26 +1829,15 @@ impl HogMap {
                     // Labels and meshes share a font/atlas stamp, prepared once below.
                     // Highlight decisions depend on the snapshot and the filter, not on the
                     // metric or the location, so they are reused while both are unchanged.
-                    let (matches, match_counts) = match previous {
-                        Some(previous)
-                            if previous.key.version == key.version && !self.filter_changed =>
-                        {
-                            (previous.matches, previous.match_counts)
-                        }
-                        _ => {
-                            let results = self.filter.match_results(index);
-                            (
-                                results.matches,
-                                (results.matched_files, results.unknown_files),
-                            )
-                        }
-                    };
+                    let match_counts = (results.matched_files, results.unknown_files);
+                    let matches = results.matches;
                     self.cache = Some(Cache {
                         key,
                         layout,
                         cells: Vec::new(),
                         matches,
                         match_counts,
+                        filter_totals,
                         location_label,
                         selection_readout: None,
                         paint: None,

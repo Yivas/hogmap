@@ -33,7 +33,7 @@ export default {
         items: [
           { text: 'Overview and status', link: '/' },
           { text: 'Understanding sizes', link: '/sizes' },
-          { text: 'Working with filters', link: '/filters' },
+          { text: 'Filters', link: '/filters' },
           { text: 'Development and checks', link: '/development' },
           { text: 'Third-party licenses', link: '/licenses' }
         ]

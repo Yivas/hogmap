@@ -8,6 +8,94 @@ use std::sync::mpsc::channel;
 use std::time::SystemTime;
 
 #[test]
+fn filter_mode_keyboard_switch_changes_geometry_and_keeps_unknown_totals_separate() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let context = egui::Context::default();
+        context.set_visuals(match theme {
+            Theme::Dark => egui::Visuals::dark(),
+            Theme::Light => egui::Visuals::light(),
+        });
+        context.enable_accesskit();
+        let mut app = app(&context);
+        desktop_frame(&context, &mut app, egui::vec2(1280.0, 720.0), Vec::new());
+        let output = desktop_frame(&context, &mut app, egui::vec2(1280.0, 720.0), Vec::new());
+        let mode_node = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .unwrap()
+            .nodes
+            .iter()
+            .map(|(_, node)| node)
+            .find(|node| node.label() == Some("Filter mode: Highlight"))
+            .expect("named mode selector");
+        assert!(mode_node.supports_action(egui::accesskit::Action::Focus));
+        let index = app.reducer.finished_index_mut().unwrap();
+        let first = index
+            .entries()
+            .find(|(_, entry)| entry.name == "first")
+            .unwrap()
+            .0;
+        index
+            .set_filter_metadata(
+                first,
+                hogmap::filter::Metadata {
+                    attributes: Some(2),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(app.filter.set(":attr:hidden"));
+        app.filter_changed = true;
+        frame(&context, &mut app, Vec::new());
+        assert_eq!(app.cache.as_ref().unwrap().layout.known_sum, 600);
+        assert_eq!(app.cache.as_ref().unwrap().match_counts, (1, 1));
+        let toggle = egui::Event::Key {
+            key: Key::F,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::CTRL | Modifiers::SHIFT,
+        };
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: vec![toggle.clone()],
+                ..Default::default()
+            },
+            |_| app.shortcuts(&context),
+        );
+        assert!(app.geometry_filter);
+        frame(&context, &mut app, Vec::new());
+        let cache = app.cache.as_ref().unwrap();
+        assert_eq!(cache.layout.known_sum, 600);
+        assert_eq!(cache.match_counts, (1, 1));
+        assert_eq!(
+            cache.filter_totals.as_deref(),
+            Some(
+                "Filtered matches: 400 B | Undecided: 200 B (0 unknown sizes) | Full snapshot: 600 B"
+            )
+        );
+        assert!(app.filter.set("first"));
+        app.filter_changed = true;
+        frame(&context, &mut app, Vec::new());
+        assert_eq!(app.cache.as_ref().unwrap().layout.known_sum, 400);
+        assert!(!app.filter.set("m<bad"));
+        frame(&context, &mut app, Vec::new());
+        assert_eq!(app.cache.as_ref().unwrap().layout.known_sum, 400);
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: vec![toggle],
+                ..Default::default()
+            },
+            |_| app.shortcuts(&context),
+        );
+        assert!(!app.geometry_filter);
+        frame(&context, &mut app, Vec::new());
+        assert_eq!(app.cache.as_ref().unwrap().layout.known_sum, 600);
+    }
+}
+
+#[test]
 fn provisional_reserve_uses_the_same_capacity_sample_without_assuming_unknown_zero() {
     let mut drive = dialog::DriveChoice {
         root: r"C:\".into(),
@@ -677,7 +765,7 @@ fn chrome_names_real_actions_and_selection_without_clipping_at_desktop_sizes() {
                 "Home",
                 "Rescan",
                 "Stop",
-                "Highlight",
+                "Expression",
                 "More detail",
                 "Less detail",
             ] {

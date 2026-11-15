@@ -1,33 +1,84 @@
-# Working with filters
+# Filters
 
-The core can evaluate a filter against one file's name and optional logical size. The window's Highlight field uses this evaluator, for both real scans and the synthetic sample: matches keep their colors, non-matches dim and unknown decisions stay distinct. Directory context is retained, totals and geometry do not change, and invalid expressions keep the previous valid highlight. There is no filtered-geometry mode yet.
+Use the expression field on a scanned tree or the labelled synthetic sample. It works on cached metadata and never rescans. Choose **Highlight** to dim non-matches without changing geometry or totals, or **Filter** to remove non-matching files from the map. The mode selector and Ctrl+Shift+F switch between them; Ctrl+F focuses the expression. Neither the mode nor expression is saved.
 
-## Start with a name
+Filter keeps undecided files visible in their distinct tone. Its total line separates **Filtered matches**, **Undecided** known bytes and unknown-size count, and **Full snapshot** bytes. Undecided files are not matches. Totals cover the snapshot, even when zoomed. Filter hides volume/free/residual cells: excluding files does not turn their space into free space. A file whose size is unknown has no invented map area.
 
-`*.jpg` matches names such as `photo.jpg` and `PHOTO.JPG`. Prefixing the mask with `|` excludes those names instead: `|*.jpg` matches `notes.txt`, but not `photo.jpg`.
+## File and folder masks
 
-`*` matches zero or more characters and `?` matches one Unicode scalar. ASCII letters are case-insensitive; other Unicode characters compare literally. A native Windows name that cannot be represented without loss produces an unknown name-dependent result rather than disappearing silently.
+`*.jpg` matches `photo.jpg` and `PHOTO.JPG`. `?` matches exactly one Unicode scalar and `*` matches zero or more. Masks match the whole name, not a substring. ASCII letters are case-insensitive; other characters compare literally, without claiming Windows-wide Unicode folding.
 
-## Add a size condition
+A leading backslash selects folder components: `\temp` matches files anywhere beneath a folder named temp, including nested descendants. `\build*` matches a folder component starting with build. The snapshot root also counts as a folder component. This is not a path: `\temp\nested` is invalid. A file named temp does not itself match `\temp`.
 
-`*.jpg;>1mb` requires both a JPG name and a logical size strictly larger than 1048576 bytes. A file exactly that size does not pass.
+Prefix a mask with `|` to exclude it: `|*.tmp` excludes temporary names, and `|\temp` excludes files beneath temp folders.
 
-The legacy suffixes `kb`, `mb`, `gb` and `tb` use powers of 1024. They do not mean decimal SI units. This first implementation always compares **logical bytes**, not allocated or recoverable storage. That stays true when the map shows allocated size; the line under the Highlight field then says that highlighting uses logical size, and counts and totals do not change.
+## Logical and allocated sizes
 
-## Combine names and exclusions
+`*.jpg;s>1mb` selects JPGs with listed logical size strictly greater than 1048576 bytes. A file exactly that size does not pass. Bare `>1mb` means the same as `s>1mb`.
 
-`*.jpg;*.png;>1mb;|draft*` means:
+`d<16k` compares observed allocated size, independently of the map's Logical/Allocated choice. Unknown allocation stays undecided. Allocation is not physical attribution or recoverable space.
 
-- JPG or PNG;
-- logical size greater than 1 MiB;
-- name not starting with `draft`.
+Use a non-negative integer and `b`, `k`/`kb`, `m`/`mb`, `g`/`gb` or `t`/`tb`. Suffixes are case-insensitive and use powers of 1024, not decimal SI. Fractions, missing units and `<=`/`>=` are invalid.
 
-Positive name masks are OR-ed. Every exclusion and every size condition must also pass. Filtering leaves the full index unchanged, so changing the expression will not require a future scanner to read the same tree again.
+## Creation, modification and access age
 
-## Handle unknowns and errors
+- `c>2d`: created more than two days ago.
+- `m<10s`: modified less than ten seconds ago.
+- `a<1h`: accessed less than one hour ago.
 
-A file with an unknown logical size cannot be declared larger or smaller than a threshold. The evaluator returns `Unknown` unless another condition rules it out conclusively. For example, a non-JPG name fails `*.jpg;>1mb` even when its size is unknown.
+Duration units are `s` seconds, `m` minutes, `h` hours, `d` days and `w` weeks, with an integer threshold. Comparisons are strict. The reference instant is fixed when the expression is applied; reapply it to advance the clock. Missing, zero or future timestamps stay undecided. Filesystem access times can be delayed or disabled; an access age is an observation, not proof that someone opened the file.
 
-Parsing is all-or-nothing. A consumer must keep the previous valid filter when a new expression is invalid. Empty conditions, paths, unsupported size units, fractional thresholds and overflow are rejected. Date, tag and attribute filters are outside this subset.
+## Attributes
 
-The full grammar, bounds and API semantics live in the [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md). [Development and checks](./development.md) explains how to run the tests that exercise it.
+`:attr:hidden` and `+:attr:hidden` require the hidden flag; `-:attr:hidden` forbids it. Every attribute condition must pass.
+
+| Attribute | Example |
+|-|-|
+| File kind | `:attr:file` |
+| Directory kind | `:attr:dir` |
+| System | `:attr:system` |
+| Hidden | `-:attr:hidden` |
+| Compressed | `:attr:compressed` |
+| Encrypted | `:attr:encrypted` |
+| Offline | `-:attr:offline` |
+| Sparse | `:attr:sparse` |
+| Alternate data streams | `:attr:ads` |
+
+The map counts files, while directories provide context. Consequently `:attr:dir` alone has no file matches; use a folder mask to select files inside a folder. Unknown flags remain undecided even when forbidden. Ordinary enumeration does not inspect streams, so ADS presence is unknown unless supplied in memory; the filter does not trigger extra queries or content reads. Skipped offline/cloud entries retain their existing safety behavior.
+
+## File classes
+
+`:class:images` expands into extension masks. `-:class:images` excludes those masks. Built-in classes are:
+
+| Class | Extensions |
+|-|-|
+| images | jpg, jpeg, png, gif, webp |
+| audio | mp3, wav, flac |
+| video | mp4, mkv, avi |
+| documents | txt, pdf, docx, md |
+| archives | zip, 7z, tar, gz |
+
+The core also accepts an in-memory user class table, including replacement definitions. There is no class editor or class-based coloring in the window yet. An unknown class name is an error, not an empty class.
+
+## Temporary tags
+
+The in-memory tag model supports four bits: `:1`/`:red`, `:2`/`:yellow`, `:3`/`:green`, and `:4`/`:blue`. `:tag:` means any tag; `-:tag:` means untagged. `+:red` requires red and `-:red` forbids it. Descendants inherit their nearest folder assignment unless explicitly overridden; zero clears inherited tags.
+
+The tagging UI is not implemented. Ordinary scans start untagged; these conditions are usable with tags supplied through the core API, not through a hidden keyboard action. Nothing is persisted.
+
+## Combining conditions
+
+Separate conditions with `;`. Positive file masks, folder masks, class masks and positive tags form **one OR group**. There is no folder-over-file precedence. All exclusions, negative tags, sizes, ages and attributes are AND conditions. Without positive alternatives, the OR group starts true.
+
+- `*.jpg;*.png;s>1mb;|draft*`: JPG or PNG, larger than 1 MiB, excluding draft names.
+- `\temp;*.jpg`: files beneath temp **or** JPGs anywhere in the snapshot.
+- `*.jpg;:red;s>1mb;-:blue`: JPG or red-tagged, larger than 1 MiB, with blue forbidden.
+- `:class:archives;m>2w;-:attr:system`: archives modified more than two weeks ago, excluding system files.
+
+## Unknowns and errors
+
+An unavailable input is undecided, not false or zero. Another conclusive failing AND condition can still reject the file. A known matching positive alternative can establish the OR group even when another alternative is unknown. Native names that cannot be represented losslessly stay undecided when a name-dependent decision cannot otherwise be established.
+
+Parsing is all-or-nothing. An error keeps the previous valid filter active and shows a correction message. Expressions are limited to **4096 UTF-8 bytes and 64 conditions**. Empty conditions (`*.jpg;;>1mb`), missing units (`m<10`), malformed durations, unknown attributes/classes/tags, overflow and unsupported paths are rejected. Fuzzy keywords and regular expressions are not supported.
+
+The [core contract](https://github.com/Yivas/hogmap/blob/main/docs/core.md#name-and-logical-size-filter) specifies the APIs, grammar, cached decisions and apparent-weight accounting. [Development and checks](./development.md) separates headless coverage from native acceptance.

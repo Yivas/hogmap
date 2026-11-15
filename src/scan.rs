@@ -89,6 +89,7 @@ pub struct DirectoryOutcome {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Batch {
     records: Vec<ScanRecord>,
+    metadata: Vec<Option<crate::filter::Metadata>>,
     outcomes: Vec<DirectoryOutcome>,
     estimated_bytes: usize,
 }
@@ -133,7 +134,17 @@ impl Batch {
     /// Adds a record unless the batch is full. An empty batch accepts an
     /// oversized record rather than losing it.
     pub fn push(&mut self, record: ScanRecord) -> bool {
-        let extra = record.estimated_bytes();
+        self.push_with_metadata(record, None)
+    }
+
+    /// Optional observations travel with their record, under the same byte and cursor budget.
+    pub fn push_with_metadata(
+        &mut self,
+        record: ScanRecord,
+        metadata: Option<crate::filter::Metadata>,
+    ) -> bool {
+        let extra =
+            record.estimated_bytes() + std::mem::size_of::<Option<crate::filter::Metadata>>();
         let exceeds_records = self.records.len() + self.outcomes.len() >= MAX_BATCH_RECORDS;
         let exceeds_bytes =
             !self.is_empty() && self.estimated_bytes.saturating_add(extra) > MAX_BATCH_BYTES;
@@ -141,6 +152,7 @@ impl Batch {
             return false;
         }
         self.records.push(record);
+        self.metadata.push(metadata);
         self.estimated_bytes = self.estimated_bytes.saturating_add(extra);
         true
     }
@@ -473,7 +485,7 @@ impl ScanReducer {
         report: &mut DrainReport,
     ) -> bool {
         while let Some(record) = pending.batch.records().get(pending.record) {
-            self.apply_record(record);
+            self.apply_record(record, pending.batch.metadata[pending.record]);
             report.records += 1;
             report.directories += usize::from(record.kind == Kind::Directory);
             pending.record += 1;
@@ -504,8 +516,8 @@ impl ScanReducer {
         }
         match event.event {
             ScanEventKind::Batch(batch) => {
-                for record in batch.records() {
-                    self.apply_record(record);
+                for (position, record) in batch.records().iter().enumerate() {
+                    self.apply_record(record, batch.metadata[position]);
                 }
                 for outcome in batch.outcomes() {
                     self.finish_directory(outcome.key, outcome.code);
@@ -524,13 +536,16 @@ impl ScanReducer {
         }
     }
 
-    fn apply_record(&mut self, record: &ScanRecord) {
+    fn apply_record(&mut self, record: &ScanRecord, metadata: Option<crate::filter::Metadata>) {
         if self.keys.get(record.key).is_some() {
             self.diagnostics.duplicate_key_records += 1;
             return;
         }
         if self.index.is_none() {
             self.apply_root_record(record);
+            if let (Some(index), Some(metadata)) = (&mut self.index, metadata) {
+                let _ = index.set_filter_metadata(index.root(), metadata);
+            }
             return;
         }
         let Some(parent_key) = record.parent else {
@@ -559,6 +574,13 @@ impl ScanReducer {
         };
         match inserted {
             Ok(id) => {
+                if let Some(metadata) = metadata {
+                    self.index
+                        .as_mut()
+                        .expect("inserted index")
+                        .set_filter_metadata(id, metadata)
+                        .expect("inserted metadata ID");
+                }
                 self.keys.insert(record.key, id);
             }
             Err(_) => self.diagnostics.invalid_records += 1,
