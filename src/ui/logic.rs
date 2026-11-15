@@ -1,4 +1,5 @@
 use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use hogmap::filter::{Filter, FilterError, Match};
 use hogmap::index::{EntryId, Index, Kind, MetricSummary, SizeMetric};
@@ -99,6 +100,53 @@ impl Location {
         }
         result
     }
+}
+
+/// Rebuild a native path from this snapshot's components, never its lossy display labels.
+/// The scan root is captured absolutely before scanning; no filesystem resolution happens here.
+pub fn item_path(index: &Index, root: &Path, id: EntryId) -> Option<PathBuf> {
+    fn units(name: &std::ffi::OsStr) -> usize {
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStrExt;
+            name.encode_wide().count()
+        }
+        #[cfg(not(windows))]
+        {
+            name.len()
+        }
+    }
+    let mut length = units(root.as_os_str());
+    if !root.is_absolute() || length >= 32767 {
+        return None;
+    }
+    if root
+        .as_os_str()
+        .as_encoded_bytes()
+        .last()
+        .is_some_and(|byte| matches!(*byte, b'\\' | b'/'))
+    {
+        length -= 1;
+    }
+    let mut components = Vec::new();
+    let mut current = id;
+    for _ in 0..index.len() {
+        let entry = index.get(current)?;
+        if current == index.root() {
+            let mut path = root.to_path_buf();
+            for name in components.into_iter().rev() {
+                path.push(name);
+            }
+            return Some(path);
+        }
+        length = length.checked_add(1 + units(entry.name))?;
+        if length >= 32767 {
+            return None;
+        }
+        components.push(entry.name);
+        current = entry.parent?;
+    }
+    None
 }
 
 #[derive(Default)]

@@ -69,7 +69,7 @@ pub fn volume_choice(
 
 /// Inspect each prefix before the directory check, without canonicalizing through a junction.
 /// Like the engine's checks, this cannot rule out concurrent path replacement.
-pub fn validate_root(root: &Path) -> Result<(), String> {
+pub fn validate_root(root: &Path) -> Result<PathBuf, String> {
     let absolute = std::path::absolute(root).map_err(|error| text::path_error(&error))?;
     let mut prefix = PathBuf::new();
     for component in absolute.components() {
@@ -95,11 +95,11 @@ pub fn validate_root(root: &Path) -> Result<(), String> {
             return Err(text::scan_code(hogmap::scan_win::SKIP_REPARSE_CODE));
         }
     }
-    let metadata = std::fs::metadata(root).map_err(|error| text::path_error(&error))?;
+    let metadata = std::fs::metadata(&absolute).map_err(|error| text::path_error(&error))?;
     if !metadata.is_dir() {
         return Err(text::NOT_DIRECTORY.into());
     }
-    Ok(())
+    Ok(absolute)
 }
 
 struct DriveColumns {
@@ -679,7 +679,8 @@ mod tests {
     #[test]
     fn path_validation_requires_an_existing_directory() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        assert!(validate_root(root).is_ok());
+        assert_eq!(validate_root(root).unwrap(), root);
+        assert_eq!(validate_root(Path::new(".")).unwrap(), root);
         assert_eq!(
             validate_root(&root.join("Cargo.toml")),
             Err(text::NOT_DIRECTORY.into())

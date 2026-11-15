@@ -50,6 +50,95 @@ fn fixture() -> (Index, hogmap::index::EntryId, hogmap::index::EntryId) {
 }
 
 #[test]
+fn native_item_paths_preserve_roots_components_unicode_and_long_names_without_io() {
+    use std::path::Path;
+    let (mut index, directory, file) = fixture();
+    let root = if cfg!(windows) {
+        Path::new(r"C:\fixture")
+    } else {
+        Path::new("/fixture")
+    };
+    assert_eq!(
+        logic::item_path(&index, root, index.root()),
+        Some(root.into())
+    );
+    assert_eq!(
+        logic::item_path(&index, root, file),
+        Some(root.join("photos").join("photo.jpg"))
+    );
+    assert!(logic::item_path(&index, Path::new("relative"), file).is_none());
+    let long = root.join("segment".repeat(35));
+    let deeper = index
+        .insert(
+            directory,
+            "é漢🦔".into(),
+            Kind::Directory,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    let leaf = index
+        .insert(
+            deeper,
+            "file.bin".into(),
+            Kind::File,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    let expected = long.join("photos").join("é漢🦔").join("file.bin");
+    assert!(expected.as_os_str().len() > 260);
+    assert_eq!(logic::item_path(&index, &long, leaf), Some(expected));
+    let too_long = root.join("x".repeat(32767));
+    assert!(logic::item_path(&index, &too_long, file).is_none());
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        for spelling in [
+            r"C:\",
+            r"C:\\\",
+            r"\\?\C:\",
+            r"C:\fixture\\",
+            r"\\?\C:\fixture\",
+        ] {
+            let root = Path::new(spelling);
+            assert_eq!(
+                logic::item_path(&index, root, index.root())
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .collect::<Vec<_>>(),
+                root.as_os_str().encode_wide().collect::<Vec<_>>()
+            );
+            assert_eq!(
+                logic::item_path(&index, root, file),
+                Some(root.join("photos").join("photo.jpg"))
+            );
+        }
+        let name = OsString::from_wide(&[0x0066, 0xd800, 0x002e, 0x0078]);
+        let id = index
+            .insert(
+                index.root(),
+                name,
+                Kind::File,
+                Sizes::default(),
+                None,
+                State::Complete,
+            )
+            .unwrap();
+        let actual = logic::item_path(&index, Path::new(r"C:\"), id).unwrap();
+        assert_eq!(
+            actual.as_os_str().encode_wide().collect::<Vec<_>>(),
+            [0x0043, 0x003a, 0x005c, 0x0066, 0xd800, 0x002e, 0x0078]
+        );
+        assert!(logic::item_path(&index, Path::new("C:relative"), id).is_none());
+    }
+}
+
+#[test]
 fn history_branches_and_resolves_names_in_a_new_snapshot() {
     let (index, directory, _) = fixture();
     let photos = Location::directory(&index, directory);

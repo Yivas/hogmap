@@ -91,7 +91,7 @@ fn facts() -> VolumeEvidence {
         directories: DirectoryNamespaceObservations::default(),
     }
 }
-fn app(context: &egui::Context) -> HogMap {
+pub(super) fn app(context: &egui::Context) -> HogMap {
     let generation = ScanGeneration::new(25);
     let mut app = HogMap::with_reducer(context.clone(), ScanReducer::new(generation));
     let mut batch = Batch::new();

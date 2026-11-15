@@ -16,7 +16,7 @@ desktop = ["dep:eframe"]
 eframe = { version = "=0.35.0", optional = true, default-features = false, features = ["glow", "default_fonts", "accesskit", "persistence"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_Ioctl", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_Graphics_Gdi", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [[bin]]
 name = "hogmap"
@@ -24,7 +24,7 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [lints.rust]
-# Audited unsafe is isolated to scan_win/volume FFI and name_arena's whole-name accessor.
+# Audited unsafe is isolated to scan_win/volume/shell_menu FFI and name_arena's whole-name accessor.
 unsafe_code = "deny"
 
 [lints.clippy]

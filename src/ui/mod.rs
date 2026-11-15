@@ -1,10 +1,14 @@
 mod composition;
 #[cfg(test)]
 mod composition_tests;
+#[cfg(test)]
+mod context_menu_tests;
 mod dialog;
 mod icons;
 pub(crate) mod logic;
 pub(crate) mod paint;
+#[cfg(windows)]
+mod shell_menu;
 pub mod text;
 pub(crate) mod theme;
 
@@ -136,6 +140,7 @@ impl StatusKey {
 }
 struct StatusCache {
     key: StatusKey,
+    menu_notice: Option<String>,
     error: Option<String>,
     layout_error: Option<String>,
     master: String,
@@ -176,6 +181,14 @@ fn subset_caption(
     })
 }
 
+#[derive(Debug)]
+struct ContextMenuRequest {
+    path: PathBuf,
+    position: [f32; 2],
+    pixels_per_point: f32,
+    extended: bool,
+}
+
 pub struct HogMap {
     /// Kept so `save` can read the theme from egui itself instead of holding a second copy.
     context: egui::Context,
@@ -203,6 +216,8 @@ pub struct HogMap {
     pub(crate) version: u64,
     history: History,
     selected: Option<NodeRef>,
+    pending_menu: Option<ContextMenuRequest>,
+    menu_notice: Option<String>,
     filter_text: String,
     filter_focused: bool,
     filter: HighlightFilter,
@@ -272,6 +287,8 @@ impl HogMap {
             version: 0,
             history: History::default(),
             selected: None,
+            pending_menu: None,
+            menu_notice: None,
             filter_text: String::new(),
             filter_focused: false,
             filter: HighlightFilter::default(),
@@ -314,6 +331,7 @@ impl HogMap {
 
     fn request_close(&mut self) {
         self.closing = true;
+        self.pending_menu = None;
         self.pending_scan = None;
         self.stop_producer();
     }
@@ -322,6 +340,7 @@ impl HogMap {
         if self.closing {
             return;
         }
+        self.pending_menu = None;
         self.stop_producer();
         // Coalesce repeated requests instead of starting more threads behind blocked I/O.
         self.pending_scan = Some(request);
@@ -395,7 +414,7 @@ impl HogMap {
                 match thread::Builder::new()
                     .name("prepare-scan".into())
                     .spawn(move || {
-                        dialog::validate_root(&root)?;
+                        let root = dialog::validate_root(&root)?;
                         // Query drives here instead of reusing the chooser's cache: on the first
                         // Start its listing may still be running, and a rescan must not reuse
                         // capacity captured when the chooser last refreshed.
@@ -569,6 +588,8 @@ impl HogMap {
         self.resolution_revision = 0;
         self.history = History::default();
         self.selected = None;
+        self.pending_menu = None;
+        self.menu_notice = None;
         self.cache = None;
         self.volume_map = None;
         self.layout_failure = None;
@@ -1319,153 +1340,161 @@ impl HogMap {
             .map(|failure| failure.message.as_str());
         if self.status_cache.as_ref().is_none_or(|cache| {
             let urgent = cache.key.immediate_change(&key)
+                || cache.menu_notice != self.menu_notice
                 || cache.error.as_deref() != self.error.as_deref()
                 || cache.layout_error.as_deref() != layout_error;
             urgent || (cache.key != key && cache.updated_at.elapsed() >= STATUS_INTERVAL)
         }) {
-            let (master, readout, brief, detail) = if let Some(index) = self.reducer.index() {
-                let totals = logic::metric_totals(index, self.metric);
-                let location = match &self.cache {
-                    Some(cache)
-                        if cache.key.metric == self.metric
-                            && cache.key.location == key.location =>
-                    {
-                        cache.location_label.clone()
-                    }
-                    // A metric chosen in this frame is laid out after the status is drawn;
-                    // caption the members for the new metric instead of repeating the old one.
-                    Some(_) => {
-                        let current = self.history.current();
-                        let members = current.resolve(index).and_then(|(_, members)| members);
-                        text::location(
+            let (master, mut readout, mut brief, mut detail) =
+                if let Some(index) = self.reducer.index() {
+                    let totals = logic::metric_totals(index, self.metric);
+                    let location = match &self.cache {
+                        Some(cache)
+                            if cache.key.metric == self.metric
+                                && cache.key.location == key.location =>
+                        {
+                            cache.location_label.clone()
+                        }
+                        // A metric chosen in this frame is laid out after the status is drawn;
+                        // caption the members for the new metric instead of repeating the old one.
+                        Some(_) => {
+                            let current = self.history.current();
+                            let members = current.resolve(index).and_then(|(_, members)| members);
+                            text::location(
+                                &entry_name(index, index.root()),
+                                &current.path,
+                                subset_caption(&current, members.as_deref(), self.metric),
+                            )
+                        }
+                        None => text::location(
                             &entry_name(index, index.root()),
-                            &current.path,
-                            subset_caption(&current, members.as_deref(), self.metric),
-                        )
+                            &self.history.current().path,
+                            None,
+                        ),
+                    };
+                    let mut detail =
+                        text::status(lifecycle, &location, &totals, self.reducer.diagnostics());
+                    if let Some(report) = &self.scan_report {
+                        detail.push('\n');
+                        detail.push_str(&text::scan_report(report));
                     }
-                    None => text::location(
-                        &entry_name(index, index.root()),
-                        &self.history.current().path,
-                        None,
-                    ),
-                };
-                let mut detail =
-                    text::status(lifecycle, &location, &totals, self.reducer.diagnostics());
-                if let Some(report) = &self.scan_report {
+                    let composition = self.composition();
+                    let composition_status = text::composition_status(
+                        &composition,
+                        index.summary_for(SizeMetric::Allocated).ok(),
+                    );
                     detail.push('\n');
-                    detail.push_str(&text::scan_report(report));
-                }
-                let composition = self.composition();
-                let composition_status = text::composition_status(
-                    &composition,
-                    index.summary_for(SizeMetric::Allocated).ok(),
-                );
-                detail.push('\n');
-                detail.push_str(&composition_status);
-                detail.push('\n');
-                detail.push_str(&self.visible_composition(&composition).detail);
-                detail.push('\n');
-                detail.push_str(&self.resolution_status());
-                if let Some(observations) = &self.observations {
+                    detail.push_str(&composition_status);
                     detail.push('\n');
-                    detail.push_str(&text::observation_detail(observations));
-                }
-                if let Some(error) = &self.error {
+                    detail.push_str(&self.visible_composition(&composition).detail);
                     detail.push('\n');
-                    detail.push_str(error);
-                }
-                if let Some(failure) = self.current_layout_failure() {
-                    detail.push('\n');
-                    detail.push_str(&failure.message);
-                }
-                // Count what the snapshot actually holds. The producer's coalescable progress
-                // events are dropped under backpressure, which showed "0 entries seen" beside a
-                // map already holding gigabytes.
-                let seen = self.reducer.index().map_or(0, |index| index.len());
-                detail = format!(
-                    "{}\n{}\n{detail}",
-                    text::master_status(master, seen, &totals, self.scan_elapsed),
-                    text::ACCOUNTING_NOTE
-                );
-                let bytes = totals
-                    .as_ref()
-                    .ok()
-                    .and_then(|summary| {
-                        summary
-                            .apparent_bytes()
-                            .ok()
-                            .map(|bytes| text::size(bytes, !summary.complete))
-                    })
-                    .unwrap_or_else(|| "Size unavailable".into());
-                let seconds = self.scan_elapsed.as_secs();
-                let master = format!(
-                    "{master} · {seen} entries · {bytes} · {} · {}:{:02} elapsed",
-                    text::completeness(&totals),
-                    seconds / 60,
-                    seconds % 60
-                );
-                let selected = self
-                    .cache
-                    .as_ref()
-                    .filter(|cache| cache.key.metric == self.metric)
-                    .and_then(|cache| cache.selection_readout.as_ref())
-                    .filter(|(node, _)| Some(*node) == self.selected)
-                    .map(|(_, label)| label.as_str());
-                let readout = selected.unwrap_or(&location).to_owned();
-                let brief = self
-                    .selected
-                    .and_then(|node| {
-                        self.cache.as_ref().and_then(|cache| {
-                            cache
-                                .layout
-                                .placed
-                                .iter()
-                                .find(|cell| cell.node == node)
-                                .map(|cell| {
-                                    let name = match node {
-                                        NodeRef::Entry(id) => entry_name(index, id),
-                                        NodeRef::Aggregate { .. } => {
-                                            text::aggregate_name(cell.members.len())
-                                        }
-                                    };
-                                    let open = if cell.header.is_some()
-                                        || matches!(node, NodeRef::Aggregate { .. })
-                                    {
-                                        " · Double-click to open"
-                                    } else {
-                                        ""
-                                    };
-                                    format!(
-                                        "Selected: {name} · {}{open}",
-                                        text::size(cell.known_sum, cell.has_unknown)
-                                    )
-                                })
+                    detail.push_str(&self.resolution_status());
+                    if let Some(observations) = &self.observations {
+                        detail.push('\n');
+                        detail.push_str(&text::observation_detail(observations));
+                    }
+                    if let Some(error) = &self.error {
+                        detail.push('\n');
+                        detail.push_str(error);
+                    }
+                    if let Some(failure) = self.current_layout_failure() {
+                        detail.push('\n');
+                        detail.push_str(&failure.message);
+                    }
+                    // Count what the snapshot actually holds. The producer's coalescable progress
+                    // events are dropped under backpressure, which showed "0 entries seen" beside a
+                    // map already holding gigabytes.
+                    let seen = self.reducer.index().map_or(0, |index| index.len());
+                    detail = format!(
+                        "{}\n{}\n{detail}",
+                        text::master_status(master, seen, &totals, self.scan_elapsed),
+                        text::ACCOUNTING_NOTE
+                    );
+                    let bytes = totals
+                        .as_ref()
+                        .ok()
+                        .and_then(|summary| {
+                            summary
+                                .apparent_bytes()
+                                .ok()
+                                .map(|bytes| text::size(bytes, !summary.complete))
                         })
-                    })
-                    .unwrap_or_default();
-                (master, readout, brief, detail)
-            } else {
-                let detail = self
-                    .scan_report
-                    .as_ref()
-                    .map(text::scan_report)
-                    .unwrap_or_else(|| master.to_owned());
-                let readout = self
-                    .error
-                    .as_deref()
-                    .unwrap_or(if self.scan_started.is_some() {
-                        text::WAITING
-                    } else {
-                        text::NO_SCAN
-                    })
-                    .to_owned();
-                (
-                    master.to_owned(),
-                    readout.clone(),
-                    readout,
-                    format!("{}\n{detail}", text::ACCOUNTING_NOTE),
-                )
-            };
+                        .unwrap_or_else(|| "Size unavailable".into());
+                    let seconds = self.scan_elapsed.as_secs();
+                    let master = format!(
+                        "{master} · {seen} entries · {bytes} · {} · {}:{:02} elapsed",
+                        text::completeness(&totals),
+                        seconds / 60,
+                        seconds % 60
+                    );
+                    let selected = self
+                        .cache
+                        .as_ref()
+                        .filter(|cache| cache.key.metric == self.metric)
+                        .and_then(|cache| cache.selection_readout.as_ref())
+                        .filter(|(node, _)| Some(*node) == self.selected)
+                        .map(|(_, label)| label.as_str());
+                    let readout = selected.unwrap_or(&location).to_owned();
+                    let brief = self
+                        .selected
+                        .and_then(|node| {
+                            self.cache.as_ref().and_then(|cache| {
+                                cache
+                                    .layout
+                                    .placed
+                                    .iter()
+                                    .find(|cell| cell.node == node)
+                                    .map(|cell| {
+                                        let name = match node {
+                                            NodeRef::Entry(id) => entry_name(index, id),
+                                            NodeRef::Aggregate { .. } => {
+                                                text::aggregate_name(cell.members.len())
+                                            }
+                                        };
+                                        let open = if cell.header.is_some()
+                                            || matches!(node, NodeRef::Aggregate { .. })
+                                        {
+                                            " · Double-click to open"
+                                        } else {
+                                            ""
+                                        };
+                                        format!(
+                                            "Selected: {name} · {}{open}",
+                                            text::size(cell.known_sum, cell.has_unknown)
+                                        )
+                                    })
+                            })
+                        })
+                        .unwrap_or_default();
+                    (master, readout, brief, detail)
+                } else {
+                    let detail = self
+                        .scan_report
+                        .as_ref()
+                        .map(text::scan_report)
+                        .unwrap_or_else(|| master.to_owned());
+                    let readout = self
+                        .error
+                        .as_deref()
+                        .unwrap_or(if self.scan_started.is_some() {
+                            text::WAITING
+                        } else {
+                            text::NO_SCAN
+                        })
+                        .to_owned();
+                    (
+                        master.to_owned(),
+                        readout.clone(),
+                        readout,
+                        format!("{}\n{detail}", text::ACCOUNTING_NOTE),
+                    )
+                };
+            if let Some(notice) = &self.menu_notice {
+                brief = notice.clone();
+                readout = format!("{notice}\n{readout}");
+                detail.push('\n');
+                detail.push_str(notice);
+            }
             let accessible = format!("{master}\n{readout}\n{detail}");
             let width = ui
                 .painter()
@@ -1479,6 +1508,7 @@ impl HogMap {
                 + 12.0;
             self.status_cache = Some(StatusCache {
                 key,
+                menu_notice: self.menu_notice.clone(),
                 error: self.error.clone(),
                 layout_error: layout_error.map(str::to_owned),
                 master,
@@ -1832,6 +1862,7 @@ impl HogMap {
                 .on_hover_text(&cache.cells[hovered].tooltip);
         }
         let mut zoom = None;
+        let mut context_target = None;
         let mut focused = None;
         for (position, cell) in cache.layout.placed.iter().enumerate() {
             let interactive = paint::rect(cell.header.unwrap_or(cell.rect));
@@ -1863,6 +1894,11 @@ impl HogMap {
             if control.double_clicked() {
                 zoom = Some(cell.node);
             }
+            if control.secondary_clicked() {
+                context_target = control
+                    .interact_pointer_pos()
+                    .map(|point| (cell.node, point));
+            }
         }
         if let Some(position) = hovered {
             if response.clicked() {
@@ -1872,6 +1908,37 @@ impl HogMap {
             if response.double_clicked() {
                 zoom = Some(cache.layout.placed[position].node);
             }
+            if response.secondary_clicked() {
+                context_target = response
+                    .interact_pointer_pos()
+                    .map(|point| (cache.layout.placed[position].node, point));
+            }
+        }
+        if let Some((node, point)) = context_target {
+            self.selected = Some(node);
+            let subset_root = cache.key.location.members.is_some()
+                && cache
+                    .layout
+                    .placed
+                    .first()
+                    .is_some_and(|cell| cell.node == node);
+            self.pending_menu = match (node, self.scan_root.as_deref()) {
+                (NodeRef::Entry(id), Some(root))
+                    if !subset_root && (id != index.root() || root.parent().is_some()) =>
+                {
+                    logic::item_path(index, root, id).map(|path| ContextMenuRequest {
+                        path,
+                        position: [point.x, point.y],
+                        pixels_per_point: ui.ctx().pixels_per_point(),
+                        extended: ui.input(|input| input.modifiers.shift),
+                    })
+                }
+                _ => None,
+            };
+            if self.pending_menu.is_none() {
+                self.menu_notice = Some(text::SHELL_NO_ITEM.into());
+            }
+            ui.ctx().request_repaint();
         }
         // Tooltips above may add glyphs. Tessellate only after they settle the font atlas;
         // floating dialogs drawn later use the uncached painter to keep their first frame safe.
@@ -1926,6 +1993,22 @@ impl HogMap {
         }
         if let Some(node) = zoom {
             self.zoom(node);
+        }
+    }
+
+    // The recorder seam keeps headless tests free of COM and metadata I/O. Native calls happen
+    // next logic tick, before ingestion, with only the owned path/position (no index/UI locks).
+    fn process_context_menu(
+        &mut self,
+        show: impl FnOnce(&ContextMenuRequest) -> Result<bool, String>,
+    ) {
+        if let Some(request) = self.pending_menu.take() {
+            match show(&request) {
+                Ok(true) => self.menu_notice = Some(text::SHELL_CHANGED.into()),
+                Ok(false) => {}
+                Err(message) => self.menu_notice = Some(message),
+            }
+            self.context.request_repaint();
         }
     }
 
@@ -2006,6 +2089,12 @@ impl HogMap {
 
 impl eframe::App for HogMap {
     fn logic(&mut self, context: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(windows)]
+        self.process_context_menu(shell_menu::show);
+        #[cfg(not(windows))]
+        self.process_context_menu(|_| {
+            Err("Windows shell menus are only available on Windows.".into())
+        });
         self.drain(context);
     }
 
