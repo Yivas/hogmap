@@ -61,7 +61,7 @@ pub fn render(view: View<'_>) -> String {
     for (position, cell) in cells.iter().enumerate().skip(1) {
         let parent = match cell.node {
             NodeRef::Entry(id) => view.index.get(id).and_then(|entry| entry.parent),
-            NodeRef::Aggregate { parent } => Some(parent),
+            NodeRef::Aggregate { parent } | NodeRef::Group { parent, .. } => Some(parent),
         };
         if let Some(parent) = parent {
             children.entry(parent).or_default().push(position);
@@ -141,6 +141,14 @@ fn push_row(
                 },
             )
         }
+        NodeRef::Group { .. } => (
+            format!(
+                "[{}; {} members; not expanded]",
+                escape(OsStr::new(cell.group_name.as_deref().unwrap_or("Other"))),
+                cell.members.len()
+            ),
+            "group",
+        ),
         NodeRef::Aggregate { .. } => (
             format!("[{} grouped items; not expanded]", cell.members.len()),
             "aggregate",

@@ -188,6 +188,7 @@ fn aggregate_history_keeps_members_and_up_returns_to_parent() {
     location.members = Some(Members {
         names: vec!["photo.jpg".into()],
         grouped_by: SizeMetric::Logical,
+        group_name: None,
     });
     assert_eq!(
         location.resolve(&index),

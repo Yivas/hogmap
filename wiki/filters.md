@@ -64,6 +64,8 @@ Delete class removes the selected definition. If the active expression uses it, 
 
 **View → File Classes** colours files by class; **View → Flat Colors** restores the common file fill. Ctrl+T switches styles outside text fields. Folders keep their depth tones and geometry stays unchanged. Where extensions overlap, the first matching class in alphabetical name order supplies the colour. The five fixed colour choices and the style are session-only.
 
+**View → Group by → Class** groups the current folder's items by the same definitions, using the first matching class name and `Other` for folders, extension-less files and extensions no class defines. Under Filter, a group with no retained file is not drawn. Editing a class rebuilds a grouped map.
+
 ## Temporary tags
 
 The in-memory tag model supports four bits: `:1`/`:red`, `:2`/`:yellow`, `:3`/`:green`, and `:4`/`:blue`. `:tag:` means any tag; `-:tag:` means untagged. `+:red` requires red and `-:red` forbids it. Descendants inherit their nearest folder assignment unless explicitly overridden; zero clears inherited tags.

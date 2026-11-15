@@ -37,7 +37,10 @@ impl HogMap {
         if !self.can_save_snapshot() {
             return;
         }
-        let (Some(index), Some(cache)) = (self.reducer.index(), &self.cache) else {
+        let (Some(index), Some(cache)) = (
+            self.ghosts.display.as_ref().or(self.reducer.index()),
+            &self.cache,
+        ) else {
             return;
         };
         if cache.key.metric != self.metric
@@ -172,6 +175,8 @@ impl HogMap {
         let generation = ScanGeneration::new(self.reducer.generation().value().wrapping_add(1));
         self.reducer =
             hogmap::scan::ScanReducer::from_snapshot(generation, snapshot.index, snapshot.terminal);
+        self.ghosts.clear();
+        self.ghost_baseline = None;
         self.scan_root = None; // No shell menu, rescan or filesystem lookup from untrusted stored paths.
         self.saved_root = snapshot.root_path;
         self.snapshot_file = Some(path);

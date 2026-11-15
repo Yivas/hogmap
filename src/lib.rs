@@ -1,7 +1,9 @@
 //! Metadata model, scanner protocol, Windows metadata engine and pure treemap layout.
 
+pub mod cli;
 pub mod composition;
 pub mod filter;
+pub mod ghosts;
 pub mod index;
 mod name_arena;
 pub mod scan;

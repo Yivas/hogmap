@@ -10,6 +10,30 @@ use std::time::SystemTime;
 
 use super::logic::MetricOverflow;
 
+pub const VIEW_NESTED: &str = "Nested";
+pub const VIEW_FLAT: &str = "Flat";
+pub const GROUP_BY: &str = "Group by";
+pub const GROUP_NONE: &str = "None";
+pub const GROUP_EXTENSION: &str = "Extension";
+pub const GROUP_CLASS: &str = "Class";
+pub const SHOW_GHOSTS: &str = "Show ghosts";
+pub const CLEAR_GHOSTS: &str = "Clear ghosts";
+pub const GHOST_UNAVAILABLE: &str = "Ghosts need a completed rescan of the same live root; snapshots and different roots cannot be compared.";
+pub const NO_GHOSTS: &str = "No ghosts found in the latest same-root rescan.";
+pub const GHOSTS_CLEARED: &str = "Ghosts cleared; showing the live map.";
+pub const GHOST_ERROR: &str = "Could not build the ghost view";
+pub const GHOST_TOTALS: &str = "Map includes ghosts at last listed sizes; its totals are not comparable with volume capacity. Clear ghosts to return to the live map.";
+pub const GHOST_TOOLTIP: &str = "Ghost: not found in the latest scan; last known listed size.";
+pub const WEAK_IDENTITY: &str =
+    "Path comparison only: a file identity was unavailable, so this match is less reliable.";
+pub const OPTIONS: &str = "Options…";
+pub const OPTIONS_SESSION: &str =
+    "Changes apply immediately, for this session only. Area: 1–1,000,000 px²; header: 0–64 px.";
+pub const MINIMUM_AREA: &str = "Minimum cell area";
+pub const HEADER_HEIGHT: &str = "Header height";
+pub const GROUP_SMALL: &str = "Group small siblings";
+pub const CLOSE_OPTIONS: &str = "Close";
+
 pub const TITLE: &str = "HogMap";
 pub const FILE: &str = "File";
 pub const OPEN_SNAPSHOT: &str = "Open snapshot…";

@@ -277,7 +277,7 @@ fn find(layout: &Layout, node: NodeRef) -> &Placed {
 fn parent_of(index: &Index, placed: &Placed) -> Option<EntryId> {
     match placed.node {
         NodeRef::Entry(id) => index.get(id).and_then(|entry| entry.parent),
-        NodeRef::Aggregate { parent } => Some(parent),
+        NodeRef::Aggregate { parent } | NodeRef::Group { parent, .. } => Some(parent),
     }
 }
 

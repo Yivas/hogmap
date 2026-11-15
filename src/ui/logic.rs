@@ -40,6 +40,7 @@ pub struct Location {
 pub struct Members {
     pub names: Vec<OsString>,
     pub grouped_by: SizeMetric,
+    pub group_name: Option<String>,
 }
 
 impl Location {
@@ -90,7 +91,7 @@ impl Location {
     pub fn members_grouped_by(&self, metric: SizeMetric) -> bool {
         self.members
             .as_ref()
-            .is_some_and(|members| members.grouped_by == metric)
+            .is_some_and(|members| members.group_name.is_none() && members.grouped_by == metric)
     }
 
     pub fn up(&self) -> Self {
@@ -193,10 +194,11 @@ impl History {
     }
 }
 
-/// The selection to keep after the map switches metric. An entry ID stays valid for the same
-/// snapshot. An aggregate is only identified by its parent, so it survives only when the new
-/// layout groups exactly the same members under that parent. Each metric orders members by its
-/// own weights, so the comparison ignores order.
+/// The selection to keep when a new layout replaces the previous one. An entry ID stays valid for
+/// the same snapshot. A group is identified only by its parent and ordinal, so it survives only
+/// when the new layout groups exactly the same members there; a metric switch or scan growth can
+/// put another group at that ordinal. Each metric orders members by its own weights, so the
+/// comparison ignores order.
 pub fn retained_selection(
     selected: Option<NodeRef>,
     before: Option<&Layout>,
@@ -366,15 +368,17 @@ pub fn highlight(node: NodeRef, members: &[EntryId], matches: &[Match]) -> Match
             .get(id.position())
             .copied()
             .unwrap_or(Match::Unknown),
-        NodeRef::Aggregate { .. } => members.iter().fold(Match::No, |found, id| {
-            combine(
-                found,
-                matches
-                    .get(id.position())
-                    .copied()
-                    .unwrap_or(Match::Unknown),
-            )
-        }),
+        NodeRef::Aggregate { .. } | NodeRef::Group { .. } => {
+            members.iter().fold(Match::No, |found, id| {
+                combine(
+                    found,
+                    matches
+                        .get(id.position())
+                        .copied()
+                        .unwrap_or(Match::Unknown),
+                )
+            })
+        }
     }
 }
 

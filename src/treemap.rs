@@ -71,6 +71,11 @@ pub enum NodeRef {
     Aggregate {
         parent: EntryId,
     },
+    /// Session-only extension/class group; `ordinal` belongs to this layout only.
+    Group {
+        parent: EntryId,
+        ordinal: usize,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -85,6 +90,7 @@ pub struct Placed {
     pub has_unknown: bool,
     /// Entries grouped by an [`NodeRef::Aggregate`]; empty otherwise.
     pub members: Vec<EntryId>,
+    pub group_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -366,10 +372,139 @@ fn layout_selection(
                         known_sum: aggregate_weight,
                         has_unknown,
                         members: std::mem::take(&mut aggregate_members),
+                        group_name: None,
                     });
                 }
             }
         }
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GroupBy {
+    #[default]
+    None,
+    Extension,
+    Class,
+}
+
+/// Groups immediate children, preserving real IDs in each navigable member list. Group weights
+/// use the same corrected subtree totals as ordinary layouts; directories belong to Other.
+pub fn layout_grouped(
+    index: &Index,
+    root: EntryId,
+    rect: Rect,
+    params: LayoutParams,
+    metric: SizeMetric,
+    grouping: (&crate::filter::ClassTable, GroupBy),
+    matches: Option<&[crate::filter::Match]>,
+) -> Result<Layout, LayoutError> {
+    let (classes, by) = grouping;
+    if matches.is_some_and(|values| values.len() != index.len()) {
+        return Err(LayoutError::UnknownRoot);
+    }
+    let mut result = layout_selection(
+        index,
+        root,
+        None,
+        rect,
+        LayoutParams {
+            max_depth: 0,
+            ..params
+        },
+        metric,
+        matches,
+    )?;
+    let totals = subtree_totals(index, metric, matches)?;
+    // A directory only remains after filtering if a file below it remains. Its scan-state
+    // uncertainty alone must not manufacture an empty group.
+    let mut retained = vec![false; index.len()];
+    for (id, entry) in index.entries().rev() {
+        if entry.kind == Kind::File {
+            retained[id.position()] =
+                matches.is_none_or(|values| values[id.position()] != crate::filter::Match::No);
+        }
+        if retained[id.position()]
+            && let Some(parent) = entry.parent
+        {
+            retained[parent.position()] = true;
+        }
+    }
+    let mut groups: std::collections::BTreeMap<String, Vec<EntryId>> =
+        std::collections::BTreeMap::new();
+    for (id, entry) in index
+        .entries()
+        .filter(|(_, entry)| entry.parent == Some(root))
+    {
+        if matches.is_some() && !retained[id.position()] {
+            continue;
+        }
+        let extension = (entry.kind == Kind::File)
+            .then(|| {
+                entry
+                    .name
+                    .to_str()?
+                    .rsplit_once('.')
+                    .map(|(_, ext)| ext.to_ascii_lowercase())
+            })
+            .flatten()
+            .filter(|ext| !ext.is_empty());
+        let name = match by {
+            GroupBy::Extension => extension.map(|ext| format!(".{ext}")),
+            GroupBy::Class => extension.and_then(|ext| {
+                classes
+                    .entries()
+                    .find(|(_, class)| {
+                        class
+                            .extensions
+                            .iter()
+                            .any(|candidate| candidate.eq_ignore_ascii_case(&ext))
+                    })
+                    .map(|(name, _)| name.to_owned())
+            }),
+            GroupBy::None => None,
+        }
+        .unwrap_or_else(|| "Other".into());
+        groups.entry(name).or_default().push(id);
+    }
+    let mut entries = Vec::new();
+    for (name, members) in groups {
+        let mut sum = 0_u64;
+        let mut unknown = false;
+        for id in &members {
+            let value = totals.get(id.position());
+            sum = sum
+                .checked_add(value.known_sum)
+                .ok_or(LayoutError::SizeOverflow)?;
+            unknown |= value.unknown > 0;
+        }
+        entries.push((name, members, sum, unknown));
+    }
+    let weights: Vec<_> = entries
+        .iter()
+        .map(|(_, _, weight, _)| Cell {
+            node: None,
+            weight: *weight,
+        })
+        .collect();
+    let rectangles = squarify(&weights, RectF64::from_rect(result.content));
+    for (ordinal, ((name, members, known_sum, has_unknown), rect)) in
+        entries.into_iter().zip(rectangles).enumerate()
+    {
+        result.placed.push(Placed {
+            node: NodeRef::Group {
+                parent: root,
+                ordinal,
+            },
+            rect,
+            header: None,
+            content: rect,
+            known_sum,
+            has_unknown,
+            members,
+            group_name: Some(name),
+        });
     }
     Ok(result)
 }
@@ -664,6 +799,7 @@ fn place(
         known_sum: totals.known_sum,
         has_unknown: totals.unknown > 0,
         members: Vec::new(),
+        group_name: None,
     }
 }
 

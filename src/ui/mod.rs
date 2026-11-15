@@ -10,6 +10,7 @@ mod file_dialog;
 mod files;
 mod icons;
 pub(crate) mod logic;
+mod options;
 pub(crate) mod paint;
 #[cfg(windows)]
 mod shell_menu;
@@ -33,7 +34,7 @@ use hogmap::scan_win::{
     ScanOriginObservations, ScanReport, run_win_scan_observed_with_options,
 };
 use hogmap::synthetic::{SyntheticSpec, run_synthetic};
-use hogmap::treemap::{self, Layout, LayoutError, LayoutParams, NodeRef, Rect};
+use hogmap::treemap::{self, GroupBy, Layout, LayoutError, LayoutParams, NodeRef, Rect};
 use hogmap::volume::{self, volume_root_for};
 use logic::{HighlightFilter, History, Location, Members};
 use theme::{MapStyle, Theme};
@@ -44,8 +45,8 @@ pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(67);
 const DRAIN_BUDGET: Duration = Duration::from_millis(6);
 // Detail controls area, not a two-level stop. The depth bound is only a safety limit;
 // deeper folders remain navigable without recursively growing the rendered tree forever.
-const DETAIL_AREAS: [f32; 5] = [4096.0, 2048.0, 1024.0, 640.0, 400.0];
-const DEFAULT_DETAIL: usize = 2;
+// Listed from least to most detail, so "more detail" is the next smaller preset.
+const DETAIL_AREAS: [f32; 5] = [4096.0, 2048.0, 400.0, 250.0, 156.25];
 const SAFETY_DEPTH: usize = 64;
 // Hold a close request this long so returning threads can finish; then detach the rest.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
@@ -93,7 +94,9 @@ struct ViewKey {
     location: Location,
     rect: Rect,
     metric: SizeMetric,
-    detail: usize,
+    flat: bool,
+    grouping: GroupBy,
+    options: options::Options,
 }
 
 struct VolumeMap {
@@ -127,7 +130,9 @@ struct StatusKey {
     candidates: usize,
     terminal: Option<Terminal>,
     observed: bool,
-    detail: usize,
+    /// The detail actions write the minimum area here, so an explicit detail change is an options
+    /// change and still refreshes the status immediately.
+    options: options::Options,
     viewport: egui::Vec2,
 }
 impl StatusKey {
@@ -139,7 +144,7 @@ impl StatusKey {
             || self.phase != other.phase
             || self.terminal != other.terminal
             || self.observed != other.observed
-            || self.detail != other.detail
+            || self.options != other.options
             || self.viewport != other.viewport
     }
 }
@@ -235,10 +240,16 @@ pub struct HogMap {
     classes: ClassTable,
     class_editor: classes::ClassEditor,
     map_style: MapStyle,
+    flat: bool,
+    grouping: GroupBy,
+    options: options::Options,
+    options_open: bool,
+    show_ghosts: bool,
+    ghost_baseline: Option<hogmap::ghosts::Baseline>,
+    ghosts: hogmap::ghosts::Ghosts,
     /// The size the map weighs. Chosen in View for this session only: it survives a rescan but is
     /// never saved.
     metric: SizeMetric,
-    detail: usize,
     cache: Option<Cache>,
     volume_map: Option<VolumeMap>,
     status_cache: Option<StatusCache>,
@@ -259,13 +270,37 @@ pub struct HogMap {
 }
 
 impl HogMap {
-    pub fn new(context: &eframe::CreationContext<'_>) -> std::io::Result<Self> {
+    pub fn new(
+        context: &eframe::CreationContext<'_>,
+        startup: hogmap::cli::Startup,
+        snapshot: Option<hogmap::snapshot::Snapshot>,
+    ) -> std::io::Result<Self> {
         // The native window stays hidden until the first frame is painted, so restoring the
         // stored choice here is enough to start in the saved theme. A missing, corrupt or future
         // value leaves the dark default.
-        let theme = context.storage.and_then(Theme::load).unwrap_or_default();
+        let theme = startup
+            .theme
+            .map(|light| if light { Theme::Light } else { Theme::Dark })
+            .or_else(|| context.storage.and_then(Theme::load))
+            .unwrap_or_default();
         theme::apply(&context.egui_ctx, theme);
-        Ok(Self::with_context(context.egui_ctx.clone()))
+        let mut app = Self::with_context(context.egui_ctx.clone());
+        if let (Some(path), Some(snapshot)) = (startup.open, snapshot) {
+            app.install_snapshot(path, snapshot);
+        }
+        if let Some(metric) = startup.metric {
+            app.metric = metric;
+        }
+        if let Some(expression) = startup.filter {
+            app.filter_text = expression.clone();
+            app.filter.set(&expression);
+            app.geometry_filter = true;
+            app.filter_changed = true;
+        }
+        if let Some(root) = startup.scan {
+            app.start_real_scan(root);
+        }
+        Ok(app)
     }
 
     fn with_context(context: egui::Context) -> Self {
@@ -314,8 +349,14 @@ impl HogMap {
             classes: ClassTable::default(),
             class_editor: classes::ClassEditor::default(),
             map_style: MapStyle::default(),
+            flat: false,
+            grouping: GroupBy::None,
+            options: options::Options::default(),
+            options_open: false,
+            show_ghosts: false,
+            ghost_baseline: None,
+            ghosts: hogmap::ghosts::Ghosts::default(),
             metric: SizeMetric::Logical,
-            detail: DEFAULT_DETAIL,
             cache: None,
             volume_map: None,
             status_cache: None,
@@ -334,6 +375,74 @@ impl HogMap {
             focus_filter: false,
             volume: None,
         }
+    }
+
+    fn capture_ghost_baseline(&mut self, root: &std::path::Path) {
+        self.ghost_baseline = None;
+        if !self.show_ghosts {
+            return;
+        }
+        if self.snapshot_file.is_none()
+            && self.scan_root.as_deref() == Some(root)
+            && self.reducer.terminal() == Some(Terminal::Finished)
+            && let Some(index) = self.ghosts.display.as_ref().or(self.reducer.index())
+        {
+            self.ghost_baseline = Some(hogmap::ghosts::Baseline::capture(root, index));
+        } else {
+            self.menu_notice = Some(text::GHOST_UNAVAILABLE.into());
+        }
+    }
+
+    fn finish_ghost_comparison(&mut self) {
+        if self.receiver.is_some() || self.producer.is_some() || self.resolution.active() {
+            return;
+        }
+        let Some(before) = self.ghost_baseline.take() else {
+            return;
+        };
+        if self.reducer.terminal() != Some(Terminal::Finished) || !self.show_ghosts {
+            return;
+        }
+        let Some(live) = self.reducer.index() else {
+            return;
+        };
+        match self.ghosts.compare(
+            before,
+            self.scan_root.as_deref(),
+            live,
+            self.snapshot_file.is_some(),
+        ) {
+            Ok(true) => {
+                self.menu_notice = Some(
+                    if self.ghosts.count > 0 {
+                        text::GHOST_TOTALS
+                    } else {
+                        text::NO_GHOSTS
+                    }
+                    .into(),
+                );
+                self.filter_changed = true;
+                self.version = self.version.wrapping_add(1);
+                self.cache = None;
+                self.volume_map = None;
+                self.last_layout = None;
+            }
+            Ok(false) => self.menu_notice = Some(text::GHOST_UNAVAILABLE.into()),
+            Err(error) => self.error = Some(format!("{}: {error:?}", text::GHOST_ERROR)),
+        }
+    }
+
+    fn clear_ghosts(&mut self) {
+        self.ghosts.clear();
+        self.ghost_baseline = None;
+        self.history = History::default();
+        self.selected = None;
+        self.cache = None;
+        self.volume_map = None;
+        self.last_layout = None;
+        self.filter_changed = true;
+        self.menu_notice = Some(text::GHOSTS_CLEARED.into());
+        self.version = self.version.wrapping_add(1);
     }
 
     fn stop_producer(&mut self) {
@@ -523,6 +632,7 @@ impl HogMap {
             }
         };
         self.volume = Some(volume);
+        self.capture_ghost_baseline(&root);
         self.scan_root = Some(root);
         self.reset_scan(
             generation,
@@ -535,6 +645,9 @@ impl HogMap {
 
     fn rescan(&mut self) {
         if self.snapshot_file.is_some() {
+            if self.show_ghosts {
+                self.menu_notice = Some(text::GHOST_UNAVAILABLE.into());
+            }
             return;
         }
         if let Some(root) = self.scan_root.clone() {
@@ -578,6 +691,7 @@ impl HogMap {
             })?;
         self.volume = None;
         self.scan_root = None;
+        self.ghost_baseline = None;
         self.reset_scan(
             generation,
             receiver,
@@ -599,6 +713,7 @@ impl HogMap {
         self.snapshot_file = None;
         self.saved_root = None;
         self.export_preview = None;
+        self.ghosts.clear();
         self.reducer = ScanReducer::new(generation);
         self.cancellation = cancellation;
         self.receiver = Some(receiver);
@@ -692,6 +807,7 @@ impl HogMap {
         // `collect_producer` joins only an already finished thread.
         self.collect_producer();
         self.advance_resolution();
+        self.finish_ghost_comparison();
         self.poll_pending();
         self.chooser.poll_drives(context);
         self.advance_scan();
@@ -877,31 +993,49 @@ impl HogMap {
         self.selected = None;
     }
 
-    fn change_detail(&mut self, more: bool) {
-        let next = if more {
-            (self.detail + 1).min(DETAIL_AREAS.len() - 1)
+    /// The next preset strictly below (more detail) or above (less detail) the minimum area that
+    /// Options edits. Options accepts any area, so the presets are steps from wherever the area
+    /// is now; stepping through an index would raise the area on "more detail" after a custom
+    /// value.
+    fn next_detail_area(&self, more: bool) -> Option<f32> {
+        let area = self.options.minimum_area;
+        if more {
+            DETAIL_AREAS.iter().copied().find(|preset| *preset < area)
         } else {
-            self.detail.saturating_sub(1)
-        };
-        if next != self.detail {
-            self.detail = next;
+            DETAIL_AREAS
+                .iter()
+                .rev()
+                .copied()
+                .find(|preset| *preset > area)
+        }
+    }
+
+    fn can_change_detail(&self, more: bool) -> bool {
+        self.next_detail_area(more).is_some()
+    }
+
+    fn change_detail(&mut self, more: bool) {
+        if let Some(area) = self.next_detail_area(more) {
+            self.options.minimum_area = area;
             self.last_layout = None;
         }
     }
 
     fn can_zoom(&self) -> bool {
         self.selected.is_some_and(|node| match node {
-            NodeRef::Aggregate { .. } => true,
+            NodeRef::Aggregate { .. } | NodeRef::Group { .. } => true,
             NodeRef::Entry(id) => self
-                .reducer
-                .index()
+                .ghosts
+                .display
+                .as_ref()
+                .or(self.reducer.index())
                 .and_then(|index| index.get(id))
                 .is_some_and(|entry| entry.kind == hogmap::index::Kind::Directory),
         })
     }
 
     fn zoom(&mut self, node: NodeRef) {
-        let Some(index) = self.reducer.index() else {
+        let Some(index) = self.ghosts.display.as_ref().or(self.reducer.index()) else {
             return;
         };
         let location = match node {
@@ -914,7 +1048,7 @@ impl HogMap {
                 }
                 Location::directory(index, id)
             }
-            NodeRef::Aggregate { parent } => {
+            NodeRef::Aggregate { parent } | NodeRef::Group { parent, .. } => {
                 let Some(cache) = self.cache.as_ref() else {
                     return;
                 };
@@ -929,6 +1063,7 @@ impl HogMap {
                         .filter_map(|id| index.get(*id).map(|entry| entry.name.to_os_string()))
                         .collect(),
                     grouped_by: cache.key.metric,
+                    group_name: cell.group_name.clone(),
                 });
                 location
             }
@@ -938,6 +1073,7 @@ impl HogMap {
 
     fn set_filter_mode(&mut self, filtered: bool) {
         self.geometry_filter = filtered;
+        self.clear_group_selection();
         self.cache = None;
         self.volume_map = None;
         self.last_layout = None;
@@ -959,16 +1095,46 @@ impl HogMap {
     }
 
     fn assign_tag(&mut self, bits: u8) {
-        if let Some(NodeRef::Entry(id)) = self.selected
-            && self.reducer.set_tags(id, bits).is_ok()
-        {
+        if let Some(NodeRef::Entry(id)) = self.selected {
+            let changed = if let Some(display) = &mut self.ghosts.display {
+                let changed = display.set_tags(id, bits).is_ok();
+                if self
+                    .reducer
+                    .index()
+                    .is_some_and(|index| index.get(id).is_some())
+                {
+                    let _ = self.reducer.set_tags(id, bits);
+                }
+                changed
+            } else {
+                self.reducer.set_tags(id, bits).is_ok()
+            };
+            if !changed {
+                return;
+            }
             self.filter_changed = true;
             self.invalidate_presentation();
         }
     }
 
+    /// A group is a synthetic node: its ordinal only identifies it inside one layout. A rebuild
+    /// that can regroup the map must not carry the selection to whichever group takes that
+    /// ordinal, so the group selection is dropped instead. An entry selection names a real node
+    /// and survives.
+    fn clear_group_selection(&mut self) {
+        if matches!(self.selected, Some(NodeRef::Group { .. })) {
+            self.selected = None;
+        }
+    }
+
     fn classes_changed(&mut self) {
         self.filter.reparse(&self.classes);
+        if self.grouping == GroupBy::Class {
+            self.clear_group_selection();
+            self.cache = None;
+            self.volume_map = None;
+            self.last_layout = None;
+        }
         self.filter_changed = true;
         self.invalidate_presentation();
     }
@@ -983,6 +1149,7 @@ impl HogMap {
         }
         if self.chooser.open
             || self.class_editor.open
+            || self.options_open
             || self.export_preview.is_some()
             || self.pending_file.is_some()
         {
@@ -1013,6 +1180,10 @@ impl HogMap {
         }
         if context.text_edit_focused() {
             return;
+        }
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::V))
+        {
+            self.flat = !self.flat;
         }
         if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::O)) {
             self.request_file(files::Action::Open);
@@ -1145,7 +1316,7 @@ impl HogMap {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            self.detail + 1 < DETAIL_AREAS.len(),
+                            self.can_change_detail(true),
                             egui::Button::new(text::MORE_DETAIL).shortcut_text("Ctrl++"),
                         )
                         .clicked()
@@ -1155,12 +1326,47 @@ impl HogMap {
                     }
                     if ui
                         .add_enabled(
-                            self.detail > 0,
+                            self.can_change_detail(false),
                             egui::Button::new(text::LESS_DETAIL).shortcut_text("Ctrl+-"),
                         )
                         .clicked()
                     {
                         self.change_detail(false);
+                        ui.close();
+                    }
+                    ui.separator();
+                    ui.selectable_value(&mut self.flat, false, text::VIEW_NESTED)
+                        .on_hover_text("Ctrl+Shift+V");
+                    ui.selectable_value(&mut self.flat, true, text::VIEW_FLAT)
+                        .on_hover_text("Ctrl+Shift+V");
+                    ui.menu_button(text::GROUP_BY, |ui| {
+                        ui.selectable_value(&mut self.grouping, GroupBy::None, text::GROUP_NONE);
+                        ui.selectable_value(
+                            &mut self.grouping,
+                            GroupBy::Extension,
+                            text::GROUP_EXTENSION,
+                        );
+                        ui.selectable_value(&mut self.grouping, GroupBy::Class, text::GROUP_CLASS);
+                    });
+                    if ui
+                        .checkbox(&mut self.show_ghosts, text::SHOW_GHOSTS)
+                        .changed()
+                    {
+                        if self.show_ghosts {
+                            self.menu_notice = Some(text::GHOST_UNAVAILABLE.into());
+                        } else {
+                            self.clear_ghosts();
+                        }
+                    }
+                    if ui
+                        .add_enabled(self.ghosts.count > 0, egui::Button::new(text::CLEAR_GHOSTS))
+                        .clicked()
+                    {
+                        self.clear_ghosts();
+                        ui.close();
+                    }
+                    if ui.button(text::OPTIONS).clicked() {
+                        self.options_open = true;
                         ui.close();
                     }
                     ui.separator();
@@ -1277,7 +1483,7 @@ impl HogMap {
                 if button(
                     ui,
                     Icon::MoreDetail,
-                    self.detail + 1 < DETAIL_AREAS.len(),
+                    self.can_change_detail(true),
                     false,
                     text::MORE_DETAIL_TIP,
                 )
@@ -1288,7 +1494,7 @@ impl HogMap {
                 if button(
                     ui,
                     Icon::LessDetail,
-                    self.detail > 0,
+                    self.can_change_detail(false),
                     false,
                     text::LESS_DETAIL_TIP,
                 )
@@ -1452,9 +1658,11 @@ impl HogMap {
 
     fn status(&mut self, ui: &mut egui::Ui) {
         // Resolve the selected path only after selection/layout changes, not on every frame.
-        if let (Some(index), Some(cache), Some(node)) =
-            (self.reducer.index(), &mut self.cache, self.selected)
-            && cache.key.metric == self.metric
+        if let (Some(index), Some(cache), Some(node)) = (
+            self.ghosts.display.as_ref().or(self.reducer.index()),
+            &mut self.cache,
+            self.selected,
+        ) && cache.key.metric == self.metric
             && cache
                 .selection_readout
                 .as_ref()
@@ -1474,9 +1682,15 @@ impl HogMap {
                                 .get(id)
                                 .is_some_and(|entry| entry.kind == hogmap::index::Kind::Directory),
                         ),
-                        NodeRef::Aggregate { parent } => {
-                            (parent, Some(text::aggregate_name(cell.members.len())), true)
-                        }
+                        NodeRef::Aggregate { parent } | NodeRef::Group { parent, .. } => (
+                            parent,
+                            Some(
+                                cell.group_name
+                                    .clone()
+                                    .unwrap_or_else(|| text::aggregate_name(cell.members.len())),
+                            ),
+                            true,
+                        ),
                     };
                     let location = Location::directory(index, id);
                     let mut path =
@@ -1551,7 +1765,7 @@ impl HogMap {
             },
             terminal: self.reducer.terminal(),
             observed: self.volume_evidence.is_some(),
-            detail: self.detail,
+            options: self.options,
             viewport: ui.available_size(),
         };
         let layout_error = self
@@ -1669,10 +1883,17 @@ impl HogMap {
                                             NodeRef::Aggregate { .. } => {
                                                 text::aggregate_name(cell.members.len())
                                             }
+                                            NodeRef::Group { .. } => format!(
+                                                "{} · {} members",
+                                                cell.group_name.as_deref().unwrap_or("Other"),
+                                                cell.members.len()
+                                            ),
                                         };
                                         let open = if cell.header.is_some()
-                                            || matches!(node, NodeRef::Aggregate { .. })
-                                        {
+                                            || matches!(
+                                                node,
+                                                NodeRef::Aggregate { .. } | NodeRef::Group { .. }
+                                            ) {
                                             " · Double-click to open"
                                         } else {
                                             ""
@@ -1856,9 +2077,14 @@ impl HogMap {
     }
 
     fn map(&mut self, ui: &mut egui::Ui) {
+        // The filter decides which items the geometry keeps, so a filter change can regroup the
+        // map and the ordinal that identified a selected group may name another one.
+        if self.geometry_filter && self.filter_changed {
+            self.clear_group_selection();
+        }
         let (area, response) = ui.allocate_exact_size(ui.available_size(), egui::Sense::click());
         let palette = Theme::current(ui.ctx()).palette();
-        let Some(index) = self.reducer.index() else {
+        let Some(index) = self.ghosts.display.as_ref().or(self.reducer.index()) else {
             ui.painter().text(
                 area.center(),
                 egui::Align2::CENTER_CENTER,
@@ -1879,7 +2105,9 @@ impl HogMap {
             location: self.history.current(),
             rect,
             metric: self.metric,
-            detail: self.detail,
+            flat: self.flat,
+            grouping: self.grouping,
+            options: self.options,
         };
         let shown = self.volume_map.as_ref().map(|map| &map.key);
         let dirty = shown != Some(&key) || (self.geometry_filter && self.filter_changed);
@@ -1889,7 +2117,9 @@ impl HogMap {
             shown.metric != key.metric
                 || shown.location != key.location
                 || shown.rect != key.rect
-                || shown.detail != key.detail
+                || shown.flat != key.flat
+                || shown.grouping != key.grouping
+                || shown.options != key.options
         });
         let due = self.last_layout.is_none_or(|last| {
             last.elapsed() >= LAYOUT_INTERVAL.max(self.last_layout_cost.saturating_mul(4))
@@ -1919,7 +2149,7 @@ impl HogMap {
             let (tree_area, volume_cells) = composition::arrange(
                 area,
                 apparent.unwrap_or(0),
-                if self.geometry_filter {
+                if self.geometry_filter || self.ghosts.count > 0 {
                     hogmap::composition::VolumeComponents {
                         free_bytes: None,
                         reserve_bytes: None,
@@ -1927,7 +2157,7 @@ impl HogMap {
                 } else {
                     visible.components
                 },
-                if self.geometry_filter {
+                if self.geometry_filter || self.ghosts.count > 0 {
                     None
                 } else {
                     visible.pending_bytes
@@ -1957,21 +2187,44 @@ impl HogMap {
             // root temporarily, without replacing the history entry before its parent arrives.
             let (root, members) = location.resolve(index).unwrap_or((index.root(), None));
             let content_area = rect.area().max(1.0);
-            let minimum = DETAIL_AREAS[self.detail];
-            let min_area = members.as_ref().map_or(minimum, |members| {
-                // At least one member must escape the next aggregate, even on a tiny viewport.
-                (content_area / (members.len().max(1) as f32 * 4.0)).clamp(0.001, minimum)
-            });
+            let minimum = if self.options.group_small {
+                self.options.minimum_area
+            } else {
+                f32::MIN_POSITIVE
+            };
+            let min_area = members
+                .as_ref()
+                .filter(|_| self.options.group_small)
+                .map_or(minimum, |members| {
+                    // At least one member must escape the next aggregate, even on a tiny viewport.
+                    (content_area / (members.len().max(1) as f32 * 4.0)).clamp(0.001, minimum)
+                });
             let params = LayoutParams {
                 min_pixel_area: min_area,
-                header_height: 20.0,
-                max_depth: SAFETY_DEPTH,
+                ..self.options.params(self.flat)
             };
             let subset = members.as_deref().filter(|members| !members.is_empty());
             let caption = subset_caption(location, subset, self.metric);
-            let location_label =
+            let mut location_label =
                 text::location(&entry_name(index, index.root()), &location.path, caption);
-            let result = if self.geometry_filter {
+            if let Some(name) = location
+                .members
+                .as_ref()
+                .and_then(|members| members.group_name.as_deref())
+            {
+                location_label.push_str(&format!(" / {name}"));
+            }
+            let result = if self.grouping != GroupBy::None && location.members.is_none() {
+                treemap::layout_grouped(
+                    index,
+                    root,
+                    rect,
+                    params,
+                    self.metric,
+                    (&self.classes, self.grouping),
+                    self.geometry_filter.then_some(results.matches.as_slice()),
+                )
+            } else if self.geometry_filter {
                 treemap::layout_filtered(
                     index,
                     root,
@@ -1998,13 +2251,14 @@ impl HogMap {
             // only its highlight results can carry over.
             let previous = self.cache.take();
             self.layout_failure = None;
-            if switched {
-                self.selected = logic::retained_selection(
-                    self.selected,
-                    previous.as_ref().map(|cache| &cache.layout),
-                    result.as_ref().ok(),
-                );
-            }
+            // Validated on every replacement, not only on an explicit switch: a scan that adds
+            // records regroups the map too, so the ordinal that named the selected group can
+            // name another one afterwards.
+            self.selected = logic::retained_selection(
+                self.selected,
+                previous.as_ref().map(|cache| &cache.layout),
+                result.as_ref().ok(),
+            );
             match result {
                 Ok(layout) => {
                     // Labels and meshes share a font/atlas stamp, prepared once below.
@@ -2088,6 +2342,25 @@ impl HogMap {
                 &self.classes,
                 self.map_style,
             );
+            for (placed, cell) in cache.layout.placed.iter().zip(&mut cache.cells) {
+                if let NodeRef::Entry(id) = placed.node {
+                    if index
+                        .get(id)
+                        .is_some_and(|entry| entry.state == hogmap::index::State::Stale)
+                    {
+                        cell.tooltip.push_str(&format!(
+                            "\n{}\n{}",
+                            text::GHOST_TOOLTIP,
+                            text::GHOST_TOTALS
+                        ));
+                        if index.get(id).is_some_and(|entry| entry.identity.is_none()) {
+                            cell.tooltip.push_str(&format!("\n{}", text::WEAK_IDENTITY));
+                        }
+                    } else if self.ghosts.weak_matches.contains(&id) {
+                        cell.tooltip.push_str(&format!("\n{}", text::WEAK_IDENTITY));
+                    }
+                }
+            }
             cache.paint = None;
         }
         // The cell controls below cover the map, so its own response is not hovered; ask whether
@@ -2175,7 +2448,9 @@ impl HogMap {
                     .is_some_and(|cell| cell.node == node);
             self.pending_menu = match (node, self.scan_root.as_deref()) {
                 (NodeRef::Entry(id), Some(root))
-                    if !subset_root && (id != index.root() || root.parent().is_some()) =>
+                    if !subset_root
+                        && self.ghosts.count == 0
+                        && (id != index.root() || root.parent().is_some()) =>
                 {
                     logic::item_path(index, root, id).map(|path| ContextMenuRequest {
                         path,
@@ -2193,7 +2468,12 @@ impl HogMap {
         }
         // Tooltips above may add glyphs. Tessellate only after they settle the font atlas;
         // floating dialogs drawn later use the uncached painter to keep their first frame safe.
-        if self.chooser.open || self.about || self.class_editor.open {
+        if self.chooser.open
+            || self.about
+            || self.class_editor.open
+            || self.export_preview.is_some()
+            || self.options_open
+        {
             paint::draw(
                 ui.painter(),
                 palette,
@@ -2321,6 +2601,7 @@ impl HogMap {
             self.classes_changed();
         }
         self.show_export_preview(&context);
+        self.show_options(&context);
         if self.about {
             let mut about = text::about(self.metric);
             if let Some(index) = self.reducer.index() {
@@ -2540,7 +2821,7 @@ mod tests {
             index.root(),
             cache.key.rect,
             LayoutParams {
-                min_pixel_area: DETAIL_AREAS[app.detail],
+                min_pixel_area: app.options.minimum_area,
                 header_height: 20.0,
                 max_depth: SAFETY_DEPTH,
             },

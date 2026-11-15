@@ -493,7 +493,7 @@ fn status_progress_is_coalesced_but_errors_terminal_and_selection_are_immediate(
         candidates: 0,
         terminal: None,
         observed: false,
-        detail: DEFAULT_DETAIL,
+        options: options::Options::default(),
         viewport: egui::vec2(800.0, 600.0),
     };
     let mut after = StatusKey {
@@ -701,6 +701,19 @@ fn cached_map_meshes_match_the_live_painter_and_refresh_after_filter_or_theme_ch
         "cached meshes preserve clips, geometry, colours and texture coordinates"
     );
     app.about = false;
+    // The preview is drawn after the map, so its new glyphs can grow the atlas once the map has
+    // painted. While it is open the map must paint through the uncached path: a memoized mesh
+    // cleared here has to stay cleared, because reusing the previous cache is exactly the hazard.
+    app.export_preview = Some("Preview adds glyphs: Ω Ж".into());
+    app.cache.as_mut().unwrap().paint = None;
+    let live_export = digest(frame(&context, &mut app, Vec::new()).0);
+    assert_eq!(cached, live_export);
+    assert!(
+        app.cache.as_ref().unwrap().paint.is_none(),
+        "an open dialog keeps the map on the uncached painter"
+    );
+    assert_eq!(app.paint_rebuilds, count);
+    app.export_preview = None;
     app.filter.set("missing-name");
     app.filter_changed = true;
     let filtered = digest(frame(&context, &mut app, Vec::new()).0);
@@ -784,11 +797,11 @@ fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
             };
             desktop_frame(&context, &mut app, size, vec![key(Key::Minus)]);
             desktop_frame(&context, &mut app, size, vec![key(Key::Minus)]);
-            assert_eq!(app.detail, 0);
+            assert_eq!(app.options.minimum_area, DETAIL_AREAS[0]);
             assert!(app.cache.as_ref().unwrap().layout.placed.len() < detailed);
             desktop_frame(&context, &mut app, size, vec![key(Key::Plus)]);
             desktop_frame(&context, &mut app, size, vec![key(Key::Equals)]);
-            assert_eq!(app.detail, 2);
+            assert_eq!(app.options.minimum_area, DETAIL_AREAS[2]);
             assert_eq!(app.cache.as_ref().unwrap().layout.placed.len(), detailed);
             let output = desktop_frame(&context, &mut app, size, Vec::new());
             let more = output
@@ -823,15 +836,15 @@ fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
                     ],
                 );
             }
-            assert_eq!(app.detail, 3);
+            assert_eq!(app.options.minimum_area, DETAIL_AREAS[3]);
             for _ in 0..10 {
                 app.change_detail(true);
             }
-            assert_eq!(app.detail, 4);
+            assert_eq!(app.options.minimum_area, DETAIL_AREAS[4]);
             for _ in 0..10 {
                 app.change_detail(false);
             }
-            assert_eq!(app.detail, 0);
+            assert_eq!(app.options.minimum_area, DETAIL_AREAS[0]);
             app.change_detail(true);
             // Move away from controls and allow egui's finite hover animation to settle.
             let _ = desktop_frame(&context, &mut app, size, vec![egui::Event::PointerGone]);
@@ -860,6 +873,206 @@ fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
             assert_eq!(app.volume_map.as_ref().unwrap().key.version, app.version);
         }
     }
+}
+
+#[test]
+fn detail_steps_follow_the_area_in_effect_after_options_writes_a_custom_value() {
+    let context = egui::Context::default();
+    let mut app = app(&context);
+    // The level was 2048 before Options wrote 300. Stepping through the preset index instead of
+    // the area in effect would raise that 300 to 400 on "more detail".
+    app.change_detail(false);
+    assert_eq!(app.options.minimum_area, 2048.0);
+    assert!(app.set_options(options::Options {
+        minimum_area: 300.0,
+        ..app.options
+    }));
+    assert_eq!(app.next_detail_area(true), Some(250.0));
+    assert_eq!(app.next_detail_area(false), Some(400.0));
+    app.change_detail(true);
+    assert_eq!(app.options.minimum_area, 250.0);
+    app.change_detail(false);
+    assert_eq!(app.options.minimum_area, 400.0);
+    // Below the smallest preset there is no more detail to add, so the action is disabled.
+    assert!(app.set_options(options::Options {
+        minimum_area: 100.0,
+        ..app.options
+    }));
+    assert!(!app.can_change_detail(true));
+    assert!(app.can_change_detail(false));
+    app.change_detail(true);
+    assert_eq!(app.options.minimum_area, 100.0);
+    // Above the largest preset there is no less detail to remove.
+    assert!(app.set_options(options::Options {
+        minimum_area: 5000.0,
+        ..app.options
+    }));
+    assert!(app.can_change_detail(true));
+    assert!(!app.can_change_detail(false));
+    app.change_detail(false);
+    assert_eq!(app.options.minimum_area, 5000.0);
+    assert_eq!(app.next_detail_area(true), Some(4096.0));
+}
+
+/// A root with one file per class: grouping by class gives audio[0], documents[1], images[2].
+fn class_grouped_app(context: &egui::Context) -> HogMap {
+    let mut index = Index::new("Fixture".into()).unwrap();
+    index.set_state(index.root(), State::Complete).unwrap();
+    for (name, bytes) in [("song.mp3", 300), ("readme.txt", 200), ("photo.jpg", 100)] {
+        index
+            .insert(
+                index.root(),
+                name.into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(bytes),
+                    allocated: Some(bytes),
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap();
+    }
+    let mut app = HogMap::with_reducer(
+        context.clone(),
+        ScanReducer::from_snapshot(ScanGeneration::new(1), index, Terminal::Finished),
+    );
+    app.grouping = GroupBy::Class;
+    app
+}
+
+/// The name of the group the layout places at `ordinal`.
+fn group_name(app: &HogMap, ordinal: usize) -> Option<String> {
+    let cache = app.cache.as_ref()?;
+    cache
+        .layout
+        .placed
+        .iter()
+        .find(|cell| matches!(cell.node, NodeRef::Group { ordinal: found, .. } if found == ordinal))
+        .and_then(|cell| cell.group_name.clone())
+}
+
+#[test]
+fn a_class_edit_does_not_hand_a_group_selection_to_the_next_ordinal() {
+    let context = egui::Context::default();
+    let mut app = class_grouped_app(&context);
+    frame(&context, &mut app, Vec::new());
+    assert_eq!(group_name(&app, 0).as_deref(), Some("audio"));
+    assert_eq!(group_name(&app, 1).as_deref(), Some("documents"));
+    assert_eq!(group_name(&app, 2).as_deref(), Some("images"));
+    let root = app.reducer.index().unwrap().root();
+    app.selected = Some(NodeRef::Group {
+        parent: root,
+        ordinal: 1,
+    });
+    // A class that sorts first shifts every group above it, so audio takes ordinal 1.
+    app.classes.set("aaa", &["jpg"]).unwrap();
+    app.classes_changed();
+    frame(&context, &mut app, Vec::new());
+    assert_eq!(group_name(&app, 0).as_deref(), Some("aaa"));
+    assert_eq!(group_name(&app, 1).as_deref(), Some("audio"));
+    assert_eq!(group_name(&app, 2).as_deref(), Some("documents"));
+    assert_eq!(
+        app.selected, None,
+        "ordinal 1 named documents before the edit and audio after it"
+    );
+}
+
+#[test]
+fn a_filter_that_removes_a_group_does_not_hand_the_selection_to_the_next_one() {
+    let context = egui::Context::default();
+    let mut app = class_grouped_app(&context);
+    frame(&context, &mut app, Vec::new());
+    let root = app.reducer.index().unwrap().root();
+    app.selected = Some(NodeRef::Group {
+        parent: root,
+        ordinal: 0,
+    });
+    // Filtering out the only audio file removes that group, so documents takes ordinal 0.
+    app.filter.set("*.jpg;*.txt");
+    app.set_filter_mode(true);
+    frame(&context, &mut app, Vec::new());
+    assert_eq!(group_name(&app, 0).as_deref(), Some("documents"));
+    assert_eq!(group_name(&app, 1).as_deref(), Some("images"));
+    assert_eq!(
+        app.selected, None,
+        "ordinal 0 named audio before the filter and documents after it"
+    );
+}
+
+/// A live scan whose first batch holds readme.txt and photo.jpg, so grouping by class gives
+/// documents[0] and images[1]. A later batch adds song.mp3, which moves both ordinals.
+#[test]
+fn scan_growth_does_not_hand_a_group_selection_to_the_next_ordinal() {
+    let context = egui::Context::default();
+    let generation = ScanGeneration::new(79);
+    let mut app = HogMap::with_reducer(context.clone(), ScanReducer::new(generation));
+    let (sender, receiver) = event_channel(4);
+    app.receiver = Some(receiver);
+    app.scan_started = Some(Instant::now());
+    app.chooser.open = false;
+    app.grouping = GroupBy::Class;
+    let record =
+        |key: u64, parent: Option<u64>, name: &str, kind: Kind, bytes: Option<u64>| ScanRecord {
+            key: NodeKey::new(key),
+            parent: parent.map(NodeKey::new),
+            name: name.into(),
+            kind,
+            sizes: Sizes {
+                logical: bytes,
+                allocated: bytes,
+            },
+            identity: bytes.map(|_| FileIdentity {
+                volume: 1,
+                file: key as u128,
+            }),
+        };
+    let mut first = Batch::new();
+    for record in [
+        record(1, None, "Fixture", Kind::Directory, None),
+        record(2, Some(1), "readme.txt", Kind::File, Some(200)),
+        record(3, Some(1), "photo.jpg", Kind::File, Some(100)),
+    ] {
+        assert!(first.push(record));
+    }
+    sender
+        .send(ScanEvent {
+            generation,
+            event: ScanEventKind::Batch(first),
+        })
+        .unwrap();
+    app.last_tick = None;
+    app.drain(&context);
+    frame(&context, &mut app, Vec::new());
+    assert_eq!(group_name(&app, 0).as_deref(), Some("documents"));
+    assert_eq!(group_name(&app, 1).as_deref(), Some("images"));
+    let root = app.reducer.index().unwrap().root();
+    app.selected = Some(NodeRef::Group {
+        parent: root,
+        ordinal: 0,
+    });
+    // The scan keeps growing: a later record adds an audio file, so audio takes ordinal 0.
+    let mut second = Batch::new();
+    assert!(second.push(record(4, Some(1), "song.mp3", Kind::File, Some(300))));
+    sender
+        .send(ScanEvent {
+            generation,
+            event: ScanEventKind::Batch(second),
+        })
+        .unwrap();
+    app.last_tick = None;
+    app.drain(&context);
+    // Growth rebuilds are throttled like any other, so let the interval elapse without changing
+    // the metric, location, viewport, flat mode, grouping or options.
+    app.last_layout = None;
+    frame(&context, &mut app, Vec::new());
+    assert_eq!(group_name(&app, 0).as_deref(), Some("audio"));
+    assert_eq!(group_name(&app, 1).as_deref(), Some("documents"));
+    assert_eq!(group_name(&app, 2).as_deref(), Some("images"));
+    assert_eq!(
+        app.selected, None,
+        "ordinal 0 named documents before the growth and audio after it"
+    );
 }
 
 fn named_nodes(output: &egui::FullOutput) -> Vec<&egui::accesskit::Node> {
@@ -1569,6 +1782,7 @@ fn logical_free_is_independent_while_folder_zoom_and_unknown_capacity_stay_hidde
                 members: Some(Members {
                     names: vec!["first".into()],
                     grouped_by: SizeMetric::Allocated,
+                    group_name: None,
                 }),
             }),
         }

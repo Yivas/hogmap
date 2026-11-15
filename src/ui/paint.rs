@@ -95,6 +95,12 @@ pub fn prepare(
                     };
                     (name, entry.state, entry.kind, depth)
                 }
+                NodeRef::Group { .. } => (
+                    cell.group_name.clone().expect("group has a name"),
+                    State::Complete,
+                    Kind::File,
+                    0,
+                ),
                 NodeRef::Aggregate { .. } => (
                     text::aggregate_name(cell.members.len()),
                     State::Complete,
@@ -109,6 +115,12 @@ pub fn prepare(
             } else {
                 text::tooltip(&name, &size, state_label, metric, kind == Kind::Directory)
             };
+            if matches!(cell.node, NodeRef::Group { .. }) {
+                tooltip.push_str(&format!(
+                    "\n{} members; open to view them.",
+                    cell.members.len()
+                ));
+            }
             let tags = match cell.node {
                 NodeRef::Entry(id) => index.tags(id).unwrap_or(0),
                 _ => 0,
@@ -126,7 +138,7 @@ pub fn prepare(
                 Surface::Incomplete {
                     inaccessible: state == State::Inaccessible,
                 }
-            } else if matches!(cell.node, NodeRef::Aggregate { .. }) {
+            } else if matches!(cell.node, NodeRef::Aggregate { .. } | NodeRef::Group { .. }) {
                 Surface::Aggregate
             } else if kind == Kind::Directory {
                 Surface::Directory { depth }

@@ -990,6 +990,10 @@ fn ui_bench() -> Result<bool, &'static str> {
             match cell.node {
                 NodeRef::Entry(id) => (0, id.position()).hash(&mut hash),
                 NodeRef::Aggregate { parent } => (1, parent.position()).hash(&mut hash),
+                // Variant tag 2 keeps synthetic groups distinct from entries (0) and aggregates (1).
+                NodeRef::Group { parent, ordinal } => {
+                    (2, parent.position(), ordinal).hash(&mut hash)
+                }
             }
             for value in [
                 cell.rect.x,
