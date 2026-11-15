@@ -3,6 +3,22 @@
 //! same geometry for the same sample and viewport.
 
 use eframe::egui::{self, Color32, CornerRadius, Shadow, Stroke};
+use hogmap::filter::ClassColor;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum MapStyle {
+    #[default]
+    FlatColors,
+    FileClasses,
+}
+impl MapStyle {
+    pub fn other(self) -> Self {
+        match self {
+            Self::FlatColors => Self::FileClasses,
+            Self::FileClasses => Self::FlatColors,
+        }
+    }
+}
 
 /// The chosen theme is the only state this module persists. Its key and value format are a
 /// contract with the file eframe keeps in the user's application-data directory, so the value
@@ -51,6 +67,7 @@ pub struct Palette {
     pub message: Color32,
     pub directories: [Tone; DEPTH_TONES],
     pub file: Tone,
+    pub classes: [Tone; 5],
     pub free: Tone,
     pub not_yet_scanned: Tone,
     pub aggregate: Tone,
@@ -93,6 +110,9 @@ const fn rgb(hex: u32) -> Color32 {
     Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8)
 }
 
+/// Black numerals and borders keep tags readable in either map theme/style.
+pub const TAG_COLORS: [Color32; 4] = [rgb(0xF2A4A4), rgb(0xF1D66D), rgb(0x9ED6AC), rgb(0xA3CBF2)];
+
 const DARK_CHROME: Color32 = rgb(0x1D2025);
 const DARK_TEXT: Color32 = rgb(0xDADDE2);
 const DARK_STATE_MARK: Color32 = rgb(0xE9D8B4);
@@ -125,6 +145,38 @@ const DARK: Palette = Palette {
         rgb(0x24405B),
         Some(DARK_STATE_MARK),
     ),
+    classes: [
+        seamed(
+            rgb(0x35597A),
+            rgb(0xEEF3F8),
+            rgb(0x24405B),
+            Some(DARK_STATE_MARK),
+        ),
+        seamed(
+            rgb(0x305C48),
+            rgb(0xEEF3F8),
+            rgb(0x203F30),
+            Some(DARK_STATE_MARK),
+        ),
+        seamed(
+            rgb(0x60456E),
+            rgb(0xEEF3F8),
+            rgb(0x412E4C),
+            Some(DARK_STATE_MARK),
+        ),
+        seamed(
+            rgb(0x6A502A),
+            rgb(0xEEF3F8),
+            rgb(0x49371C),
+            Some(DARK_STATE_MARK),
+        ),
+        seamed(
+            rgb(0x6C424B),
+            rgb(0xEEF3F8),
+            rgb(0x4B2D33),
+            Some(DARK_STATE_MARK),
+        ),
+    ],
     free: tone(rgb(0x315B3B), rgb(0xEEF5E8), None),
     not_yet_scanned: tone(rgb(0x42464D), rgb(0xEEF1F5), None),
     aggregate: seamed(
@@ -155,7 +207,7 @@ const DARK: Palette = Palette {
 
 const LIGHT_STATE_MARK: Color32 = rgb(0x2E2418);
 
-/// The light palette keeps the earlier fills and black labels as the regression baseline.
+/// Four directory tones step by at least 1.18:1 in each theme; deeper levels reuse the fourth.
 const LIGHT: Palette = Palette {
     chrome: rgb(0xF0F2F5),
     secondary_text: rgb(0x535D68),
@@ -171,10 +223,10 @@ const LIGHT: Palette = Palette {
     map_background: Color32::from_gray(248),
     message: Color32::BLACK,
     directories: [
-        tone(rgb(0xCAA67C), Color32::BLACK, Some(LIGHT_STATE_MARK)),
-        tone(rgb(0xC49F75), Color32::BLACK, Some(LIGHT_STATE_MARK)),
-        tone(rgb(0xBE986E), Color32::BLACK, Some(LIGHT_STATE_MARK)),
-        tone(rgb(0xB89167), Color32::BLACK, Some(LIGHT_STATE_MARK)),
+        tone(rgb(0xE8CBA7), Color32::BLACK, Some(LIGHT_STATE_MARK)),
+        tone(rgb(0xD4B58F), Color32::BLACK, Some(LIGHT_STATE_MARK)),
+        tone(rgb(0xC1A07A), Color32::BLACK, Some(LIGHT_STATE_MARK)),
+        tone(rgb(0xB08E69), Color32::BLACK, Some(LIGHT_STATE_MARK)),
     ],
     file: seamed(
         rgb(0x9DC8E5),
@@ -182,6 +234,38 @@ const LIGHT: Palette = Palette {
         rgb(0x7BA6C4),
         Some(LIGHT_STATE_MARK),
     ),
+    classes: [
+        seamed(
+            rgb(0x9DC8E5),
+            Color32::BLACK,
+            rgb(0x7BA6C4),
+            Some(LIGHT_STATE_MARK),
+        ),
+        seamed(
+            rgb(0xA6D1B5),
+            Color32::BLACK,
+            rgb(0x82AA90),
+            Some(LIGHT_STATE_MARK),
+        ),
+        seamed(
+            rgb(0xC8B4DB),
+            Color32::BLACK,
+            rgb(0xA28EB7),
+            Some(LIGHT_STATE_MARK),
+        ),
+        seamed(
+            rgb(0xDBBF8C),
+            Color32::BLACK,
+            rgb(0xB39968),
+            Some(LIGHT_STATE_MARK),
+        ),
+        seamed(
+            rgb(0xD9ADB8),
+            Color32::BLACK,
+            rgb(0xB08791),
+            Some(LIGHT_STATE_MARK),
+        ),
+    ],
     free: tone(rgb(0x90B76C), Color32::BLACK, None),
     not_yet_scanned: tone(rgb(0xCDCFD2), Color32::BLACK, None),
     aggregate: seamed(
@@ -209,6 +293,18 @@ const LIGHT: Palette = Palette {
     focus: Color32::BLACK,
     focus_backing: Color32::WHITE,
 };
+
+impl Palette {
+    pub fn class(&self, color: ClassColor) -> Tone {
+        self.classes[match color {
+            ClassColor::Blue => 0,
+            ClassColor::Green => 1,
+            ClassColor::Purple => 2,
+            ClassColor::Amber => 3,
+            ClassColor::Rose => 4,
+        }]
+    }
+}
 
 impl Theme {
     pub fn palette(self) -> &'static Palette {
@@ -420,6 +516,7 @@ mod tests {
             ("undecided", palette.undecided),
         ];
         tones.extend(palette.directories.iter().map(|tone| ("directory", *tone)));
+        tones.extend(palette.classes.iter().map(|tone| ("class", *tone)));
         tones
     }
 
@@ -435,14 +532,33 @@ mod tests {
 
     #[test]
     fn every_map_label_meets_aa_against_its_fill() {
+        for fill in TAG_COLORS {
+            assert!(contrast_ratio(Color32::BLACK, fill) >= TEXT_MINIMUM);
+        }
         for theme in THEMES {
-            for (name, tone) in tones(theme.palette()).into_iter().chain([
-                ("Free space", theme.palette().free),
-                ("Not yet scanned estimate", theme.palette().not_yet_scanned),
-            ]) {
-                let ratio = contrast_ratio(tone.text, tone.fill);
-                println!("{theme:?} {name} label contrast={ratio:.3}:1");
-                assert!(ratio >= TEXT_MINIMUM, "{theme:?} {name}: {ratio:.2}");
+            for style in [MapStyle::FlatColors, MapStyle::FileClasses] {
+                for (name, tone) in tones(theme.palette()).into_iter().chain([
+                    ("Free space", theme.palette().free),
+                    ("Not yet scanned estimate", theme.palette().not_yet_scanned),
+                ]) {
+                    let ratio = contrast_ratio(tone.text, tone.fill);
+                    println!("{theme:?} {style:?} {name} label contrast={ratio:.3}:1");
+                    assert!(
+                        ratio >= TEXT_MINIMUM,
+                        "{theme:?} {style:?} {name}: {ratio:.2}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_directory_levels_have_deliberate_measured_steps() {
+        for theme in THEMES {
+            for pair in theme.palette().directories.windows(2) {
+                let ratio = contrast_ratio(pair[0].fill, pair[1].fill);
+                println!("{theme:?} adjacent depth contrast={ratio:.3}:1");
+                assert!(ratio >= 1.18, "{theme:?}: {ratio:.3}");
             }
         }
     }

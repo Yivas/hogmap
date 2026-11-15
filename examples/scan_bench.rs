@@ -809,6 +809,8 @@ fn run(args: Arguments) -> Result<bool, &'static str> {
                     &layout,
                     None,
                     hogmap::index::SizeMetric::Logical,
+                    &hogmap::filter::ClassTable::default(),
+                    theme::MapStyle::FlatColors,
                 ));
             },
         );
@@ -1043,7 +1045,15 @@ fn ui_bench() -> Result<bool, &'static str> {
     let mut cells = Vec::new();
     let start = Instant::now();
     let _ = context.run_ui(input(), |ui| {
-        cells = paint::prepare(ui, index, &first, None, SizeMetric::Logical);
+        cells = paint::prepare(
+            ui,
+            index,
+            &first,
+            None,
+            SizeMetric::Logical,
+            &hogmap::filter::ClassTable::default(),
+            theme::MapStyle::FlatColors,
+        );
     });
     println!(
         "ui_labels_cold_ms={:.3}",
@@ -1068,7 +1078,15 @@ fn ui_bench() -> Result<bool, &'static str> {
     for _ in 0..5 {
         let start = Instant::now();
         let _ = context.run_ui(input(), |ui| {
-            cells = paint::prepare(ui, index, &first, None, SizeMetric::Logical);
+            cells = paint::prepare(
+                ui,
+                index,
+                &first,
+                None,
+                SizeMetric::Logical,
+                &hogmap::filter::ClassTable::default(),
+                theme::MapStyle::FlatColors,
+            );
         });
         labels.push(start.elapsed().as_secs_f64() * 1000.0);
         let start = Instant::now();
@@ -1145,7 +1163,15 @@ fn ui_bench() -> Result<bool, &'static str> {
                 let results = filter.match_results(index);
                 let counts = (results.matched_files, results.unknown_files);
                 let matches = results.matches;
-                let prepared = paint::prepare(ui, index, &map, None, SizeMetric::Logical);
+                let prepared = paint::prepare(
+                    ui,
+                    index,
+                    &map,
+                    None,
+                    SizeMetric::Logical,
+                    &hogmap::filter::ClassTable::default(),
+                    theme::MapStyle::FlatColors,
+                );
                 paint::draw(
                     ui.painter(),
                     theme::Theme::Dark.palette(),

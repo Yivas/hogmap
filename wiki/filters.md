@@ -58,13 +58,19 @@ The map counts files, while directories provide context. Consequently `:attr:dir
 | documents | txt, pdf, docx, md |
 | archives | zip, 7z, tar, gz |
 
-The core also accepts an in-memory user class table, including replacement definitions. There is no class editor or class-based coloring in the window yet. An unknown class name is an error, not an empty class.
+Open **View → File classes…** to list classes, choose one to edit its space-separated extensions and colour, or choose **New class** to add a definition. Names must be unique and non-empty; use letters, digits, `_` or `-`, and at least one extension without a leading dot. Apply class updates the table and reparses the last valid expression, even if the field currently contains an invalid draft. Close or Escape leaves the dialog; edits last for the session only.
+
+Delete class removes the selected definition. If the active expression uses it, the dialog asks for confirmation and shows that expression. A missing class leaves the previous filter definition active with a visible warning: restore the class or choose **Clear filter**. Unknown classes never silently become empty classes.
+
+**View → File Classes** colours files by class; **View → Flat Colors** restores the common file fill. Ctrl+T switches styles outside text fields. Folders keep their depth tones and geometry stays unchanged. Where extensions overlap, the first matching class in alphabetical name order supplies the colour. The five fixed colour choices and the style are session-only.
 
 ## Temporary tags
 
 The in-memory tag model supports four bits: `:1`/`:red`, `:2`/`:yellow`, `:3`/`:green`, and `:4`/`:blue`. `:tag:` means any tag; `-:tag:` means untagged. `+:red` requires red and `-:red` forbids it. Descendants inherit their nearest folder assignment unless explicitly overridden; zero clears inherited tags.
 
-The tagging UI is not implemented. Ordinary scans start untagged; these conditions are usable with tags supplied through the core API, not through a hidden keyboard action. Nothing is persisted.
+Select a file or folder and press **Ctrl+1** Red, **Ctrl+2** Yellow, **Ctrl+3** Green or **Ctrl+4** Blue to assign one tag, replacing its previous assignment. **Ctrl+0** clears it, including an inherited tag. The same actions appear in **View**. Shortcuts do not intercept typing in text fields. Children inherit the nearest folder assignment unless explicitly overridden, including while new records arrive during scanning.
+
+Numbered coloured marks identify effective tags without relying on hue alone; tooltips and accessible cell names include the number and colour. Very small cells omit the visual mark but keep that text. For example, tag a large folder red and use `-:red` to hide it in Filter, or tag selected entries and use `:tag:` to keep that set. There is one view, not a multi-window basket. New scans start untagged; nothing is saved.
 
 ## Combining conditions
 

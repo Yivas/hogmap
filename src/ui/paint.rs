@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use eframe::egui::{self, Color32, FontId, Pos2, Shape, Stroke, StrokeKind};
-use hogmap::filter::Match;
+use hogmap::filter::{ClassColor, ClassTable, Match};
 use hogmap::index::{EntryId, Index, Kind, SizeMetric, State};
 use hogmap::treemap::{Layout, NodeRef, Placed, Rect};
 
-use super::theme::{DEPTH_TONES, Palette, Theme, Tone};
+use super::theme::{DEPTH_TONES, MapStyle, Palette, Theme, Tone};
 use super::{logic, text};
 
 /// Cells smaller than this on either side keep their fill and tooltip but skip state marks, which
@@ -29,6 +29,7 @@ pub enum Surface {
         depth: usize,
     },
     File,
+    ClassFile(ClassColor),
     Aggregate,
     /// Partial, inaccessible or stale. Inaccessible entries are hatched; the others get a dashed
     /// inner border.
@@ -41,6 +42,7 @@ pub struct Cell {
     pub tooltip: String,
     pub label: Option<(Arc<egui::Galley>, Pos2)>,
     pub surface: Surface,
+    pub tags: u8,
     /// Directory borders are drawn after every cell, above the children that tile them.
     pub directory: bool,
     /// The total is incomplete (`has_unknown`): some sizes are unknown or some content is
@@ -63,6 +65,8 @@ pub fn prepare(
     layout: &Layout,
     subset: Option<text::Subset>,
     metric: SizeMetric,
+    classes: &ClassTable,
+    style: MapStyle,
 ) -> Vec<Cell> {
     // The layout places parents before their descendants, so a parent's depth is always known.
     let mut depths: HashMap<EntryId, usize> = HashMap::new();
@@ -100,10 +104,23 @@ pub fn prepare(
             };
             let size = text::size(cell.known_sum, cell.has_unknown);
             let state_label = text::state(state);
-            let tooltip = if matches!(cell.node, NodeRef::Aggregate { .. }) {
+            let mut tooltip = if matches!(cell.node, NodeRef::Aggregate { .. }) {
                 text::aggregate_tooltip(cell.members.len(), &size, metric)
             } else {
                 text::tooltip(&name, &size, state_label, metric, kind == Kind::Directory)
+            };
+            let tags = match cell.node {
+                NodeRef::Entry(id) => index.tags(id).unwrap_or(0),
+                _ => 0,
+            };
+            if tags != 0 {
+                tooltip.push_str(&format!("\n{}", text::tag_names(tags)));
+            }
+            let class = match cell.node {
+                NodeRef::Entry(id) if kind == Kind::File && style == MapStyle::FileClasses => index
+                    .get(id)
+                    .and_then(|entry| classes.color_for(entry.name)),
+                _ => None,
             };
             let surface = if matches!(state, State::Partial | State::Inaccessible | State::Stale) {
                 Surface::Incomplete {
@@ -114,11 +131,11 @@ pub fn prepare(
             } else if kind == Kind::Directory {
                 Surface::Directory { depth }
             } else {
-                Surface::File
+                class.map_or(Surface::File, Surface::ClassFile)
             };
             // Header bands are short by design, so they get almost no vertical inset; a uniform
             // 3 px on every edge would eat the text line of a 13 px band.
-            let label_rect = match cell.header {
+            let mut label_rect = match cell.header {
                 Some(header) => {
                     let band = rect(header);
                     egui::Rect::from_min_max(
@@ -128,6 +145,9 @@ pub fn prepare(
                 }
                 None => rect(cell.rect).shrink(3.0),
             };
+            if let Some(badge) = tag_area(cell, tags) {
+                label_rect.max.x = label_rect.max.x.min(badge.left() - 2.0);
+            }
             let label = if cell.header.is_some() {
                 fitter.fit(ui, &text::header(&name, &size), label_rect, false)
             } else {
@@ -137,6 +157,7 @@ pub fn prepare(
                 tooltip,
                 label,
                 surface,
+                tags,
                 directory: kind == Kind::Directory,
                 unknown: cell.has_unknown,
             }
@@ -281,6 +302,7 @@ fn base_tone(palette: &Palette, surface: Surface) -> Tone {
     match surface {
         Surface::Directory { depth } => palette.directories[depth.min(DEPTH_TONES - 1)],
         Surface::File => palette.file,
+        Surface::ClassFile(color) => palette.class(color),
         Surface::Aggregate => palette.aggregate,
         Surface::Incomplete { .. } => palette.incomplete,
     }
@@ -294,6 +316,18 @@ fn painted_tone(palette: &Palette, surface: Surface, matches: &[Match], placed: 
         Match::No => palette.dimmed,
         Match::Unknown => palette.undecided,
     }
+}
+
+/// Numbers, not hue, identify effective tags. Tiny cells retain their full accessible tooltip.
+fn tag_area(placed: &Placed, tags: u8) -> Option<egui::Rect> {
+    let area = rect(placed.header.unwrap_or(placed.rect));
+    let width = tags.count_ones() as f32 * 12.0;
+    (tags != 0 && area.height() >= 15.0 && area.width() >= width + 6.0).then(|| {
+        egui::Rect::from_min_size(
+            egui::pos2(area.right() - width - 3.0, area.top() + 1.0),
+            egui::vec2(width, 13.0),
+        )
+    })
 }
 
 fn at_least(area: egui::Rect, side: f32) -> bool {
@@ -363,6 +397,31 @@ pub fn draw(
                 3.0,
                 &mut dashes,
             );
+        }
+        if let Some(badge) = tag_area(placed, cell.tags) {
+            for (offset, slot) in (0..4)
+                .filter(|slot| cell.tags & (1 << slot) != 0)
+                .enumerate()
+            {
+                let mark = egui::Rect::from_min_size(
+                    badge.min + egui::vec2(offset as f32 * 12.0, 0.0),
+                    egui::vec2(11.0, 13.0),
+                );
+                painter.rect_filled(mark, 0, super::theme::TAG_COLORS[slot]);
+                painter.rect_stroke(
+                    mark,
+                    0,
+                    Stroke::new(1.0, Color32::BLACK),
+                    StrokeKind::Inside,
+                );
+                painter.text(
+                    mark.center(),
+                    egui::Align2::CENTER_CENTER,
+                    (slot + 1).to_string(),
+                    FontId::monospace(10.0),
+                    Color32::BLACK,
+                );
+            }
         }
         if let Some((galley, position)) = &cell.label {
             if inaccessible {
@@ -695,7 +754,7 @@ mod tests {
             index.insert(second, "leaf.bin".into(), Kind::File, hogmap::index::Sizes { logical: Some(4096), allocated: Some(4096) }, None, State::Complete).unwrap();
             index.set_state(root, State::Complete).unwrap();
             let layout = hogmap::treemap::layout(&index, root, Rect::new(0.0, 0.0, 800.0, 600.0), hogmap::treemap::LayoutParams { min_pixel_area: 1.0, header_height: 20.0, max_depth: 2 }).unwrap();
-            let cells = prepare(ui, &index, &layout, None, SizeMetric::Logical);
+            let cells = prepare(ui, &index, &layout, None, SizeMetric::Logical, &ClassTable::default(), MapStyle::FlatColors);
             assert_eq!(cells.len(), 3);
             for ((placed, cell), height) in layout.placed.iter().zip(&cells).zip([20.0, 16.0, 15.0]) {
                 let header = placed.header.unwrap();

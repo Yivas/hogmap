@@ -293,6 +293,11 @@ impl Index {
         Ok(())
     }
 
+    /// Effective session tags, including the nearest ancestor assignment. Unknown IDs stay absent.
+    pub fn tags(&self, id: EntryId) -> Option<u8> {
+        self.tags.get(self, id)
+    }
+
     /// Session-only tag assignment. Zero explicitly clears inherited directory tags.
     pub fn set_tags(&mut self, id: EntryId, bits: u8) -> Result<(), crate::filter::FilterError> {
         if self.get(id).is_none() {

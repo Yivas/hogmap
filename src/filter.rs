@@ -55,9 +55,25 @@ pub struct Metadata {
     pub ads: Option<bool>,
 }
 
-/// Session-only class definitions. A user entry replaces a built-in entry of the same name.
+/// Fixed presentation choices; RGB values belong to the desktop theme, not the filter engine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClassColor {
+    Blue,
+    Green,
+    Purple,
+    Amber,
+    Rose,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ClassTable(BTreeMap<String, Vec<String>>);
+pub struct FileClass {
+    pub extensions: Vec<String>,
+    pub color: ClassColor,
+}
+
+/// Session-only definitions, ordered by name. The first matching name supplies the file colour.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassTable(BTreeMap<String, FileClass>);
 impl Default for ClassTable {
     fn default() -> Self {
         Self(
@@ -72,7 +88,16 @@ impl Default for ClassTable {
             .map(|(name, extensions)| {
                 (
                     name.into(),
-                    extensions.iter().map(|s| (*s).into()).collect(),
+                    FileClass {
+                        extensions: extensions.iter().map(|s| (*s).into()).collect(),
+                        color: match name {
+                            "images" => ClassColor::Green,
+                            "audio" => ClassColor::Amber,
+                            "video" => ClassColor::Purple,
+                            "documents" => ClassColor::Blue,
+                            _ => ClassColor::Rose,
+                        },
+                    },
                 )
             })
             .collect(),
@@ -84,11 +109,49 @@ impl ClassTable {
         if !identifier(name) || extensions.is_empty() || extensions.iter().any(|s| !identifier(s)) {
             return Err(FilterError::UnknownClass);
         }
+        let name = name.to_ascii_lowercase();
+        let color = self
+            .0
+            .get(&name)
+            .map_or(ClassColor::Blue, |class| class.color);
         self.0.insert(
-            name.to_ascii_lowercase(),
-            extensions.iter().map(|s| s.to_ascii_lowercase()).collect(),
+            name,
+            FileClass {
+                extensions: extensions.iter().map(|s| s.to_ascii_lowercase()).collect(),
+                color,
+            },
         );
         Ok(())
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &FileClass)> {
+        self.0.iter().map(|(name, class)| (name.as_str(), class))
+    }
+
+    pub fn set_color(&mut self, name: &str, color: ClassColor) -> Result<(), FilterError> {
+        let class = self
+            .0
+            .get_mut(&name.to_ascii_lowercase())
+            .ok_or(FilterError::UnknownClass)?;
+        class.color = color;
+        Ok(())
+    }
+
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.0.remove(&name.to_ascii_lowercase()).is_some()
+    }
+
+    pub fn color_for(&self, name: &OsStr) -> Option<ClassColor> {
+        let extension = name.to_str()?.rsplit_once('.')?.1;
+        self.0
+            .values()
+            .find(|class| {
+                class
+                    .extensions
+                    .iter()
+                    .any(|candidate| candidate.eq_ignore_ascii_case(extension))
+            })
+            .map(|class| class.color)
     }
 }
 fn identifier(text: &str) -> bool {
@@ -110,7 +173,7 @@ impl TagTable {
         self.0.insert(id, bits);
         Ok(())
     }
-    fn get(&self, index: &Index, mut id: EntryId) -> Option<u8> {
+    pub(crate) fn get(&self, index: &Index, mut id: EntryId) -> Option<u8> {
         loop {
             let entry = index.get(id)?;
             if let Some(bits) = self.0.get(&id) {
@@ -318,6 +381,7 @@ impl Filter {
                 };
                 target.extend(
                     extensions
+                        .extensions
                         .iter()
                         .map(|extension| extension.as_bytes().to_vec()),
                 );

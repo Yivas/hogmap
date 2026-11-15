@@ -104,6 +104,52 @@ fn snapshot(index: &Index) -> Vec<SnapshotEntry> {
 }
 
 #[test]
+fn tags_during_a_partial_scan_invalidate_decisions_and_new_children_inherit() {
+    use hogmap::filter::Filter;
+    let generation = ScanGeneration::new(73);
+    let (sender, receiver) = sync_channel(4);
+    let mut reducer = ScanReducer::new(generation);
+    sender
+        .send(event(
+            generation,
+            ScanEventKind::Batch(batch_of([
+                record(1, None, "root", Kind::Directory),
+                record(2, Some(1), "first.bin", Kind::File),
+            ])),
+        ))
+        .unwrap();
+    reducer.drain(&receiver, 10);
+    let root = reducer.index().unwrap().root();
+    let filter = Filter::parse(":red").unwrap();
+    assert_eq!(filter.matches(reducer.index().unwrap()).matched_files, 0);
+    reducer.set_tags(root, 1).unwrap();
+    assert_eq!(filter.matches(reducer.index().unwrap()).matched_files, 1);
+    assert!(reducer.set_tags(root, 16).is_err());
+    sender
+        .send(event(
+            generation,
+            ScanEventKind::Batch(batch_of([record(3, Some(1), "later.bin", Kind::File)])),
+        ))
+        .unwrap();
+    reducer.drain(&receiver, 10);
+    assert_eq!(filter.matches(reducer.index().unwrap()).matched_files, 2);
+    reducer.set_tags(root, 0).unwrap();
+    assert_eq!(filter.matches(reducer.index().unwrap()).matched_files, 0);
+    sender
+        .send(event(
+            generation,
+            ScanEventKind::Terminal(Terminal::Cancelled),
+        ))
+        .unwrap();
+    reducer.drain(&receiver, 10);
+    assert_eq!(
+        reducer.index().unwrap().get(root).unwrap().state,
+        State::Partial
+    );
+    assert_eq!(reducer.diagnostics().invalid_records, 0);
+}
+
+#[test]
 fn synthetic_scan_reaches_the_index_and_finishes() {
     let generation = ScanGeneration::new(1);
     let (reducer, outcome) = run_to_end(spec(), 42, 4, generation, generation);

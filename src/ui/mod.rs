@@ -1,3 +1,4 @@
+mod classes;
 mod composition;
 #[cfg(test)]
 mod composition_tests;
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Key, Modifiers};
 use hogmap::composition::{CompositionEvaluation, CompositionView, VolumeEvidence};
-use hogmap::filter::Match;
+use hogmap::filter::{ClassTable, Match};
 use hogmap::index::{EntryId, Index, SizeMetric};
 use hogmap::scan::{
     DEFAULT_CHANNEL_CAPACITY, ScanCancellation, ScanGeneration, ScanReceiver, ScanReducer,
@@ -32,7 +33,7 @@ use hogmap::synthetic::{SyntheticSpec, run_synthetic};
 use hogmap::treemap::{self, Layout, LayoutError, LayoutParams, NodeRef, Rect};
 use hogmap::volume::{self, volume_root_for};
 use logic::{HighlightFilter, History, Location, Members};
-use theme::Theme;
+use theme::{MapStyle, Theme};
 
 const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(250);
@@ -224,6 +225,9 @@ pub struct HogMap {
     filter: HighlightFilter,
     filter_changed: bool,
     geometry_filter: bool,
+    classes: ClassTable,
+    class_editor: classes::ClassEditor,
+    map_style: MapStyle,
     /// The size the map weighs. Chosen in View for this session only: it survives a rescan but is
     /// never saved.
     metric: SizeMetric,
@@ -296,6 +300,9 @@ impl HogMap {
             filter: HighlightFilter::default(),
             filter_changed: false,
             geometry_filter: false,
+            classes: ClassTable::default(),
+            class_editor: classes::ClassEditor::default(),
+            map_style: MapStyle::default(),
             metric: SizeMetric::Logical,
             detail: DEFAULT_DETAIL,
             cache: None,
@@ -916,8 +923,37 @@ impl HogMap {
         self.filter_changed = true;
     }
 
+    fn invalidate_presentation(&mut self) {
+        if let Some(cache) = &mut self.cache {
+            cache.paint = None;
+        }
+        self.context.request_repaint();
+    }
+
+    fn set_style(&mut self, style: MapStyle) {
+        if self.map_style != style {
+            self.map_style = style;
+            self.invalidate_presentation();
+        }
+    }
+
+    fn assign_tag(&mut self, bits: u8) {
+        if let Some(NodeRef::Entry(id)) = self.selected
+            && self.reducer.set_tags(id, bits).is_ok()
+        {
+            self.filter_changed = true;
+            self.invalidate_presentation();
+        }
+    }
+
+    fn classes_changed(&mut self) {
+        self.filter.reparse(&self.classes);
+        self.filter_changed = true;
+        self.invalidate_presentation();
+    }
+
     fn shortcuts(&mut self, context: &egui::Context) {
-        if self.chooser.open {
+        if self.chooser.open || self.class_editor.open {
             return;
         }
         if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::N)) {
@@ -945,6 +981,20 @@ impl HogMap {
         }
         if context.text_edit_focused() {
             return;
+        }
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::T)) {
+            self.set_style(self.map_style.other());
+        }
+        for (key, bits) in [
+            (Key::Num0, 0),
+            (Key::Num1, 1),
+            (Key::Num2, 2),
+            (Key::Num3, 4),
+            (Key::Num4, 8),
+        ] {
+            if context.input_mut(|input| input.consume_key(Modifiers::CTRL, key)) {
+                self.assign_tag(bits);
+            }
         }
         if context.input_mut(|input| {
             input.consume_key(Modifiers::CTRL, Key::Plus)
@@ -1048,6 +1098,34 @@ impl HogMap {
                     if metric != self.metric {
                         self.metric = metric;
                         ui.close();
+                    }
+                    ui.separator();
+                    let mut style = self.map_style;
+                    ui.selectable_value(&mut style, MapStyle::FlatColors, text::STYLE_FLAT)
+                        .on_hover_text("Ctrl+T");
+                    ui.selectable_value(&mut style, MapStyle::FileClasses, text::STYLE_CLASSES)
+                        .on_hover_text("Ctrl+T");
+                    if style != self.map_style {
+                        self.set_style(style);
+                        ui.close();
+                    }
+                    if ui.button(text::FILE_CLASSES).clicked() {
+                        self.class_editor.reopen();
+                        ui.close();
+                    }
+                    ui.separator();
+                    for slot in 0..5 {
+                        if ui
+                            .add_enabled(
+                                matches!(self.selected, Some(NodeRef::Entry(_))),
+                                egui::Button::new(text::TAG_ACTIONS[slot])
+                                    .shortcut_text(text::TAG_SHORTCUTS[slot]),
+                            )
+                            .clicked()
+                        {
+                            self.assign_tag(if slot == 0 { 0 } else { 1 << (slot - 1) });
+                            ui.close();
+                        }
                     }
                     ui.separator();
                     // Both items are drawn every frame so the checkmark and the accessible state
@@ -1223,7 +1301,11 @@ impl HogMap {
                     self.focus_filter = false;
                 }
                 self.filter_focused = response.has_focus();
-                if response.changed() && self.filter.set(&self.filter_text) {
+                if response.changed()
+                    && self
+                        .filter
+                        .set_with_classes(&self.filter_text, &self.classes)
+                {
                     self.filter_changed = true;
                 }
                 if logic::show_match_count(&self.filter_text) {
@@ -1237,7 +1319,23 @@ impl HogMap {
             let error_color = ui.visuals().error_fg_color;
             // Reserve one message line so valid/invalid filter input never shifts the map.
             ui.allocate_ui(egui::vec2(ui.available_width(), 16.0), |ui| {
-                if let Some(error) = self.filter.error {
+                if let Some(name) = &self.filter.missing_class {
+                    let message = text::missing_class(name);
+                    ui.horizontal(|ui| {
+                        if ui.button(text::CLEAR_FILTER).clicked() {
+                            self.filter_text.clear();
+                            self.filter.set("");
+                            self.filter_changed = true;
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&message).small().color(error_color),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(&message);
+                    });
+                } else if let Some(error) = self.filter.error {
                     ui.add(
                         egui::Label::new(
                             egui::RichText::new(text::filter_error(error))
@@ -1898,7 +1996,15 @@ impl HogMap {
             let location = &cache.key.location;
             let members = location.resolve(index).and_then(|(_, members)| members);
             let caption = subset_caption(location, members.as_deref(), self.metric);
-            cache.cells = paint::prepare(ui, index, &cache.layout, caption, self.metric);
+            cache.cells = paint::prepare(
+                ui,
+                index,
+                &cache.layout,
+                caption,
+                self.metric,
+                &self.classes,
+                self.map_style,
+            );
             cache.paint = None;
         }
         // The cell controls below cover the map, so its own response is not hovered; ask whether
@@ -2004,7 +2110,7 @@ impl HogMap {
         }
         // Tooltips above may add glyphs. Tessellate only after they settle the font atlas;
         // floating dialogs drawn later use the uncached painter to keep their first frame safe.
-        if self.chooser.open || self.about {
+        if self.chooser.open || self.about || self.class_editor.open {
             paint::draw(
                 ui.painter(),
                 palette,
@@ -2123,6 +2229,12 @@ impl HogMap {
                     }
                 }
             }
+        }
+        if self
+            .class_editor
+            .show(&context, &mut self.classes, &self.filter)
+        {
+            self.classes_changed();
         }
         if self.about {
             let mut about = text::about(self.metric);

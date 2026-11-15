@@ -63,6 +63,48 @@ pub const ZOOM_IN: &str = "Zoom into selection";
 pub const ZOOM_OUT: &str = "Zoom out";
 pub const THEME_DARK: &str = "Dark";
 pub const THEME_LIGHT: &str = "Light";
+pub const STYLE_FLAT: &str = "Flat Colors";
+pub const STYLE_CLASSES: &str = "File Classes";
+pub const FILE_CLASSES: &str = "File classes…";
+pub const CLASS_NAME: &str = "Class name";
+pub const CLASS_EXTENSIONS: &str = "Extensions (space-separated, without dots)";
+pub const CLASS_COLOR: &str = "Class colour";
+pub const CLASS_NEW: &str = "New class";
+pub const CLASS_SAVE: &str = "Apply class";
+pub const CLASS_DELETE: &str = "Delete class";
+pub const CLASS_CANCEL: &str = "Cancel deletion";
+pub const CLEAR_FILTER: &str = "Clear filter";
+pub const CLASS_SESSION: &str =
+    "Session only. The first matching class in name order supplies the colour.";
+pub const TAG_ACTIONS: [&str; 5] = [
+    "Clear selection tag",
+    "Tag 1 · Red",
+    "Tag 2 · Yellow",
+    "Tag 3 · Green",
+    "Tag 4 · Blue",
+];
+pub const TAG_SHORTCUTS: [&str; 5] = ["Ctrl+0", "Ctrl+1", "Ctrl+2", "Ctrl+3", "Ctrl+4"];
+pub const CLASS_COLORS: [&str; 5] = ["Blue", "Green", "Purple", "Amber", "Rose"];
+
+pub fn missing_class(name: &str) -> String {
+    format!(
+        "Class '{name}' is missing; the filter still uses its previous definition. Restore the class or clear the filter."
+    )
+}
+pub fn confirm_class_delete(name: &str, expression: &str) -> String {
+    format!(
+        "Delete class '{name}'? Active expression: {expression}. The filter will keep its previous definition until you restore the class or clear the filter."
+    )
+}
+pub fn tag_names(bits: u8) -> String {
+    let names: Vec<_> = TAG_ACTIONS[1..]
+        .iter()
+        .enumerate()
+        .filter(|(slot, _)| bits & (1 << slot) != 0)
+        .map(|(_, name)| *name)
+        .collect();
+    names.join(", ")
+}
 pub const METRIC_LOGICAL: &str = "Logical size";
 pub const METRIC_ALLOCATED: &str = "Allocated size";
 pub const HELP: &str = "Help";
@@ -134,7 +176,7 @@ pub fn empty_map(metric: SizeMetric) -> String {
 
 pub fn about(metric: SizeMetric) -> String {
     format!(
-        "Read-only Windows folder and drive scanning. No release yet.\nRight-click a real file or folder for Windows' classic shell menu; Shift requests extended commands. Windows and installed shell extensions own these actions and their confirmations, including any Delete action. HogMap implements no file changes and never invokes a command automatically. Rename may be absent or unsupported without Explorer's editable view. The menu can block or crash through third-party extensions. Rescan after changes; the index is not refreshed automatically.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nFilter syntax: * and ? name masks; \\temp folder components; | excludes masks; s>1mb or >1mb logical, d<16k allocated; c/m/a age with s/m/h/d/w; + or - :attr:hidden, :class:images and :red / :1..:4 / :tag:. Positive masks, classes and tags OR; exclusions and other conditions AND. Age reference is fixed when applied. Highlight dims non-matches and keeps full geometry. Filter hides non-matches and reports matched, undecided and full snapshot bytes separately; volume cells are omitted. Unknown decisions stay visible, never counted as matches. Tags/classes are in memory; editing UI and fuzzy keywords are not implemented.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt an unzoomed whole-volume root, independently known Free space is drawn in either size view, during scanning and after eligible final observations. Running capacity is provisional; Not yet scanned · estimate is a residual, not measured inaccessible space. Logical tree bytes and volume-capacity bytes are comparable only in order of magnitude. Reserved by Windows retains its allocated/Finished gates. These cells have no file actions. The map is not a complete disk partition: final estimated difference is diagnostic text only, never an inaccessible-space block. More/Less detail changes minimum cell area with a safety depth bound; it is not saved.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation and the size view are not saved.",
+        "Read-only Windows folder and drive scanning. No release yet.\nRight-click a real file or folder for Windows' classic shell menu; Shift requests extended commands. Windows and installed shell extensions own these actions and their confirmations, including any Delete action. HogMap implements no file changes and never invokes a command automatically. Rename may be absent or unsupported without Explorer's editable view. The menu can block or crash through third-party extensions. Rescan after changes; the index is not refreshed automatically.\nApparent size (map) counts each listed name: known bytes plus the signed charge correction. The charged record uses the authoritative size; aliases retain listed sizes, without full per-name correction or an error bound. Apparent size can exceed disk capacity.\nMap areas and cell sizes use apparent {} bytes per listed name, not unique bytes per identity. The estimated difference instead subtracts unique allocated bytes after authoritative hard-link corrections, not the map's apparent total. Repeated hard-link names = apparent allocated bytes minus unique allocated bytes. Map + free + reserve + estimated difference can exceed disk capacity by those repeated-name bytes. View switches between logical size (the default) and observed allocated size.\nAllocated size is what Windows reports for each file, not physical attribution or recoverable space.\nFilter syntax: * and ? name masks; \\temp folder components; | excludes masks; s>1mb or >1mb logical, d<16k allocated; c/m/a age with s/m/h/d/w; + or - :attr:hidden, :class:images and :red / :1..:4 / :tag:. Positive masks, classes and tags OR; exclusions and other conditions AND. Age reference is fixed when applied. Highlight dims non-matches and keeps full geometry. Filter hides non-matches and reports matched, undecided and full snapshot bytes separately; volume cells are omitted. Unknown decisions stay visible, never counted as matches. Select a file or folder, then Ctrl+1/2/3/4 assigns tag 1 Red/2 Yellow/3 Green/4 Blue; Ctrl+0 clears it, including inheritance. View lists these actions. Numbered marks and accessible cell names identify effective tags. View → File classes… adds/edits extensions and fixed colours or deletes classes, reparsing the active expression after each change. Deleting a class in use asks for confirmation; a missing-class warning offers Clear filter. View → Flat Colors / File Classes or Ctrl+T changes file fills, never geometry. Fuzzy keywords are not implemented.\nZero-size and unknown-size items have no map area; unknown is not zero.\nAt an unzoomed whole-volume root, independently known Free space is drawn in either size view, during scanning and after eligible final observations. Running capacity is provisional; Not yet scanned · estimate is a residual, not measured inaccessible space. Logical tree bytes and volume-capacity bytes are comparable only in order of magnitude. Reserved by Windows retains its allocated/Finished gates. These cells have no file actions. The map is not a complete disk partition: final estimated difference is diagnostic text only, never an inaccessible-space block. More/Less detail changes minimum cell area with a safety depth bound; it is not saved.\nVolume free/total are global Windows filesystem values, not limited by per-user quotas.\nThe synthetic sample is generated in memory, not scanned.\nOnly window geometry and the chosen theme are saved; names, filters, navigation, tags, class edits, map style and the size view are not saved.",
         metric_bytes(metric)
     )
 }

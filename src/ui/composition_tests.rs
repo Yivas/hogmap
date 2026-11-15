@@ -8,6 +8,188 @@ use std::sync::mpsc::channel;
 use std::time::SystemTime;
 
 #[test]
+fn tag_shortcuts_update_inherited_marks_and_accessible_names_then_clear() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = app(&context);
+    app.volume_evidence = None;
+    let root = app.reducer.index().unwrap().root();
+    app.selected = Some(NodeRef::Entry(root));
+    for (key, bits, name) in [
+        (Key::Num1, 1, "Tag 1 · Red"),
+        (Key::Num2, 2, "Tag 2 · Yellow"),
+        (Key::Num3, 4, "Tag 3 · Green"),
+        (Key::Num4, 8, "Tag 4 · Blue"),
+        (Key::Num0, 0, ""),
+    ] {
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |_| app.shortcuts(&context),
+        );
+        assert_eq!(app.reducer.index().unwrap().tags(root), Some(bits));
+        frame(&context, &mut app, Vec::new());
+        let (output, _, _) = frame(&context, &mut app, Vec::new());
+        assert!(
+            app.cache
+                .as_ref()
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.tags == bits)
+        );
+        if bits != 0 {
+            assert!(
+                app.cache
+                    .as_ref()
+                    .unwrap()
+                    .cells
+                    .iter()
+                    .all(|cell| cell.tooltip.contains(name))
+            );
+            assert!(
+                output
+                    .platform_output
+                    .accesskit_update
+                    .as_ref()
+                    .unwrap()
+                    .nodes
+                    .iter()
+                    .any(|(_, node)| node.label().is_some_and(|label| label.contains(name)))
+            );
+        }
+    }
+}
+
+#[test]
+fn style_shortcut_changes_fill_without_changing_geometry_in_both_themes() {
+    for theme in [Theme::Dark, Theme::Light] {
+        let context = egui::Context::default();
+        theme::apply(&context, theme);
+        let mut app = app(&context);
+        app.volume_evidence = None;
+        let index = app.reducer.finished_index_mut().unwrap();
+        let id = index
+            .insert(
+                index.root(),
+                "photo.jpg".into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(100),
+                    allocated: Some(100),
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap();
+        app.version += 1;
+        frame(&context, &mut app, Vec::new());
+        let geometry: Vec<_> = app
+            .cache
+            .as_ref()
+            .unwrap()
+            .layout
+            .placed
+            .iter()
+            .map(|p| (p.node, p.rect, p.header, p.known_sum))
+            .collect();
+        let _ = context.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key {
+                    key: Key::T,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: Modifiers::CTRL,
+                }],
+                ..Default::default()
+            },
+            |_| app.shortcuts(&context),
+        );
+        assert_eq!(app.map_style, MapStyle::FileClasses);
+        frame(&context, &mut app, Vec::new());
+        let cache = app.cache.as_ref().unwrap();
+        assert_eq!(
+            cache
+                .layout
+                .placed
+                .iter()
+                .map(|p| (p.node, p.rect, p.header, p.known_sum))
+                .collect::<Vec<_>>(),
+            geometry
+        );
+        let slot = cache
+            .layout
+            .placed
+            .iter()
+            .position(|p| p.node == NodeRef::Entry(id))
+            .unwrap();
+        assert_eq!(
+            cache.cells[slot].surface,
+            paint::Surface::ClassFile(hogmap::filter::ClassColor::Green)
+        );
+        assert_ne!(
+            theme.palette().file.fill,
+            theme
+                .palette()
+                .class(hogmap::filter::ClassColor::Green)
+                .fill
+        );
+    }
+}
+
+#[test]
+fn class_dialog_exposes_named_controls_and_escape_closes_without_cancelling() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = app(&context);
+    app.class_editor.reopen();
+    desktop_frame(&context, &mut app, egui::vec2(1280.0, 720.0), Vec::new());
+    let output = desktop_frame(&context, &mut app, egui::vec2(1280.0, 720.0), Vec::new());
+    let nodes = &output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .unwrap()
+        .nodes;
+    for name in [
+        "File classes…",
+        "New class",
+        "Class colour: Blue",
+        "Apply class",
+        "Close",
+    ] {
+        assert!(
+            nodes.iter().any(|(_, node)| node.label() == Some(name)),
+            "{name}"
+        );
+    }
+    assert!(nodes.iter().any(|(_, node)| !node.labelled_by().is_empty()));
+    desktop_frame(
+        &context,
+        &mut app,
+        egui::vec2(1280.0, 720.0),
+        vec![egui::Event::Key {
+            key: Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::NONE,
+        }],
+    );
+    assert!(!app.class_editor.open);
+    assert!(!app.cancelled);
+}
+
+#[test]
 fn filter_mode_keyboard_switch_changes_geometry_and_keeps_unknown_totals_separate() {
     for theme in [Theme::Dark, Theme::Light] {
         let context = egui::Context::default();

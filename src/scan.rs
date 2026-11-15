@@ -355,6 +355,14 @@ impl ScanReducer {
         self.index.as_ref()
     }
 
+    /// Tag a current entry even while records arrive, without exposing mutable snapshot access.
+    pub fn set_tags(&mut self, id: EntryId, bits: u8) -> Result<(), crate::filter::FilterError> {
+        self.index
+            .as_mut()
+            .ok_or(crate::filter::FilterError::UnsupportedSyntax)?
+            .set_tags(id, bits)
+    }
+
     /// Mutable access for an explicit post-pass only after a Finished terminal was consumed.
     pub fn finished_index_mut(&mut self) -> Option<&mut Index> {
         if self.terminal == Some(Terminal::Finished) {

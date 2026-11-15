@@ -238,7 +238,10 @@ fn folder_components_masks_classes_and_tags_obey_positive_or_and_exclusions() {
             "{expression}"
         );
     }
+    assert_eq!(index.tags(a), Some(1));
+    assert_eq!(index.tags(c), Some(8));
     index.set_tags(a, 0).unwrap();
+    assert_eq!(index.tags(a), Some(0));
     assert_eq!(
         Filter::parse(":red").unwrap().matches(&index).matched_files,
         0

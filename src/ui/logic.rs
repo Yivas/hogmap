@@ -292,15 +292,27 @@ pub fn fitting_prefix(widths: &[f32], available: f32, ellipsis: f32) -> Option<(
 #[derive(Default)]
 pub struct HighlightFilter {
     filter: Filter,
+    pub(super) active_expression: String,
     pub error: Option<FilterError>,
+    pub missing_class: Option<String>,
 }
 
 impl HighlightFilter {
     pub fn set(&mut self, expression: &str) -> bool {
-        match Filter::parse(expression) {
+        self.set_with_classes(expression, &hogmap::filter::ClassTable::default())
+    }
+
+    pub fn set_with_classes(
+        &mut self,
+        expression: &str,
+        classes: &hogmap::filter::ClassTable,
+    ) -> bool {
+        match Filter::parse_with_classes(expression, classes, std::time::SystemTime::now()) {
             Ok(filter) => {
                 self.filter = filter;
+                self.active_expression = expression.to_owned();
                 self.error = None;
+                self.missing_class = None;
                 true
             }
             Err(error) => {

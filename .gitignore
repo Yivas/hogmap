@@ -1,3 +1,6 @@
+# Local independent-review marker
+.review-gate
+
 # Rust build output
 /target/
 
