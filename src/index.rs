@@ -311,6 +311,20 @@ impl Index {
         Ok(())
     }
 
+    pub(crate) fn tag_assignment(&self, id: EntryId) -> Option<u8> {
+        self.tags.assignment(id)
+    }
+
+    pub(crate) fn authoritative_corrections(&self) -> Vec<(FileIdentity, Sizes)> {
+        let mut corrections: Vec<_> = self
+            .authoritative_sizes
+            .iter()
+            .map(|(identity, sizes)| (FileIdentity::from(*identity), *sizes))
+            .collect();
+        corrections.sort_unstable_by_key(|(identity, _)| (identity.volume, identity.file));
+        corrections
+    }
+
     pub fn root(&self) -> EntryId {
         EntryId::at(0).expect("root ID fits")
     }
@@ -805,15 +819,11 @@ struct IdentityCharge {
     allocated: MetricCharge,
 }
 
-type ChargeShard = HashMap<
-    StoredIdentity,
-    IdentityCharge,
-    std::hash::BuildHasherDefault<std::collections::hash_map::DefaultHasher>,
->;
+type ChargeShard = HashMap<StoredIdentity, IdentityCharge>;
 
 /// Bound individual rehash work instead of moving the entire identity table in one UI tick.
-/// Identities come from the trusted filesystem worker, not arbitrary network/IPC input. Fixed
-/// std hashers reproduce lookup behaviour; callers sort observable conflict lists explicitly.
+/// Snapshot files supply untrusted identities, so each shard uses std's randomized hasher.
+/// Accounting follows insertion order; observable conflict lists are sorted explicitly.
 #[derive(Debug)]
 struct IdentityCharges([ChargeShard; 64]);
 impl Default for IdentityCharges {
@@ -912,7 +922,7 @@ fn accumulate(sum: &mut u64, bytes: u64, overflowed: &mut bool) {
     }
 }
 
-fn validate_name(name: &OsStr) -> Result<(), IndexError> {
+pub(crate) fn validate_name(name: &OsStr) -> Result<(), IndexError> {
     let bytes = name.as_encoded_bytes();
     if bytes.is_empty()
         || bytes == b"."

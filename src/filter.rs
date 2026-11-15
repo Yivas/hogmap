@@ -185,6 +185,9 @@ impl TagTable {
             }
         }
     }
+    pub(crate) fn assignment(&self, id: EntryId) -> Option<u8> {
+        self.0.get(&id).copied()
+    }
     pub(crate) fn memory_bytes(&self) -> usize {
         self.0.capacity() * (std::mem::size_of::<(EntryId, u8)>() + 1)
     }

@@ -341,6 +341,16 @@ impl ScanReducer {
         }
     }
 
+    /// A validated file snapshot has no producer or producer-key mapping. Its original terminal
+    /// describes the saved scan, not a new scan of any stored path.
+    pub fn from_snapshot(generation: ScanGeneration, index: Index, terminal: Terminal) -> Self {
+        Self {
+            index: Some(index),
+            terminal: Some(terminal),
+            ..Self::new(generation)
+        }
+    }
+
     /// Index and producer-key allocation estimates at terminal/disconnect, not peak memory.
     pub fn memory_before_release(&self) -> (usize, usize) {
         self.memory_before_release

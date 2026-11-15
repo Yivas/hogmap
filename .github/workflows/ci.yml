@@ -28,8 +28,11 @@ jobs:
       - name: Limit unsafe-code exceptions to audited boundary modules
         shell: bash
         run: |
-          if grep -rn "allow(unsafe_code)" src --exclude=scan_win.rs --exclude=volume.rs --exclude=name_arena.rs --exclude=shell_menu.rs; then
-            echo "::error::Unsafe code is allowed only in src/scan_win.rs, src/volume.rs, src/name_arena.rs and src/ui/shell_menu.rs"
+          # Match the exact audited paths, not bare file names: a future src/other/file_dialog.rs
+          # must not inherit the exception.
+          allowed='^(src/scan_win\.rs|src/volume\.rs|src/name_arena\.rs|src/ui/shell_menu\.rs|src/ui/file_dialog\.rs):'
+          if grep -rn "allow(unsafe_code)" src | grep -Ev "$allowed"; then
+            echo "::error::Unsafe code is allowed only in src/scan_win.rs, src/volume.rs, src/name_arena.rs, src/ui/shell_menu.rs and src/ui/file_dialog.rs"
             exit 1
           fi
       - name: Test std-only core

@@ -1,6 +1,6 @@
 # Filters
 
-Use the expression field on a scanned tree or the labelled synthetic sample. It works on cached metadata and never rescans. Choose **Highlight** to dim non-matches without changing geometry or totals, or **Filter** to remove non-matching files from the map. The mode selector and Ctrl+Shift+F switch between them; Ctrl+F focuses the expression. Neither the mode nor expression is saved.
+Use the expression field on a scanned tree, an opened snapshot or the labelled synthetic sample. It works on cached metadata and never rescans. Choose **Highlight** to dim non-matches without changing geometry or totals, or **Filter** to remove non-matching files from the map. The mode selector and Ctrl+Shift+F switch between them; Ctrl+F focuses the expression. Neither the mode nor expression is saved.
 
 Filter keeps undecided files visible in their distinct tone. Its total line separates **Filtered matches**, **Undecided** known bytes and unknown-size count, and **Full snapshot** bytes. Undecided files are not matches. Totals cover the snapshot, even when zoomed. Filter hides volume/free/residual cells: excluding files does not turn their space into free space. A file whose size is unknown has no invented map area.
 
@@ -70,7 +70,11 @@ The in-memory tag model supports four bits: `:1`/`:red`, `:2`/`:yellow`, `:3`/`:
 
 Select a file or folder and press **Ctrl+1** Red, **Ctrl+2** Yellow, **Ctrl+3** Green or **Ctrl+4** Blue to assign one tag, replacing its previous assignment. **Ctrl+0** clears it, including an inherited tag. The same actions appear in **View**. Shortcuts do not intercept typing in text fields. Children inherit the nearest folder assignment unless explicitly overridden, including while new records arrive during scanning.
 
-Numbered coloured marks identify effective tags without relying on hue alone; tooltips and accessible cell names include the number and colour. Very small cells omit the visual mark but keep that text. For example, tag a large folder red and use `-:red` to hide it in Filter, or tag selected entries and use `:tag:` to keep that set. There is one view, not a multi-window basket. New scans start untagged; nothing is saved.
+Numbered coloured marks identify effective tags without relying on hue alone; tooltips and accessible cell names include the number and colour. Very small cells omit the visual mark but keep that text. For example, tag a large folder red and use `-:red` to hide it in Filter, or tag selected entries and use `:tag:` to keep that set. There is one view, not a multi-window basket. New scans start untagged. Explicit snapshot saves retain assignments, including explicit zero overrides; reopening restores inheritance. No tags are saved automatically.
+
+## Export the filtered view
+
+File → Export view as text… (Ctrl+E outside text editing) previews the current zoom/member view with the last valid expression and Highlight/Filter mode. Only drawn tree cells are listed; aggregates say how many items are not expanded, and entries without area are not listed individually. Unknown sizes remain explicit. Cancel writes nothing. Snapshots preserve metadata and tags, not the active expression or mode; opening resets those controls. See [Snapshots and text files](./development.md#snapshots-and-text-files).
 
 ## Combining conditions
 

@@ -138,6 +138,7 @@ impl DriveColumns {
 pub enum Action {
     Start(PathBuf),
     Sample,
+    OpenSnapshot,
     Close,
 }
 
@@ -505,6 +506,15 @@ impl SpaceDialog {
                     }
                 }
                 ui.separator();
+                if ui
+                    .add_enabled(
+                        !self.preparing,
+                        egui::Button::new(text::OPEN_SNAPSHOT).shortcut_text("Ctrl+O"),
+                    )
+                    .clicked()
+                {
+                    action = Some(Action::OpenSnapshot);
+                }
                 if ui
                     .add_enabled(!self.preparing, egui::Button::new(text::SAMPLE_ACTION))
                     .clicked()

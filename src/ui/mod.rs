@@ -5,6 +5,9 @@ mod composition_tests;
 #[cfg(test)]
 mod context_menu_tests;
 mod dialog;
+#[cfg(windows)]
+mod file_dialog;
+mod files;
 mod icons;
 pub(crate) mod logic;
 pub(crate) mod paint;
@@ -213,6 +216,10 @@ pub struct HogMap {
     close_hold: Option<Instant>,
     scan_report: Option<ScanReport>,
     scan_root: Option<PathBuf>,
+    snapshot_file: Option<PathBuf>,
+    saved_root: Option<PathBuf>,
+    pending_file: Option<files::Action>,
+    export_preview: Option<String>,
     cancellation: ScanCancellation,
     cancelled: bool,
     pub(crate) version: u64,
@@ -288,6 +295,10 @@ impl HogMap {
             close_hold: None,
             scan_report: None,
             scan_root: None,
+            snapshot_file: None,
+            saved_root: None,
+            pending_file: None,
+            export_preview: None,
             cancellation: ScanCancellation::new(),
             cancelled: false,
             version: 0,
@@ -523,6 +534,9 @@ impl HogMap {
     }
 
     fn rescan(&mut self) {
+        if self.snapshot_file.is_some() {
+            return;
+        }
         if let Some(root) = self.scan_root.clone() {
             self.start_real_scan(root);
         } else {
@@ -582,6 +596,9 @@ impl HogMap {
         cancellation: ScanCancellation,
         previous_failed: bool,
     ) {
+        self.snapshot_file = None;
+        self.saved_root = None;
+        self.export_preview = None;
         self.reducer = ScanReducer::new(generation);
         self.cancellation = cancellation;
         self.receiver = Some(receiver);
@@ -826,7 +843,7 @@ impl HogMap {
             .index()
             .and_then(|index| index.summary_for(self.metric).ok())
             .and_then(|summary| summary.apparent_bytes().ok());
-        composition::visible(
+        let mut visible = composition::visible(
             CompositionView {
                 metric: self.metric,
                 unzoomed: self.history.current() == Location::default(),
@@ -840,7 +857,11 @@ impl HogMap {
             self.volume_evidence.as_ref(),
             legacy.components,
             scanned,
-        )
+        );
+        if self.snapshot_file.is_some() {
+            visible.detail = format!("{}\n{}", text::SNAPSHOT_EVIDENCE, visible.detail);
+        }
+        visible
     }
 
     /// A layout failure of the selected metric. One left by the other metric is not reported while
@@ -953,7 +974,18 @@ impl HogMap {
     }
 
     fn shortcuts(&mut self, context: &egui::Context) {
-        if self.chooser.open || self.class_editor.open {
+        if self.chooser.open
+            && !self.chooser.preparing
+            && context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::O))
+        {
+            self.request_file(files::Action::Open);
+            return;
+        }
+        if self.chooser.open
+            || self.class_editor.open
+            || self.export_preview.is_some()
+            || self.pending_file.is_some()
+        {
             return;
         }
         if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::N)) {
@@ -981,6 +1013,15 @@ impl HogMap {
         }
         if context.text_edit_focused() {
             return;
+        }
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::O)) {
+            self.request_file(files::Action::Open);
+        }
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::S)) {
+            self.request_file(files::Action::Save);
+        }
+        if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::E)) {
+            self.begin_export();
         }
         if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::T)) {
             self.set_style(self.map_style.other());
@@ -1041,6 +1082,38 @@ impl HogMap {
                         self.request_scan(ScanRequest::Sample);
                         ui.close();
                     }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            !self.work_pending() && self.receiver.is_none(),
+                            egui::Button::new(text::OPEN_SNAPSHOT).shortcut_text("Ctrl+O"),
+                        )
+                        .clicked()
+                    {
+                        self.request_file(files::Action::Open);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.can_save_snapshot(),
+                            egui::Button::new(text::SAVE_SNAPSHOT).shortcut_text("Ctrl+S"),
+                        )
+                        .clicked()
+                    {
+                        self.request_file(files::Action::Save);
+                        ui.close();
+                    }
+                    if ui
+                        .add_enabled(
+                            self.can_save_snapshot() && self.cache.is_some(),
+                            egui::Button::new(text::EXPORT_VIEW).shortcut_text("Ctrl+E"),
+                        )
+                        .clicked()
+                    {
+                        self.begin_export();
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button(text::EXIT).clicked() {
                         self.request_close();
                     }
@@ -1227,7 +1300,7 @@ impl HogMap {
                 if button(
                     ui,
                     Icon::Rescan,
-                    self.scan_started.is_some(),
+                    self.scan_started.is_some() && self.snapshot_file.is_none(),
                     false,
                     text::RESCAN_TIP,
                 )
@@ -1433,7 +1506,9 @@ impl HogMap {
             || self.closing
             || (self.cancelled && self.producer.is_some())
             || (self.preparation.is_some() && self.cancellation.is_cancelled());
-        let lifecycle = if self.resolution.active() && !stopping {
+        let lifecycle = if self.snapshot_file.is_some() {
+            text::SNAPSHOT_NOT_LIVE
+        } else if self.resolution.active() && !stopping {
             if self.cancelled {
                 text::STOPPING
             } else {
@@ -1451,7 +1526,10 @@ impl HogMap {
         // Ready describes an idle producer, never the completeness of its metadata.
         let master = match state {
             logic::ScanState::Finished
-                if !stopping && self.preparation.is_none() && !self.resolution.active() =>
+                if !stopping
+                    && self.preparation.is_none()
+                    && !self.resolution.active()
+                    && self.snapshot_file.is_none() =>
             {
                 text::READY
             }
@@ -1716,21 +1794,26 @@ impl HogMap {
                         palette.volume_text,
                     );
                     let root = self
-                        .volume
+                        .snapshot_file
                         .as_ref()
-                        .map(|volume| {
-                            if volume.label.is_empty() {
-                                volume.root.display().to_string()
-                            } else {
-                                format!("{} · {}", volume.root.display(), volume.label)
-                            }
-                        })
+                        .map(|path| text::snapshot_header(path))
                         .unwrap_or_else(|| {
-                            if self.scan_started.is_some() {
-                                text::SAMPLE.into()
-                            } else {
-                                text::NO_SPACE.into()
-                            }
+                            self.volume
+                                .as_ref()
+                                .map(|volume| {
+                                    if volume.label.is_empty() {
+                                        volume.root.display().to_string()
+                                    } else {
+                                        format!("{} · {}", volume.root.display(), volume.label)
+                                    }
+                                })
+                                .unwrap_or_else(|| {
+                                    if self.scan_started.is_some() {
+                                        text::SAMPLE.into()
+                                    } else {
+                                        text::NO_SPACE.into()
+                                    }
+                                })
                         });
                     let capacity = self.volume.as_ref().map_or_else(
                         || text::drive_capacity(None, None),
@@ -2222,6 +2305,7 @@ impl HogMap {
             match action {
                 dialog::Action::Start(root) => self.start_real_scan(root),
                 dialog::Action::Sample => self.request_scan(ScanRequest::Sample),
+                dialog::Action::OpenSnapshot => self.request_file(files::Action::Open),
                 dialog::Action::Close => {
                     self.chooser.open = false;
                     if self.preparation.is_some() || self.pending_scan.is_some() {
@@ -2236,6 +2320,7 @@ impl HogMap {
         {
             self.classes_changed();
         }
+        self.show_export_preview(&context);
         if self.about {
             let mut about = text::about(self.metric);
             if let Some(index) = self.reducer.index() {
@@ -2269,6 +2354,10 @@ impl eframe::App for HogMap {
         self.process_context_menu(|_| {
             Err("Windows shell menus are only available on Windows.".into())
         });
+        #[cfg(windows)]
+        self.process_file_action(file_dialog::choose);
+        #[cfg(not(windows))]
+        self.process_file_action(|_| Err(text::DIALOG_WINDOWS_ONLY.into()));
         self.drain(context);
     }
 
