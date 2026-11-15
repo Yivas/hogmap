@@ -218,7 +218,17 @@ fn layout_selection(
         .as_ref()
         .is_none_or(|cache| cache.metric != metric || cache.matches.as_deref() != matches)
     {
-        *storage = Some(LayoutData::build(index, metric, matches)?);
+        if let Some(cache) = storage.as_mut() {
+            // Membership is snapshot-owned and independent of weights. Insertions maintain it
+            // or discard this cache; authoritative corrections also discard the cache.
+            let totals = subtree_totals(index, metric, matches)?;
+            cache.totals = totals;
+            cache.metric = metric;
+            cache.matches = matches.map(<[_]>::to_vec);
+            cache.sorted.fill(false);
+        } else {
+            *storage = Some(LayoutData::build(index, metric, matches)?);
+        }
     }
     let data = storage.as_mut().expect("initialized layout data");
     let mut selected_children = members.map(<[EntryId]>::to_vec);
@@ -226,8 +236,8 @@ fn layout_selection(
         selected.sort_by(|a, b| {
             compare_children(
                 index,
-                &(*a, data.totals[a.position()].known_sum),
-                &(*b, data.totals[b.position()].known_sum),
+                &(*a, data.totals.get(a.position()).known_sum),
+                &(*b, data.totals.get(b.position()).known_sum),
             )
         });
     }
@@ -235,7 +245,7 @@ fn layout_selection(
     let root_totals = if let Some(members) = members {
         let mut selected = Totals::default();
         for id in members {
-            let value = totals[id.position()];
+            let value = totals.get(id.position());
             selected.known_sum = selected
                 .known_sum
                 .checked_add(value.known_sum)
@@ -244,7 +254,7 @@ fn layout_selection(
         }
         selected
     } else {
-        totals[root.position()]
+        totals.get(root.position())
     };
     let root_placed = place(
         NodeRef::Entry(root),
@@ -271,8 +281,8 @@ fn layout_selection(
             data.children[slot].sort_by(|a, b| {
                 compare_children(
                     index,
-                    &(*a, totals[a.position()].known_sum),
-                    &(*b, totals[b.position()].known_sum),
+                    &(*a, totals.get(a.position()).known_sum),
+                    &(*b, totals.get(b.position()).known_sum),
                 )
             });
             data.sorted[slot] = true;
@@ -282,7 +292,7 @@ fn layout_selection(
         } else {
             &data.children[slot]
         };
-        let positive = child_ids.partition_point(|id| totals[id.position()].known_sum > 0);
+        let positive = child_ids.partition_point(|id| totals.get(id.position()).known_sum > 0);
         if positive == 0 {
             continue;
         }
@@ -290,11 +300,11 @@ fn layout_selection(
         let total = if parent == root {
             root_totals.known_sum
         } else {
-            totals[slot].known_sum
+            totals.get(slot).known_sum
         };
         let content_area = f64::from(content.area());
         let keep = child_ids.partition_point(|id| {
-            content_area * totals[id.position()].known_sum as f64 / total as f64
+            content_area * totals.get(id.position()).known_sum as f64 / total as f64
                 >= f64::from(params.min_pixel_area)
         });
         let mut aggregate_members = child_ids[keep..].to_vec();
@@ -303,7 +313,7 @@ fn layout_selection(
         let retained_weight = child_ids[..keep]
             .iter()
             .try_fold(0_u64, |sum, id| {
-                sum.checked_add(totals[id.position()].known_sum)
+                sum.checked_add(totals.get(id.position()).known_sum)
             })
             .ok_or(LayoutError::SizeOverflow)?;
         let aggregate_weight = total
@@ -313,7 +323,7 @@ fn layout_selection(
             .iter()
             .map(|id| Cell {
                 node: Some(*id),
-                weight: totals[id.position()].known_sum,
+                weight: totals.get(id.position()).known_sum,
             })
             .collect();
         if !aggregate_members.is_empty() {
@@ -328,7 +338,7 @@ fn layout_selection(
             match cell.node {
                 Some(id) => {
                     let entry = index.get(id).ok_or(LayoutError::UnknownRoot)?;
-                    let cell_totals = totals[id.position()];
+                    let cell_totals = totals.get(id.position());
                     let placed = place(
                         NodeRef::Entry(id),
                         &entry,
@@ -347,7 +357,7 @@ fn layout_selection(
                 None => {
                     let has_unknown = aggregate_members
                         .iter()
-                        .any(|id| totals[id.position()].unknown > 0);
+                        .any(|id| totals.get(id.position()).unknown > 0);
                     result.placed.push(Placed {
                         node: NodeRef::Aggregate { parent },
                         rect: cell_rect,
@@ -383,7 +393,38 @@ fn validate_rect(rect: Rect) -> Result<(), LayoutError> {
 #[derive(Clone, Copy, Debug, Default)]
 struct Totals {
     known_sum: u64,
-    unknown: usize,
+    unknown: u32,
+}
+
+#[derive(Debug)]
+struct SubtreeTotals {
+    known: Vec<u64>,
+    unknown: Vec<u32>,
+}
+
+impl SubtreeTotals {
+    fn new(len: usize) -> Self {
+        let mut known = Vec::with_capacity(len + 4096);
+        let mut unknown = Vec::with_capacity(len + 4096);
+        known.resize(len, 0);
+        unknown.resize(len, 0);
+        Self { known, unknown }
+    }
+
+    fn get(&self, slot: usize) -> Totals {
+        Totals {
+            known_sum: self.known[slot],
+            unknown: self.unknown[slot],
+        }
+    }
+
+    fn add(&mut self, slot: usize, value: Totals) -> Result<(), LayoutError> {
+        self.known[slot] = self.known[slot]
+            .checked_add(value.known_sum)
+            .ok_or(LayoutError::SizeOverflow)?;
+        self.unknown[slot] += value.unknown;
+        Ok(())
+    }
 }
 
 /// Snapshot-owned, one metric at a time. Unknown counts allow completion to clear an ancestor
@@ -393,7 +434,7 @@ pub(crate) struct LayoutData {
     metric: SizeMetric,
     matches: Option<Vec<crate::filter::Match>>,
     children: Vec<Vec<EntryId>>,
-    totals: Vec<Totals>,
+    totals: SubtreeTotals,
     sorted: Vec<bool>,
     child_capacity_bytes: usize,
 }
@@ -416,18 +457,20 @@ impl LayoutData {
             .sum();
         let mut sorted = Vec::with_capacity(index.len() + 4096);
         sorted.resize(index.len(), false);
+        let totals = subtree_totals(index, metric, matches)?;
         Ok(Self {
             metric,
             matches: matches.map(<[_]>::to_vec),
             children,
-            totals: subtree_totals(index, metric, matches)?,
+            totals,
             sorted,
             child_capacity_bytes,
         })
     }
     pub(crate) fn memory_bytes(&self) -> usize {
         self.children.capacity() * std::mem::size_of::<Vec<EntryId>>()
-            + self.totals.capacity() * std::mem::size_of::<Totals>()
+            + self.totals.known.capacity() * std::mem::size_of::<u64>()
+            + self.totals.unknown.capacity() * std::mem::size_of::<u32>()
             + self.sorted.capacity() * std::mem::size_of::<bool>()
             + self.child_capacity_bytes
             + self.matches.as_ref().map_or(0, |matches| {
@@ -441,8 +484,11 @@ impl LayoutData {
         if self.children.len() == self.children.capacity() {
             self.children.reserve(4096);
         }
-        if self.totals.len() == self.totals.capacity() {
-            self.totals.reserve(4096);
+        if self.totals.known.len() == self.totals.known.capacity() {
+            self.totals.known.reserve(4096);
+        }
+        if self.totals.unknown.len() == self.totals.unknown.capacity() {
+            self.totals.unknown.reserve(4096);
         }
         let entry = index.get(id).expect("new index entry");
         let value = Totals {
@@ -451,7 +497,7 @@ impl LayoutData {
             } else {
                 0
             },
-            unknown: usize::from(
+            unknown: u32::from(
                 entry.state != State::Complete
                     || (entry.kind == Kind::File && self.metric.of(entry.sizes).is_none()),
             ),
@@ -461,7 +507,8 @@ impl LayoutData {
             self.sorted.reserve(4096);
         }
         self.sorted.push(false);
-        self.totals.push(value);
+        self.totals.known.push(value.known_sum);
+        self.totals.unknown.push(value.unknown);
         if let Some(parent) = entry.parent {
             let list = &mut self.children[parent.position()];
             let previous = list.capacity();
@@ -473,11 +520,7 @@ impl LayoutData {
         while let Some(parent) = next {
             let slot = parent.position();
             self.sorted[slot] = false;
-            self.totals[slot].known_sum = self.totals[slot]
-                .known_sum
-                .checked_add(value.known_sum)
-                .ok_or(LayoutError::SizeOverflow)?;
-            self.totals[slot].unknown += value.unknown;
+            self.totals.add(slot, value)?;
             next = index.get(parent).expect("existing parent").parent;
         }
         Ok(())
@@ -509,9 +552,9 @@ impl LayoutData {
         let mut next = Some(id);
         while let Some(id) = next {
             if after {
-                self.totals[id.position()].unknown += 1;
+                self.totals.unknown[id.position()] += 1;
             } else {
-                self.totals[id.position()].unknown -= 1;
+                self.totals.unknown[id.position()] -= 1;
             }
             next = index.get(id).expect("existing ancestor").parent;
         }
@@ -522,32 +565,11 @@ fn subtree_totals(
     index: &Index,
     metric: SizeMetric,
     matches: Option<&[crate::filter::Match]>,
-) -> Result<Vec<Totals>, LayoutError> {
-    let mut seen_identities: HashSet<FileIdentity> = HashSet::new();
-    let mut totals = Vec::with_capacity(index.len() + 4096);
-    totals.resize(index.len(), Totals::default());
-    let corrected = index.has_authoritative_sizes();
-    for (id, entry) in index.entries() {
-        let mut known_sum = 0_u64;
-        let mut has_unknown = entry.state != State::Complete;
-        if entry.kind == Kind::File {
-            match metric.of(entry.sizes) {
-                Some(listed) => {
-                    let first_charge = !corrected
-                        || entry
-                            .identity
-                            .is_none_or(|identity| seen_identities.insert(identity));
-                    known_sum = if first_charge {
-                        index
-                            .effective_size(&entry, metric)
-                            .expect("known listed size")
-                    } else {
-                        listed
-                    };
-                }
-                None => has_unknown = true,
-            }
-        }
+) -> Result<SubtreeTotals, LayoutError> {
+    let mut totals = SubtreeTotals::new(index.len());
+    let contribution = |id: EntryId, entry: &Entry<'_>, mut known_sum| {
+        let mut has_unknown = entry.state != State::Complete
+            || (entry.kind == Kind::File && metric.of(entry.sizes).is_none());
         if entry.kind == Kind::File
             && let Some(matches) = matches
         {
@@ -560,31 +582,60 @@ fn subtree_totals(
                 crate::filter::Match::Yes => {}
             }
         }
-        totals[id.position()] = Totals {
+        Totals {
             known_sum,
-            unknown: usize::from(has_unknown),
-        };
+            unknown: u32::from(has_unknown),
+        }
+    };
+    let corrected = index.has_authoritative_sizes();
+    if corrected {
+        // Corrections belong to the first known insertion-order charge, even when excluded.
+        // A reverse identity set would move them to the last alias and change its geometry.
+        let mut seen_identities: HashSet<FileIdentity> = HashSet::new();
+        for (id, entry) in index.entries() {
+            let known_sum = if entry.kind == Kind::File {
+                metric.of(entry.sizes).map_or(0, |listed| {
+                    if entry
+                        .identity
+                        .is_none_or(|identity| seen_identities.insert(identity))
+                    {
+                        index
+                            .effective_size(&entry, metric)
+                            .expect("known listed size")
+                    } else {
+                        listed
+                    }
+                })
+            } else {
+                0
+            };
+            totals.add(id.position(), contribution(id, &entry, known_sum))?;
+        }
     }
-
-    // The index appends a child below an existing directory, so reverse insertion order
-    // finalizes every descendant before its parent.
+    // Parents precede children; one reverse pass finalizes each subtree before its parent.
+    // At most one unknown per entry fits u32 because EntryId already bounds the index length.
     for (id, entry) in index.entries().rev() {
-        let parent = match entry.parent {
-            Some(parent) => parent,
-            None => continue,
-        };
-        let child = totals[id.position()];
-        let parent_totals = &mut totals[parent.position()];
-        parent_totals.known_sum = parent_totals
-            .known_sum
-            .checked_add(child.known_sum)
-            .ok_or(LayoutError::SizeOverflow)?;
-        parent_totals.unknown += child.unknown;
+        if !corrected {
+            let known_sum = if entry.kind == Kind::File {
+                metric.of(entry.sizes).unwrap_or(0)
+            } else {
+                0
+            };
+            totals.add(id.position(), contribution(id, &entry, known_sum))?;
+        }
+        if let Some(parent) = entry.parent {
+            totals.add(parent.position(), totals.get(id.position()))?;
+        }
     }
     Ok(totals)
 }
 
 fn compare_children(index: &Index, a: &(EntryId, u64), b: &(EntryId, u64)) -> Ordering {
+    // Zero-weight entries are outside the positive prefix: neither cells nor aggregate members
+    // can expose their order. Avoid resolving native names for an excluded sibling tail.
+    if a.1 == 0 && b.1 == 0 {
+        return Ordering::Equal;
+    }
     b.1.cmp(&a.1)
         .then_with(|| match (index.get(a.0), index.get(b.0)) {
             (Some(a), Some(b)) => a.name.cmp(b.name),

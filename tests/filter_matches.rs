@@ -482,6 +482,216 @@ fn filtered_file_state_changes_preserve_excluded_and_undecided_geometry() {
 }
 
 #[test]
+fn filtered_totals_preserve_corrected_charges_and_zero_weight_sibling_geometry() {
+    use hogmap::index::{EntryId, SizeMetric};
+    use hogmap::treemap::{self, LayoutParams, NodeRef, Rect};
+
+    fn reference(index: &Index, id: EntryId, own: &[(u64, bool)]) -> (u64, bool) {
+        let mut total = own[id.position()];
+        for (child, entry) in index.entries() {
+            if entry.parent == Some(id) {
+                let value = reference(index, child, own);
+                total.0 += value.0;
+                total.1 |= value.1;
+            }
+        }
+        total
+    }
+
+    let rect = Rect::new(0.0, 0.0, 300.0, 100.0);
+    let params = LayoutParams {
+        min_pixel_area: 1.0,
+        header_height: 0.0,
+        max_depth: 10,
+    };
+    for corrected in [false, true] {
+        let mut index = Index::new("root".into()).unwrap();
+        let root = index.root();
+        index.set_state(root, State::Complete).unwrap();
+        index.set_tags(root, 1).unwrap();
+        let keep = index
+            .insert(
+                root,
+                "keep".into(),
+                Kind::Directory,
+                Sizes::default(),
+                None,
+                State::Complete,
+            )
+            .unwrap();
+        let excluded = index
+            .insert(
+                root,
+                "excluded".into(),
+                Kind::Directory,
+                Sizes::default(),
+                None,
+                State::Inaccessible,
+            )
+            .unwrap();
+        let identity = FileIdentity { volume: 1, file: 7 };
+        let charged = index
+            .insert(
+                keep,
+                "charged".into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(if corrected { 10 } else { 40 }),
+                    allocated: Some(if corrected { 20 } else { 80 }),
+                },
+                Some(identity),
+                State::Complete,
+            )
+            .unwrap();
+        let alias = index
+            .insert(
+                root,
+                "alias".into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(20),
+                    allocated: Some(40),
+                },
+                Some(identity),
+                State::Complete,
+            )
+            .unwrap();
+        index.set_tags(alias, 9).unwrap();
+        let unknown = file(&mut index, keep, "unknown", None, None);
+        file(&mut index, excluded, "hidden", Some(500), Some(500));
+        // Reverse lexical order makes the old native-name tie-break reorder this entire tail.
+        for n in (0..128).rev() {
+            let id = file(
+                &mut index,
+                root,
+                &format!("zero-{n:03}"),
+                Some(100),
+                Some(100),
+            );
+            index.set_tags(id, 0).unwrap();
+        }
+        if corrected {
+            index
+                .apply_authoritative_sizes(
+                    identity,
+                    Sizes {
+                        logical: Some(40),
+                        allocated: Some(80),
+                    },
+                )
+                .unwrap();
+        }
+        for (expression, blue_only) in [(r":red;|\excluded;d<100b", false), (":blue", true)] {
+            let decisions = Filter::parse(expression).unwrap().matches(&index);
+            for (metric, factor) in [(SizeMetric::Logical, 1), (SizeMetric::Allocated, 2)] {
+                let mut own = vec![(0, false); index.len()];
+                own[excluded.position()] = (0, true);
+                own[alias.position()] = (20 * factor, false);
+                if !blue_only {
+                    own[charged.position()] = (40 * factor, false);
+                    own[unknown.position()] = (0, true);
+                }
+                let map = treemap::layout_filtered(
+                    &index,
+                    root,
+                    None,
+                    rect,
+                    params,
+                    metric,
+                    &decisions.matches,
+                )
+                .unwrap();
+                assert_eq!(
+                    (map.known_sum, map.has_unknown),
+                    (if blue_only { 20 } else { 60 } * factor, true)
+                );
+                let expected = if blue_only {
+                    vec![
+                        (NodeRef::Entry(root), rect, 20 * factor, true),
+                        (NodeRef::Entry(alias), rect, 20 * factor, false),
+                    ]
+                } else {
+                    vec![
+                        (NodeRef::Entry(root), rect, 60 * factor, true),
+                        (
+                            NodeRef::Entry(keep),
+                            Rect::new(0.0, 0.0, 200.0, 100.0),
+                            40 * factor,
+                            true,
+                        ),
+                        (
+                            NodeRef::Entry(alias),
+                            Rect::new(200.0, 0.0, 100.0, 100.0),
+                            20 * factor,
+                            false,
+                        ),
+                        (
+                            NodeRef::Entry(charged),
+                            Rect::new(0.0, 0.0, 200.0, 100.0),
+                            40 * factor,
+                            false,
+                        ),
+                    ]
+                };
+                assert_eq!(
+                    map.placed
+                        .iter()
+                        .map(|cell| (cell.node, cell.rect, cell.known_sum, cell.has_unknown))
+                        .collect::<Vec<_>>(),
+                    expected
+                );
+                assert!(map.placed.iter().all(|cell| cell.members.is_empty()
+                    && cell.header.is_none()
+                    && cell.content == cell.rect));
+                for (id, _) in index.entries() {
+                    let subtree = treemap::layout_filtered(
+                        &index,
+                        id,
+                        None,
+                        rect,
+                        params,
+                        metric,
+                        &decisions.matches,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        (subtree.known_sum, subtree.has_unknown),
+                        reference(&index, id, &own)
+                    );
+                }
+                // A second threshold checks that zero-weight siblings never enter an aggregate.
+                let grouped = treemap::layout_filtered(
+                    &index,
+                    root,
+                    None,
+                    rect,
+                    LayoutParams {
+                        min_pixel_area: 40_000.0,
+                        ..params
+                    },
+                    metric,
+                    &decisions.matches,
+                )
+                .unwrap();
+                assert_eq!(grouped.placed.len(), 2);
+                assert_eq!(
+                    grouped.placed[1].members,
+                    if blue_only {
+                        vec![alias]
+                    } else {
+                        vec![keep, alias]
+                    }
+                );
+                assert_eq!(
+                    (grouped.known_sum, grouped.has_unknown),
+                    reference(&index, root, &own)
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn filtered_geometry_and_totals_exclude_no_but_keep_undecided_separate() {
     use hogmap::index::SizeMetric;
     use hogmap::treemap::{self, LayoutParams, NodeRef, Rect};
