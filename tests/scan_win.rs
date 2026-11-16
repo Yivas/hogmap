@@ -356,3 +356,73 @@ fn cancellation_and_disconnect_finish_without_gui() {
         ProducerOutcome::Disconnected
     );
 }
+
+/// Creates a real directory junction named `name` pointing at `target`, both relative to `dir`,
+/// without elevation. Symbolic links need a privilege a plain test process does not have;
+/// junctions do not, and they are the reparse object a user is most likely to have.
+///
+/// The order runs with `dir` as the working directory and constant arguments, so no variable path
+/// ever reaches the shell: `Command` does not quote for `cmd`, which would reinterpret a directory
+/// containing `&` and expand `%NAME%` even inside quotes. `/D` skips the registry AutoRun commands.
+fn create_junction_in(dir: &std::path::Path, name: &str, target: &str) -> std::io::Result<()> {
+    let status = std::process::Command::new("cmd")
+        .current_dir(dir)
+        .args(["/D", "/C", "mklink", "/J", name, target])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("mklink /J failed"))
+    }
+}
+
+#[test]
+fn real_junction_is_not_followed_and_a_cycle_does_not_recurse() {
+    let fixture = Fixture::new();
+    let real = fixture.0.join("real");
+    std::fs::create_dir(&real).unwrap();
+    std::fs::write(real.join("data"), b"1234567").unwrap();
+    // A junction back to the fixture root is a cycle: following it would never end.
+    // Junctions need no elevation on NTFS, so failing to create one is a broken fixture, not a
+    // reason to pass without exercising the case.
+    create_junction_in(&fixture.0, "loop", ".").expect("junction fixture");
+    let metadata = std::fs::symlink_metadata(fixture.0.join("loop")).expect("junction metadata");
+    assert!(
+        metadata.file_type().is_symlink(),
+        "the fixture must be a reparse object, not a plain directory"
+    );
+    let (reducer, report) = scan(
+        fixture.0.clone(),
+        ScanOptions {
+            workers: 1,
+            queue_capacity: 4,
+            local_stack_capacity: 16,
+            ..ScanOptions::default()
+        },
+    );
+    let index = reducer.index().unwrap();
+    let summary = index.summary().unwrap();
+    // The file is counted once, through the real directory only.
+    assert_eq!(summary.files, 1);
+    assert_eq!(summary.known_logical_bytes, 7);
+    // The junction is reported as a reparse skip, not silently dropped.
+    assert_eq!(report.reparse_skips, 1);
+    // The junction is listed but has no descendants: following it once would have enumerated the
+    // fixture again under it, which a record count alone could miss if directories were deduped.
+    let loop_id = index
+        .entries()
+        .find(|(_, entry)| entry.name == std::ffi::OsStr::new("loop"))
+        .map(|(id, _)| id)
+        .expect("the junction must be listed");
+    assert_eq!(index.get(loop_id).unwrap().kind, Kind::Directory);
+    assert!(
+        !index
+            .entries()
+            .any(|(_, entry)| entry.parent == Some(loop_id)),
+        "the junction must not have descendants"
+    );
+    // Exactly root, `real`, `data` and `loop`: nothing was enumerated twice.
+    assert_eq!(index.len(), 4);
+}
