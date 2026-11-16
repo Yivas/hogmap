@@ -13,26 +13,10 @@ pub(super) struct Coverage {
 pub(super) fn coverage(index: &Index, layout: &Layout) -> Vec<Coverage> {
     use std::collections::HashMap;
     let mut bands = Vec::<Coverage>::new();
-    // The layout lists a parent before its children, so one pass is enough: a cell's depth comes
-    // from its parent's, which was recorded earlier. Walking the index ancestry per entry instead
-    // cost more than the layout itself, because an aggregate can hold thousands of members.
+    // The layout lists a parent before its children, so a cell's depth comes from its parent's,
+    // recorded earlier in the same pass. The classes come from the cell itself: the layout already
+    // visited every entry it stands for, so nothing is recounted here.
     let mut depths: HashMap<EntryId, usize> = HashMap::with_capacity(layout.placed.len());
-    let tally = |id: EntryId, band: &mut Coverage| {
-        let Some(entry) = index.get(id) else {
-            return;
-        };
-        match entry.state {
-            State::Partial | State::Inaccessible | State::Stale => band.partial += 1,
-            State::Pending => band.unknown += 1,
-            State::Complete
-                if entry.kind == Kind::File
-                    && (entry.sizes.logical.is_none() || entry.sizes.allocated.is_none()) =>
-            {
-                band.unknown += 1
-            }
-            State::Complete => band.complete += 1,
-        }
-    };
     for cell in &layout.placed {
         let depth = match cell.node {
             NodeRef::Entry(id) => {
@@ -46,23 +30,18 @@ pub(super) fn coverage(index: &Index, layout: &Layout) -> Vec<Coverage> {
                 depths.get(&parent).copied().map_or(1, |depth| depth + 1)
             }
         };
-        // One resize per cell, not per member: an aggregate can hold thousands of them.
-        bands.resize(bands.len().max(depth + 1), Coverage::default());
-        match cell.node {
-            NodeRef::Entry(id) => {
-                depths.insert(id, depth);
-                tally(id, &mut bands[depth]);
-            }
-            _ => {
-                let band = &mut bands[depth];
-                for &id in &cell.members {
-                    tally(id, band);
-                }
-            }
+        if let NodeRef::Entry(id) = cell.node {
+            depths.insert(id, depth);
         }
+        bands.resize(bands.len().max(depth + 1), Coverage::default());
+        let band = &mut bands[depth];
+        band.complete += cell.states[0] as usize;
+        band.partial += cell.states[1] as usize;
+        band.unknown += cell.states[2] as usize;
     }
     bands
 }
+
 /// The header the notices panel really built. `id` is the one egui derived for that collapsing
 /// header, so a caller addresses the widget instead of guessing how its id is made. Only the
 /// headless test reads the fields: the window draws the panel and ignores the answer.

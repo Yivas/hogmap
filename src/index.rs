@@ -200,6 +200,9 @@ pub struct Index {
     conflict_names: HashMap<StoredIdentity, EntryId>,
     conflicting_identity_count: usize,
     incomplete_entries: usize,
+    // Coverage class per entry, one byte: complete, partial or unknown. The layout reads it for
+    // every member of an aggregate, so it must not need a name lookup per entry.
+    coverage_classes: Vec<u8>,
     // One lazy metric cache belongs to this snapshot; mutations maintain it or invalidate it.
     pub(crate) layout_cache: std::sync::Mutex<Option<crate::treemap::LayoutData>>,
     pub(crate) filter_cache: std::sync::Mutex<Option<crate::filter::MatchCache>>,
@@ -229,6 +232,7 @@ impl Index {
             conflict_names: HashMap::new(),
             conflicting_identity_count: 0,
             incomplete_entries: 1,
+            coverage_classes: vec![2],
             layout_cache: std::sync::Mutex::new(None),
             filter_cache: std::sync::Mutex::new(None),
             filter_metadata: Vec::new(),
@@ -241,6 +245,7 @@ impl Index {
         IndexMemory {
             entry_bytes: self.entries.len() * std::mem::size_of::<StoredEntry>(),
             entry_capacity_bytes: self.entries.capacity() * std::mem::size_of::<StoredEntry>(),
+            coverage_class_bytes: self.coverage_classes.capacity(),
             name_bytes: self.names.len(),
             name_capacity_bytes: self.names.capacity(),
             name_boundary_capacity_bytes: self.names.boundary_capacity_bytes(),
@@ -379,6 +384,8 @@ impl Index {
             identity_slot,
             state,
         ));
+        self.coverage_classes
+            .push(coverage_class(kind, sizes, state) as u8);
         let cache = self
             .layout_cache
             .get_mut()
@@ -687,6 +694,18 @@ impl Index {
         let was_complete = previous == State::Complete;
         let is_complete = state == State::Complete;
         entry.set_state(state);
+        self.coverage_classes[id.position()] = coverage_class(
+            if entry.flags & 1 == 0 {
+                Kind::Directory
+            } else {
+                Kind::File
+            },
+            Sizes {
+                logical: (entry.flags & 2 != 0).then_some(entry.logical),
+                allocated: (entry.flags & 4 != 0).then_some(entry.allocated),
+            },
+            state,
+        ) as u8;
         match (was_complete, is_complete) {
             (true, false) => self.incomplete_entries += 1,
             (false, true) => self.incomplete_entries -= 1,
@@ -741,6 +760,29 @@ impl Index {
             resolution_delta_bytes: totals.resolution_delta_bytes,
             complete: self.incomplete_entries == 0 && totals.unknown_size_files == 0,
         })
+    }
+
+    /// Coverage class of one entry: 0 complete, 1 partial, 2 unknown. Reading a byte keeps the
+    /// layout's aggregate pass from building an `Entry` (and its name) for every member.
+    pub fn coverage_class_of(&self, id: EntryId) -> u8 {
+        self.coverage_classes
+            .get(id.position())
+            .copied()
+            .unwrap_or(2)
+    }
+}
+
+/// The class the coverage strip shows for one entry.
+fn coverage_class(kind: Kind, sizes: Sizes, state: State) -> usize {
+    match state {
+        State::Partial | State::Inaccessible | State::Stale => 1,
+        State::Pending => 2,
+        State::Complete
+            if kind == Kind::File && (sizes.logical.is_none() || sizes.allocated.is_none()) =>
+        {
+            2
+        }
+        State::Complete => 0,
     }
 }
 
@@ -897,6 +939,8 @@ impl From<StoredIdentity> for FileIdentity {
 pub struct IndexMemory {
     pub entry_bytes: usize,
     pub entry_capacity_bytes: usize,
+    /// One byte per entry, held so the layout can classify a member without a name lookup.
+    pub coverage_class_bytes: usize,
     pub name_bytes: usize,
     pub name_capacity_bytes: usize,
     pub name_boundary_capacity_bytes: usize,
@@ -908,6 +952,7 @@ pub struct IndexMemory {
 impl IndexMemory {
     pub fn total_bytes(self) -> usize {
         self.entry_capacity_bytes
+            + self.coverage_class_bytes
             + self.name_capacity_bytes
             + self.name_boundary_capacity_bytes
             + self.identity_bytes

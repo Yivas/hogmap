@@ -91,6 +91,26 @@ pub struct Placed {
     /// Entries grouped by an [`NodeRef::Aggregate`]; empty otherwise.
     pub members: Vec<EntryId>,
     pub group_name: Option<String>,
+    /// Entries this cell stands for, counted by coverage class: complete, partial, unknown. A
+    /// plain entry contributes one; an aggregate or group contributes its members. The layout
+    /// already visits exactly those entries, so recording them here is exact by construction and
+    /// saves the coverage strip from walking an aggregate again.
+    pub states: [u32; 3],
+}
+
+/// The class the coverage strip shows for one entry.
+pub(crate) fn coverage_class(entry: &Entry<'_>) -> usize {
+    match entry.state {
+        State::Partial | State::Inaccessible | State::Stale => 1,
+        State::Pending => 2,
+        State::Complete
+            if entry.kind == Kind::File
+                && (entry.sizes.logical.is_none() || entry.sizes.allocated.is_none()) =>
+        {
+            2
+        }
+        State::Complete => 0,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -313,7 +333,14 @@ fn layout_selection(
             content_area * totals.get(id.position()).known_sum as f64 / total as f64
                 >= f64::from(params.min_pixel_area)
         });
-        let mut aggregate_members = child_ids[keep..].to_vec();
+        // The aggregate stands for exactly these entries, so their classes are recorded here
+        // while they are already in hand.
+        let mut aggregate_states = [0_u32; 3];
+        let mut aggregate_members = Vec::with_capacity(child_ids.len() - keep);
+        for id in &child_ids[keep..] {
+            aggregate_states[index.coverage_class_of(*id) as usize] += 1;
+            aggregate_members.push(*id);
+        }
         // Parent totals already include all children. Visit only the retained prefix for its
         // complement, rather than summing a potentially million-entry small-item aggregate.
         let retained_weight = child_ids[..keep]
@@ -373,6 +400,7 @@ fn layout_selection(
                         has_unknown,
                         members: std::mem::take(&mut aggregate_members),
                         group_name: None,
+                        states: aggregate_states,
                     });
                 }
             }
@@ -472,24 +500,26 @@ pub fn layout_grouped(
     for (name, members) in groups {
         let mut sum = 0_u64;
         let mut unknown = false;
+        let mut states = [0_u32; 3];
         for id in &members {
             let value = totals.get(id.position());
             sum = sum
                 .checked_add(value.known_sum)
                 .ok_or(LayoutError::SizeOverflow)?;
             unknown |= value.unknown > 0;
+            states[index.coverage_class_of(*id) as usize] += 1;
         }
-        entries.push((name, members, sum, unknown));
+        entries.push((name, members, sum, unknown, states));
     }
     let weights: Vec<_> = entries
         .iter()
-        .map(|(_, _, weight, _)| Cell {
+        .map(|(_, _, weight, _, _)| Cell {
             node: None,
             weight: *weight,
         })
         .collect();
     let rectangles = squarify(&weights, RectF64::from_rect(result.content));
-    for (ordinal, ((name, members, known_sum, has_unknown), rect)) in
+    for (ordinal, ((name, members, known_sum, has_unknown, states), rect)) in
         entries.into_iter().zip(rectangles).enumerate()
     {
         result.placed.push(Placed {
@@ -504,6 +534,7 @@ pub fn layout_grouped(
             has_unknown,
             members,
             group_name: Some(name),
+            states,
         });
     }
     Ok(result)
@@ -794,6 +825,8 @@ fn place(
     } else {
         (None, rect)
     };
+    let mut states = [0_u32; 3];
+    states[coverage_class(entry)] = 1;
     Placed {
         node,
         rect,
@@ -803,6 +836,7 @@ fn place(
         has_unknown: totals.unknown > 0,
         members: Vec::new(),
         group_name: None,
+        states,
     }
 }
 

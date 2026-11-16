@@ -936,3 +936,126 @@ fn overflow_of_one_metric_does_not_poison_the_other() {
     );
     assert_eq!(allocated_overflow.len(), 3);
 }
+
+/// The coverage strip trusts a stored class per entry instead of re-reading it. A class that
+/// disagrees with the entry would show plausible but wrong counts, so this compares them after
+/// every mutation that can change one, and checks that an aggregate's recorded classes cover
+/// exactly its members.
+#[test]
+fn stored_coverage_classes_match_the_entry_and_cover_each_aggregate_member() {
+    let independent = |entry: &hogmap::index::Entry<'_>| match entry.state {
+        State::Partial | State::Inaccessible | State::Stale => 1,
+        State::Pending => 2,
+        State::Complete
+            if entry.kind == Kind::File
+                && (entry.sizes.logical.is_none() || entry.sizes.allocated.is_none()) =>
+        {
+            2
+        }
+        State::Complete => 0,
+    };
+    let mut index = Index::new("Fixture".into()).unwrap();
+    let root = index.root();
+    index.set_state(root, State::Complete).unwrap();
+    let folder = index
+        .insert(
+            root,
+            "folder".into(),
+            Kind::Directory,
+            Sizes::default(),
+            None,
+            State::Complete,
+        )
+        .unwrap();
+    let mut ids = Vec::new();
+    for (name, sizes, state) in [
+        (
+            "known.bin",
+            Sizes {
+                logical: Some(10),
+                allocated: Some(10),
+            },
+            State::Complete,
+        ),
+        (
+            "partial.bin",
+            Sizes {
+                logical: Some(10),
+                allocated: Some(10),
+            },
+            State::Pending,
+        ),
+        (
+            "unknown.bin",
+            Sizes {
+                logical: None,
+                allocated: None,
+            },
+            State::Complete,
+        ),
+        (
+            "zero.bin",
+            Sizes {
+                logical: Some(0),
+                allocated: Some(0),
+            },
+            State::Complete,
+        ),
+    ] {
+        ids.push(
+            index
+                .insert(folder, name.into(), Kind::File, sizes, None, state)
+                .unwrap(),
+        );
+    }
+    let check = |index: &Index| {
+        for (id, entry) in index.entries() {
+            assert_eq!(
+                usize::from(index.coverage_class_of(id)),
+                independent(&entry),
+                "stored class disagrees for {id:?} in state {:?}",
+                entry.state
+            );
+        }
+    };
+    check(&index);
+    for (id, state) in [
+        (ids[1], State::Complete),
+        (ids[0], State::Partial),
+        (ids[2], State::Inaccessible),
+        (ids[0], State::Stale),
+        (ids[3], State::Pending),
+        (ids[1], State::Complete),
+    ] {
+        index.set_state(id, state).unwrap();
+        check(&index);
+    }
+    // Every aggregate records the classes of exactly the entries it lists.
+    let layout = hogmap::treemap::layout(
+        &index,
+        folder,
+        hogmap::treemap::Rect::new(0.0, 0.0, 40.0, 40.0),
+        hogmap::treemap::LayoutParams {
+            min_pixel_area: 1_000_000.0,
+            header_height: 0.0,
+            max_depth: 2,
+        },
+    )
+    .unwrap();
+    let aggregate = layout
+        .placed
+        .iter()
+        .find(|cell| matches!(cell.node, hogmap::treemap::NodeRef::Aggregate { .. }))
+        .expect("the small files must be aggregated");
+    assert_eq!(
+        aggregate.states.iter().sum::<u32>() as usize,
+        aggregate.members.len()
+    );
+    for id in &aggregate.members {
+        let entry = index.get(*id).unwrap();
+        assert_eq!(
+            usize::from(index.coverage_class_of(*id)),
+            independent(&entry)
+        );
+    }
+}
