@@ -1,6 +1,6 @@
 use super::{HogMap, Location, Members, ScanRequest, text};
 use eframe::egui;
-use hogmap::index::{Index, Kind, State};
+use hogmap::index::{EntryId, Index, Kind, State};
 use hogmap::treemap::{Layout, NodeRef};
 use hogmap::{bookmarks, watch};
 
@@ -11,41 +11,53 @@ pub(super) struct Coverage {
     unknown: usize,
 }
 pub(super) fn coverage(index: &Index, layout: &Layout) -> Vec<Coverage> {
+    use std::collections::HashMap;
     let mut bands = Vec::<Coverage>::new();
-    let root = match layout.placed.first().map(|p| p.node) {
-        Some(NodeRef::Entry(id)) => id,
-        _ => index.root(),
+    // The layout lists a parent before its children, so one pass is enough: a cell's depth comes
+    // from its parent's, which was recorded earlier. Walking the index ancestry per entry instead
+    // cost more than the layout itself, because an aggregate can hold thousands of members.
+    let mut depths: HashMap<EntryId, usize> = HashMap::with_capacity(layout.placed.len());
+    let tally = |id: EntryId, band: &mut Coverage| {
+        let Some(entry) = index.get(id) else {
+            return;
+        };
+        match entry.state {
+            State::Partial | State::Inaccessible | State::Stale => band.partial += 1,
+            State::Pending => band.unknown += 1,
+            State::Complete
+                if entry.kind == Kind::File
+                    && (entry.sizes.logical.is_none() || entry.sizes.allocated.is_none()) =>
+            {
+                band.unknown += 1
+            }
+            State::Complete => band.complete += 1,
+        }
     };
     for cell in &layout.placed {
-        let ids = match cell.node {
-            NodeRef::Entry(id) => vec![id],
-            _ => cell.members.clone(),
-        };
-        for id in ids {
-            let mut depth = 0usize;
-            let mut next = id;
-            while next != root && depth < super::SAFETY_DEPTH {
-                let Some(parent) = index.get(next).and_then(|e| e.parent) else {
-                    break;
-                };
-                next = parent;
-                depth += 1;
+        let depth = match cell.node {
+            NodeRef::Entry(id) => {
+                let parent = index.get(id).and_then(|entry| entry.parent);
+                parent
+                    .and_then(|parent| depths.get(&parent).copied())
+                    .map_or(0, |parent_depth| parent_depth + 1)
             }
-            bands.resize(bands.len().max(depth + 1), Coverage::default());
-            let Some(entry) = index.get(id) else {
-                continue;
-            };
-            let band = &mut bands[depth];
-            match entry.state {
-                State::Partial | State::Inaccessible | State::Stale => band.partial += 1,
-                State::Pending => band.unknown += 1,
-                State::Complete
-                    if entry.kind == Kind::File
-                        && (entry.sizes.logical.is_none() || entry.sizes.allocated.is_none()) =>
-                {
-                    band.unknown += 1
+            // An aggregate or a group sits at its parent's child level, and so do its members.
+            NodeRef::Aggregate { parent } | NodeRef::Group { parent, .. } => {
+                depths.get(&parent).copied().map_or(1, |depth| depth + 1)
+            }
+        };
+        // One resize per cell, not per member: an aggregate can hold thousands of them.
+        bands.resize(bands.len().max(depth + 1), Coverage::default());
+        match cell.node {
+            NodeRef::Entry(id) => {
+                depths.insert(id, depth);
+                tally(id, &mut bands[depth]);
+            }
+            _ => {
+                let band = &mut bands[depth];
+                for &id in &cell.members {
+                    tally(id, band);
                 }
-                State::Complete => band.complete += 1,
             }
         }
     }

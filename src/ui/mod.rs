@@ -106,6 +106,16 @@ struct VolumeMap {
     cells: Vec<composition::VolumeCell>,
 }
 
+/// Where a map rebuild spends its time. The total is already kept in `last_layout_cost`; this
+/// splits it so a slow rebuild can be attributed instead of guessed at. The benchmark reads it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RebuildBreakdown {
+    pub filter: Duration,
+    pub layout: Duration,
+    pub coverage: Duration,
+    pub prepare: Duration,
+}
+
 struct Cache {
     key: ViewKey,
     layout: Layout,
@@ -275,6 +285,7 @@ pub struct HogMap {
     layout_failure: Option<LayoutFailure>,
     pub(crate) last_layout: Option<Instant>,
     pub(crate) last_layout_cost: Duration,
+    pub(crate) last_rebuild: RebuildBreakdown,
     paint_dashes: Vec<egui::Shape>,
     last_tick: Option<Instant>,
     backlog_ticks: usize,
@@ -397,6 +408,7 @@ impl HogMap {
             layout_failure: None,
             last_layout: None,
             last_layout_cost: Duration::ZERO,
+            last_rebuild: RebuildBreakdown::default(),
             paint_dashes: Vec::new(),
             last_tick: None,
             backlog_ticks: 0,
@@ -2305,7 +2317,12 @@ impl HogMap {
         let mut rebuild_started = None;
         if dirty && (self.receiver.is_none() || due || switched || self.filter_changed) {
             rebuild_started = Some(Instant::now());
+            // A rebuild that returns early or fails must not report the phases of the previous
+            // one: an unmeasured phase is zero, not stale.
+            self.last_rebuild = RebuildBreakdown::default();
+            let phase = Instant::now();
             let results = self.filter.match_results(index);
+            self.last_rebuild.filter = phase.elapsed();
             let filter_totals = self.geometry_filter.then(|| {
                 text::filter_totals(
                     results.totals(index, self.metric),
@@ -2400,6 +2417,7 @@ impl HogMap {
             {
                 location_label.push_str(&format!(" / {name}"));
             }
+            let phase = Instant::now();
             let result = if self.grouping != GroupBy::None && location.members.is_none() {
                 treemap::layout_grouped(
                     index,
@@ -2433,6 +2451,7 @@ impl HogMap {
                     None => treemap::layout_with_metric(index, root, rect, params, self.metric),
                 }
             };
+            self.last_rebuild.layout = phase.elapsed();
             // A single map is cached: the previous one is dropped once this one replaces it, and
             // only its highlight results can carry over.
             let previous = self.cache.take();
@@ -2452,9 +2471,12 @@ impl HogMap {
                     // metric or the location, so they are reused while both are unchanged.
                     let match_counts = (results.matched_files, results.unknown_files);
                     let matches = results.matches;
+                    let coverage_phase = Instant::now();
+                    let coverage = live::coverage(index, &layout);
+                    self.last_rebuild.coverage = coverage_phase.elapsed();
                     self.cache = Some(Cache {
                         key,
-                        coverage: live::coverage(index, &layout),
+                        coverage,
                         layout,
                         cells: Vec::new(),
                         matches,
@@ -2512,6 +2534,7 @@ impl HogMap {
         };
         let tree_area = paint::rect(cache.key.rect);
         let probe = paint::font_probe(ui);
+        let prepare_phase = Instant::now();
         if cache
             .paint
             .as_ref()
@@ -2553,6 +2576,9 @@ impl HogMap {
                 }
             }
             cache.paint = None;
+        }
+        if rebuild_started.is_some() {
+            self.last_rebuild.prepare = prepare_phase.elapsed();
         }
         // The cell controls below cover the map, so its own response is not hovered; ask whether
         // the pointer is over the map layer instead.

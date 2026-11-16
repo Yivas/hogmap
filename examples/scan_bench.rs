@@ -1522,6 +1522,8 @@ fn live_frame_bench(reducer: ScanReducer) -> Result<(), &'static str> {
     let mut rebuilds = Vec::new();
     let mut ordinary_drains = Vec::new();
     let mut rebuild_drains = Vec::new();
+    // Where each rebuild spent its time, so a slow one can be attributed instead of guessed at.
+    let mut rebuild_phases: Vec<(f64, f64, f64, f64)> = Vec::new();
     let mut drain_over8 = 0;
     let mut drain_over12 = 0;
     let mut over8 = 0;
@@ -1557,6 +1559,13 @@ fn live_frame_bench(reducer: ScanReducer) -> Result<(), &'static str> {
         if app.last_layout != previous {
             rebuilds.push(sample);
             rebuild_drains.push(drain_sample);
+            let phases = app.last_rebuild;
+            rebuild_phases.push((
+                phases.filter.as_secs_f64() * 1000.0,
+                phases.layout.as_secs_f64() * 1000.0,
+                phases.coverage.as_secs_f64() * 1000.0,
+                phases.prepare.as_secs_f64() * 1000.0,
+            ));
         } else {
             ordinary.push(sample);
             ordinary_drains.push(drain_sample);
@@ -1589,6 +1598,20 @@ fn live_frame_bench(reducer: ScanReducer) -> Result<(), &'static str> {
     );
     if !ordinary_drains.is_empty() {
         report_frames("stream_ordinary_drain_only", &ordinary_drains);
+    }
+    if !rebuild_phases.is_empty() {
+        let median = |mut values: Vec<f64>| {
+            values.sort_by(f64::total_cmp);
+            values[values.len() / 2]
+        };
+        println!(
+            "stream_rebuild_phases n={} filter_median_ms={:.3} layout_median_ms={:.3} coverage_median_ms={:.3} prepare_median_ms={:.3}",
+            rebuild_phases.len(),
+            median(rebuild_phases.iter().map(|phase| phase.0).collect()),
+            median(rebuild_phases.iter().map(|phase| phase.1).collect()),
+            median(rebuild_phases.iter().map(|phase| phase.2).collect()),
+            median(rebuild_phases.iter().map(|phase| phase.3).collect()),
+        );
     }
     if !rebuild_drains.is_empty() {
         report_frames("stream_rebuild_drain_only", &rebuild_drains);
