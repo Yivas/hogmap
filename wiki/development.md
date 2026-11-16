@@ -165,6 +165,19 @@ Local Windows release observations, 2026-11-11, one machine and labelled synthet
 
 The final stream had 95 ticks, 23 map/mesh rebuilds (3.621 Hz), 10 drains above 8 ms and one above 12 ms. Ordinary drain-only p95/max were 8.819/11.967 ms. The normal 6 ms target cannot preempt a single allocation. Stable rendering did not reach 1 ms: measured UI work was 0.417 ms and tessellation 0.844 ms, with 3069 shapes/49980 vertices. Growth rebuild mean 15.708 ms was slightly worse than 14.047 ms before caching; cached drawing saves ordinary work but adds preparation cost. No native CPU/GPU, driver, DPI or frame-rate guarantee follows.
 
+Local Windows release observations, 2026-11-16, same machine and labelled synthetic data, after the coverage and drawn-depth work. Two recorded runs, before and after the second change:
+
+| Measurement, median | Before | After |
+|---|---:|---:|
+| Coverage per rebuild |31.926ms|0.134ms|
+| Layout per rebuild |8.677ms|15.121ms|
+| Rebuild drain+frame |60.315ms|35.801ms|
+| Rebuild drain+frame p95 |101.829ms|72.125ms|
+
+The coverage strip no longer walks an aggregate's members: each placed cell records how many entries it stands for of each class while the layout already visits them. That moved work rather than deleting it, so the layout grew and the strip became free; the rebuild as a whole is still faster. Ordinary drain+frame during the stream measured 9.624 ms before and 9.740 ms after, so the visible cost is the rebuild, not the idle frame.
+
+Treat small differences with care: these figures come from two recorded runs, not from a controlled A/B, so a change of a few milliseconds would need an interleaved comparison of many samples before it could be attributed.
+
 A separate opt-in `HOGMAP_BENCH_EXTRA=1` with `--synthetic-million` measures complete/incomplete terminals and a 3.8M-entry memory fixture, without filesystem scanning. Allow adequate memory before using it. With 1001 omitted directory outcomes, the terminal took 7.317 ms and the following rebuild 19.283 ms; the complete case took 0.183/17.896 ms. At 1M, index plus layout/filter capacities were 280107648 bytes. At 3.8M they were 1120194368 bytes, with peak process working set 1111777280 bytes: **above 500 MiB**, whose orientative target was for 1M, not a whole-volume guarantee. Each of 64 identity shards grew 16 times; the slowest growing insertion was 5.425 ms, an upper bound including the whole insertion, not a pure rehash timer.
 
 The private identity ledger is sharded, batches resume through a deadline-checked cursor, and layout storage grows amortized. These preserve existing accounting and ordering tests; they do not bound total scan memory. Native visual, screen-reader and DPI acceptance remain separate.
