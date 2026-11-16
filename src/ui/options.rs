@@ -7,6 +7,9 @@ pub(super) struct Options {
     pub minimum_area: f32,
     pub header_height: f32,
     pub group_small: bool,
+    /// Levels drawn below the current root. Depth is relative to the zoom, so opening a folder
+    /// shows that folder's own levels instead of the remaining ones of the whole tree.
+    pub depth_levels: usize,
 }
 impl Default for Options {
     fn default() -> Self {
@@ -14,6 +17,9 @@ impl Default for Options {
             minimum_area: 400.0,
             header_height: 20.0,
             group_small: true,
+            // Three levels keep a folder readable at a glance; deeper content stays reachable by
+            // opening the folder instead of tiling every descendant into unreadable slivers.
+            depth_levels: 3,
         }
     }
 }
@@ -23,6 +29,7 @@ impl Options {
             && (1.0..=1_000_000.0).contains(&self.minimum_area)
             && self.header_height.is_finite()
             && (0.0..=64.0).contains(&self.header_height)
+            && (1..=SAFETY_DEPTH).contains(&self.depth_levels)
     }
     pub fn params(self, flat: bool) -> LayoutParams {
         LayoutParams {
@@ -33,7 +40,7 @@ impl Options {
                 f32::MIN_POSITIVE
             },
             header_height: self.header_height,
-            max_depth: if flat { 1 } else { SAFETY_DEPTH },
+            max_depth: if flat { 1 } else { self.depth_levels },
         }
     }
 }
@@ -72,6 +79,15 @@ impl HogMap {
                     egui::DragValue::new(&mut options.header_height)
                         .range(0.0..=64.0)
                         .suffix(" px"),
+                )
+                .labelled_by(label.id);
+            });
+            ui.horizontal(|ui| {
+                let label = ui.label(text::DEPTH_LEVELS);
+                ui.add(
+                    egui::DragValue::new(&mut options.depth_levels)
+                        .range(1..=SAFETY_DEPTH)
+                        .suffix(" levels"),
                 )
                 .labelled_by(label.id);
             });
@@ -160,7 +176,8 @@ mod tests {
         assert!(app.set_options(Options {
             minimum_area: 1_000_000.0,
             header_height: 0.0,
-            group_small: true
+            group_small: true,
+            depth_levels: 3,
         }));
         draw(&mut app);
         assert_eq!(app.cache.as_ref().unwrap().layout.placed.len(), 2);

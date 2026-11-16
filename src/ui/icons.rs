@@ -35,6 +35,50 @@ impl Icon {
     }
 }
 
+/// A labelled switch for a drawing option. It owns the value it shows: the click is applied
+/// before painting, so the frame that reports `Clicked` already shows and announces the new
+/// state instead of the one it is replacing.
+pub fn toggle(ui: &mut egui::Ui, label: &str, on: &mut bool, tooltip: &str) -> Response {
+    let palette = Theme::current(ui.ctx()).palette();
+    let galley = ui.painter().layout_no_wrap(
+        label.to_owned(),
+        egui::FontId::proportional(13.0),
+        palette.icon,
+    );
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(12.0 + galley.size().x, 32.0), Sense::click());
+    if response.clicked() {
+        *on = !*on;
+    }
+    let on = *on;
+    let hover = ui
+        .ctx()
+        .animate_bool_with_time(response.id.with("hover"), response.hovered(), 0.1);
+    let mut fill = palette.chrome.lerp_to_gamma(palette.tool_hover, hover);
+    if on {
+        fill = palette.tool_selected;
+    }
+    ui.painter().rect_filled(rect, 3, fill);
+    if on {
+        ui.painter().rect_stroke(
+            rect.shrink(0.5),
+            3,
+            Stroke::new(1.0, palette.accent),
+            StrokeKind::Inside,
+        );
+    }
+    ui.painter().galley(
+        egui::pos2(rect.left() + 6.0, rect.center().y - galley.size().y / 2.0),
+        galley,
+        palette.icon,
+    );
+    if response.has_focus() {
+        paint::focus_ring(ui.painter(), rect.shrink(1.0), palette);
+    }
+    response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Button, true, on, label));
+    response.on_hover_text(tooltip)
+}
+
 pub fn button(
     ui: &mut egui::Ui,
     icon: Icon,

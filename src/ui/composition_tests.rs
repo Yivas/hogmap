@@ -596,6 +596,78 @@ fn live_volume_cells_have_independent_known_bytes_and_authoritative_final_eligib
                         egui::Rect::from_min_size(egui::Pos2::ZERO, size).contains_rect(cell.rect)
                     );
                 }
+                // The two switches hide their own cell and give the space back to the tree. The
+                // header keeps reporting every figure, so this is a drawing choice, not a
+                // reclassification of the bytes.
+                let parts = |app: &HogMap| {
+                    app.volume_map
+                        .as_ref()
+                        .unwrap()
+                        .cells
+                        .iter()
+                        .map(|cell| cell.part)
+                        .collect::<Vec<_>>()
+                };
+                // A running scan draws Free and the estimate; the storage reserve keeps its
+                // allocated/Finished gate, so it has no cell yet.
+                assert_eq!(parts(&app), vec![Some(composition::VolumePart::Free), None]);
+                // Every accessible string, whatever role egui gives it: a helper that only
+                // looked at one field could pass without ever seeing this text.
+                fn accessible_text(output: &egui::FullOutput) -> Vec<String> {
+                    output
+                        .platform_output
+                        .accesskit_update
+                        .as_ref()
+                        .expect("headless accessibility enabled")
+                        .nodes
+                        .iter()
+                        .filter_map(|(_, node)| node.label().or_else(|| node.value()))
+                        .map(str::to_owned)
+                        .collect()
+                }
+                fn estimate(output: &egui::FullOutput) -> bool {
+                    accessible_text(output)
+                        .iter()
+                        .any(|text| text.starts_with("Not yet scanned · estimate"))
+                }
+                // The check below only means something if the text is reachable while the cell is
+                // drawn, so that is asserted first.
+                assert!(estimate(&output), "the visible estimate must be reachable");
+                // Hiding a cell must give its space back to the tree, not leave a hole, and it
+                // must not move a single byte of the accounting.
+                let tree_area = |app: &HogMap| app.cache.as_ref().unwrap().layout.root.width;
+                let known = |app: &HogMap| {
+                    app.reducer
+                        .index()
+                        .unwrap()
+                        .summary_for(SizeMetric::Logical)
+                        .unwrap()
+                        .known_bytes
+                };
+                let wide_tree = tree_area(&app);
+                let bytes_before = known(&app);
+                app.show_free = false;
+                app.last_layout = None;
+                desktop_frame(&context, &mut app, size, Vec::new());
+                assert_eq!(parts(&app), vec![None]);
+                assert!(
+                    tree_area(&app) > wide_tree,
+                    "the tree must take back the space of the hidden cell"
+                );
+                assert_eq!(known(&app), bytes_before, "hiding a cell changes no byte");
+                app.show_pending = false;
+                app.last_layout = None;
+                let output = desktop_frame(&context, &mut app, size, Vec::new());
+                assert!(parts(&app).is_empty());
+                assert!(
+                    !estimate(&output),
+                    "a hidden estimate must not stay reachable in the accessibility tree"
+                );
+                app.show_free = true;
+                app.show_pending = true;
+                app.last_layout = None;
+                desktop_frame(&context, &mut app, size, Vec::new());
+                assert_eq!(parts(&app), vec![Some(composition::VolumePart::Free), None]);
                 app.volume.as_mut().unwrap().total_bytes = None;
                 app.version += 1;
                 app.last_layout = None;
@@ -775,6 +847,12 @@ fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
                     )
                     .unwrap();
             }
+            // The default depth stops above this leaf, so raise it first: the test is about the
+            // controls, not about where the default lands.
+            assert!(app.set_options(options::Options {
+                depth_levels: 8,
+                ..app.options
+            }));
             for _ in 0..3 {
                 desktop_frame(&context, &mut app, size, Vec::new());
             }
@@ -797,11 +875,11 @@ fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
             };
             desktop_frame(&context, &mut app, size, vec![key(Key::Minus)]);
             desktop_frame(&context, &mut app, size, vec![key(Key::Minus)]);
-            assert_eq!(app.options.minimum_area, DETAIL_AREAS[0]);
+            assert_eq!(app.options.depth_levels, 6);
             assert!(app.cache.as_ref().unwrap().layout.placed.len() < detailed);
             desktop_frame(&context, &mut app, size, vec![key(Key::Plus)]);
             desktop_frame(&context, &mut app, size, vec![key(Key::Equals)]);
-            assert_eq!(app.options.minimum_area, DETAIL_AREAS[2]);
+            assert_eq!(app.options.depth_levels, 8);
             assert_eq!(app.cache.as_ref().unwrap().layout.placed.len(), detailed);
             let output = desktop_frame(&context, &mut app, size, Vec::new());
             let more = output
@@ -836,16 +914,19 @@ fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
                     ],
                 );
             }
-            assert_eq!(app.options.minimum_area, DETAIL_AREAS[3]);
-            for _ in 0..10 {
-                app.change_detail(true);
+            assert_eq!(app.options.depth_levels, 9);
+            // Both ends of the range are real limits, not presets that silently stop applying.
+            for _ in 0..100 {
+                app.change_depth(false);
             }
-            assert_eq!(app.options.minimum_area, DETAIL_AREAS[4]);
-            for _ in 0..10 {
-                app.change_detail(false);
+            assert_eq!(app.options.depth_levels, 1);
+            assert!(!app.can_change_depth(false));
+            for _ in 0..100 {
+                app.change_depth(true);
             }
-            assert_eq!(app.options.minimum_area, DETAIL_AREAS[0]);
-            app.change_detail(true);
+            assert_eq!(app.options.depth_levels, SAFETY_DEPTH);
+            assert!(!app.can_change_depth(true));
+            app.change_depth(false);
             // Move away from controls and allow egui's finite hover animation to settle.
             let _ = desktop_frame(&context, &mut app, size, vec![egui::Event::PointerGone]);
             let mut output = desktop_frame(&context, &mut app, size, Vec::new());
@@ -876,42 +957,26 @@ fn detail_controls_rebuild_deep_trees_without_saving_and_idle_does_not_poll() {
 }
 
 #[test]
-fn detail_steps_follow_the_area_in_effect_after_options_writes_a_custom_value() {
+fn depth_steps_are_independent_from_the_minimum_cell_area() {
     let context = egui::Context::default();
     let mut app = app(&context);
-    // The level was 2048 before Options wrote 300. Stepping through the preset index instead of
-    // the area in effect would raise that 300 to 400 on "more detail".
-    app.change_detail(false);
-    assert_eq!(app.options.minimum_area, 2048.0);
+    let area = app.options.minimum_area;
+    app.change_depth(true);
+    assert_eq!(app.options.depth_levels, 4);
+    // Depth is its own control: stepping it must not move the area Options edits.
+    assert_eq!(app.options.minimum_area, area);
+    app.change_depth(false);
+    assert_eq!(app.options.depth_levels, 3);
+    assert_eq!(app.options.minimum_area, area);
+    // A custom area survives depth steps in both directions.
     assert!(app.set_options(options::Options {
         minimum_area: 300.0,
         ..app.options
     }));
-    assert_eq!(app.next_detail_area(true), Some(250.0));
-    assert_eq!(app.next_detail_area(false), Some(400.0));
-    app.change_detail(true);
-    assert_eq!(app.options.minimum_area, 250.0);
-    app.change_detail(false);
-    assert_eq!(app.options.minimum_area, 400.0);
-    // Below the smallest preset there is no more detail to add, so the action is disabled.
-    assert!(app.set_options(options::Options {
-        minimum_area: 100.0,
-        ..app.options
-    }));
-    assert!(!app.can_change_detail(true));
-    assert!(app.can_change_detail(false));
-    app.change_detail(true);
-    assert_eq!(app.options.minimum_area, 100.0);
-    // Above the largest preset there is no less detail to remove.
-    assert!(app.set_options(options::Options {
-        minimum_area: 5000.0,
-        ..app.options
-    }));
-    assert!(app.can_change_detail(true));
-    assert!(!app.can_change_detail(false));
-    app.change_detail(false);
-    assert_eq!(app.options.minimum_area, 5000.0);
-    assert_eq!(app.next_detail_area(true), Some(4096.0));
+    app.change_depth(true);
+    app.change_depth(false);
+    assert_eq!(app.options.minimum_area, 300.0);
+    assert_eq!(app.options.depth_levels, 3);
 }
 
 /// A root with one file per class: grouping by class gives audio[0], documents[1], images[2].

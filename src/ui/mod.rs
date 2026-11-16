@@ -44,10 +44,8 @@ const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
 const STATUS_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(67);
 const DRAIN_BUDGET: Duration = Duration::from_millis(6);
-// Detail controls area, not a two-level stop. The depth bound is only a safety limit;
-// deeper folders remain navigable without recursively growing the rendered tree forever.
-// Listed from least to most detail, so "more detail" is the next smaller preset.
-const DETAIL_AREAS: [f32; 5] = [4096.0, 2048.0, 400.0, 250.0, 156.25];
+// The depth bound is only a safety limit; deeper folders remain navigable without recursively
+// growing the rendered tree forever.
 const SAFETY_DEPTH: usize = 64;
 // Hold a close request this long so returning threads can finish; then detach the rest.
 const CLOSE_GRACE: Duration = Duration::from_secs(2);
@@ -98,6 +96,9 @@ struct ViewKey {
     flat: bool,
     grouping: GroupBy,
     options: options::Options,
+    // Part of the drawing, so a switch must invalidate the cached map like any other view change.
+    show_free: bool,
+    show_pending: bool,
 }
 
 struct VolumeMap {
@@ -132,8 +133,8 @@ struct StatusKey {
     candidates: usize,
     terminal: Option<Terminal>,
     observed: bool,
-    /// The detail actions write the minimum area here, so an explicit detail change is an options
-    /// change and still refreshes the status immediately.
+    /// The detail actions change the drawn depth, which lives in the options, so an explicit
+    /// detail change is an options change and still refreshes the status immediately.
     options: options::Options,
     viewport: egui::Vec2,
 }
@@ -258,6 +259,10 @@ pub struct HogMap {
     grouping: GroupBy,
     options: options::Options,
     options_open: bool,
+    // Volume cells are part of the drawing, not of the accounting: hiding one changes neither the
+    // index nor the totals, and both are session-only like the other view controls.
+    show_free: bool,
+    show_pending: bool,
     show_ghosts: bool,
     ghost_baseline: Option<hogmap::ghosts::Baseline>,
     ghosts: hogmap::ghosts::Ghosts,
@@ -380,6 +385,8 @@ impl HogMap {
             grouping: GroupBy::None,
             options: options::Options::default(),
             options_open: false,
+            show_free: true,
+            show_pending: true,
             show_ghosts: false,
             ghost_baseline: None,
             ghosts: hogmap::ghosts::Ghosts::default(),
@@ -1057,32 +1064,27 @@ impl HogMap {
         self.selected = None;
     }
 
-    /// The next preset strictly below (more detail) or above (less detail) the minimum area that
-    /// Options edits. Options accepts any area, so the presets are steps from wherever the area
-    /// is now; stepping through an index would raise the area on "more detail" after a custom
-    /// value.
-    fn next_detail_area(&self, more: bool) -> Option<f32> {
-        let area = self.options.minimum_area;
+    /// One more or one fewer level drawn below the current root. Depth is separate from the
+    /// minimum cell area: area decides which cells are worth drawing, depth decides how far the
+    /// map descends, so a folder shows readable blocks instead of every descendant at once.
+    fn can_change_depth(&self, more: bool) -> bool {
         if more {
-            DETAIL_AREAS.iter().copied().find(|preset| *preset < area)
+            self.options.depth_levels < SAFETY_DEPTH
         } else {
-            DETAIL_AREAS
-                .iter()
-                .rev()
-                .copied()
-                .find(|preset| *preset > area)
+            self.options.depth_levels > 1
         }
     }
 
-    fn can_change_detail(&self, more: bool) -> bool {
-        self.next_detail_area(more).is_some()
-    }
-
-    fn change_detail(&mut self, more: bool) {
-        if let Some(area) = self.next_detail_area(more) {
-            self.options.minimum_area = area;
-            self.last_layout = None;
+    fn change_depth(&mut self, more: bool) {
+        if !self.can_change_depth(more) {
+            return;
         }
+        self.options.depth_levels = if more {
+            self.options.depth_levels + 1
+        } else {
+            self.options.depth_levels - 1
+        };
+        self.last_layout = None;
     }
 
     fn can_zoom(&self) -> bool {
@@ -1279,10 +1281,10 @@ impl HogMap {
                 || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Plus)
                 || input.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Equals)
         }) {
-            self.change_detail(true);
+            self.change_depth(true);
         }
         if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::Minus)) {
-            self.change_detail(false);
+            self.change_depth(false);
         }
         // Same gate as View → Rescan this folder: without a scan it would start the sample.
         if context.input_mut(|input| input.consume_key(Modifiers::CTRL, Key::F5))
@@ -1413,22 +1415,41 @@ impl HogMap {
                     ui.separator();
                     if ui
                         .add_enabled(
-                            self.can_change_detail(true),
+                            self.can_change_depth(true),
                             egui::Button::new(text::MORE_DETAIL).shortcut_text("Ctrl++"),
                         )
                         .clicked()
                     {
-                        self.change_detail(true);
+                        self.change_depth(true);
                         ui.close();
                     }
                     if ui
                         .add_enabled(
-                            self.can_change_detail(false),
+                            self.can_change_depth(false),
                             egui::Button::new(text::LESS_DETAIL).shortcut_text("Ctrl+-"),
                         )
                         .clicked()
                     {
-                        self.change_detail(false);
+                        self.change_depth(false);
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui
+                        .add(egui::Button::new(text::SHOW_FREE).selected(self.show_free))
+                        .on_hover_text(text::SHOW_FREE_TIP)
+                        .clicked()
+                    {
+                        self.show_free = !self.show_free;
+                        self.last_layout = None;
+                        ui.close();
+                    }
+                    if ui
+                        .add(egui::Button::new(text::SHOW_PENDING).selected(self.show_pending))
+                        .on_hover_text(text::SHOW_PENDING_TIP)
+                        .clicked()
+                    {
+                        self.show_pending = !self.show_pending;
+                        self.last_layout = None;
                         ui.close();
                     }
                     ui.separator();
@@ -1525,7 +1546,7 @@ impl HogMap {
             });
             ui.separator();
             ui.horizontal(|ui| {
-                use icons::{Icon, button};
+                use icons::{Icon, button, toggle};
                 if button(ui, Icon::NewScan, true, false, text::NEW_SCAN_TIP).clicked() {
                     self.chooser.reopen();
                 }
@@ -1580,24 +1601,24 @@ impl HogMap {
                 if button(
                     ui,
                     Icon::MoreDetail,
-                    self.can_change_detail(true),
+                    self.can_change_depth(true),
                     false,
                     text::MORE_DETAIL_TIP,
                 )
                 .clicked()
                 {
-                    self.change_detail(true);
+                    self.change_depth(true);
                 }
                 if button(
                     ui,
                     Icon::LessDetail,
-                    self.can_change_detail(false),
+                    self.can_change_depth(false),
                     false,
                     text::LESS_DETAIL_TIP,
                 )
                 .clicked()
                 {
-                    self.change_detail(false);
+                    self.change_depth(false);
                 }
                 ui.separator();
                 if button(
@@ -1619,6 +1640,29 @@ impl HogMap {
                         || self.resolution.active());
                 if button(ui, Icon::Stop, can_stop, false, text::STOP_TIP).clicked() {
                     self.cancel();
+                }
+                ui.separator();
+                // Both cells belong to the drawing, so the switches sit with the other view
+                // controls and repeat in View with the same state.
+                if toggle(
+                    ui,
+                    text::SHOW_FREE,
+                    &mut self.show_free,
+                    text::SHOW_FREE_TIP,
+                )
+                .clicked()
+                {
+                    self.last_layout = None;
+                }
+                if toggle(
+                    ui,
+                    text::SHOW_PENDING,
+                    &mut self.show_pending,
+                    text::SHOW_PENDING_TIP,
+                )
+                .clicked()
+                {
+                    self.last_layout = None;
                 }
                 ui.separator();
                 if button(
@@ -2238,6 +2282,8 @@ impl HogMap {
             flat: self.flat,
             grouping: self.grouping,
             options: self.options,
+            show_free: self.show_free,
+            show_pending: self.show_pending,
         };
         let shown = self.volume_map.as_ref().map(|map| &map.key);
         let dirty = shown != Some(&key) || (self.geometry_filter && self.filter_changed);
@@ -2250,6 +2296,8 @@ impl HogMap {
                 || shown.flat != key.flat
                 || shown.grouping != key.grouping
                 || shown.options != key.options
+                || shown.show_free != key.show_free
+                || shown.show_pending != key.show_pending
         });
         let due = self.last_layout.is_none_or(|last| {
             last.elapsed() >= LAYOUT_INTERVAL.max(self.last_layout_cost.saturating_mul(4))
@@ -2276,21 +2324,29 @@ impl HogMap {
                 visible.detail,
                 text::composition_status(&evaluation, allocated)
             );
+            // Hiding a cell removes its rectangle instead of leaving a hole: the tree takes the
+            // space back. The header keeps reporting every figure, so nothing is hidden from the
+            // accounting, only from the drawing.
+            let hidden = self.geometry_filter || self.ghosts.count > 0;
+            let components = if hidden {
+                hogmap::composition::VolumeComponents {
+                    free_bytes: None,
+                    reserve_bytes: None,
+                }
+            } else {
+                hogmap::composition::VolumeComponents {
+                    free_bytes: visible.components.free_bytes.filter(|_| self.show_free),
+                    reserve_bytes: visible.components.reserve_bytes,
+                }
+            };
             let (tree_area, volume_cells) = composition::arrange(
                 area,
                 apparent.unwrap_or(0),
-                if self.geometry_filter || self.ghosts.count > 0 {
-                    hogmap::composition::VolumeComponents {
-                        free_bytes: None,
-                        reserve_bytes: None,
-                    }
-                } else {
-                    visible.components
-                },
-                if self.geometry_filter || self.ghosts.count > 0 {
+                components,
+                if hidden {
                     None
                 } else {
-                    visible.pending_bytes
+                    visible.pending_bytes.filter(|_| self.show_pending)
                 },
                 &detail,
             );
@@ -2964,7 +3020,7 @@ mod tests {
             LayoutParams {
                 min_pixel_area: app.options.minimum_area,
                 header_height: 20.0,
-                max_depth: SAFETY_DEPTH,
+                max_depth: app.options.depth_levels,
             },
             SizeMetric::Allocated,
         )
@@ -3021,7 +3077,7 @@ mod tests {
             LayoutParams {
                 min_pixel_area: 1.0,
                 header_height: 20.0,
-                max_depth: SAFETY_DEPTH,
+                max_depth: app.options.depth_levels,
             },
             SizeMetric::Allocated,
         )
