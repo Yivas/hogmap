@@ -178,6 +178,14 @@ The coverage strip no longer walks an aggregate's members: each placed cell reco
 
 Treat small differences with care: these figures come from two recorded runs, not from a controlled A/B, so a change of a few milliseconds would need an interleaved comparison of many samples before it could be attributed.
 
+Comparing two builds on one machine:
+
+1. Build both, keep both binaries, and run them alternately rather than all of one then all of the other, so a slow period affects both sides.
+2. Discard the first run of each side as warm-up, then take at least ten runs per side on the same fixture and the same power plan.
+3. Compare the median and the minimum. The minimum is the steadier figure for a CPU-bound step; the median still shows what a typical run costs.
+4. Decide with a stated rule, per metric: take the spread of each build as its maximum minus its minimum over the retained runs, and report the change only when the difference between the two medians is larger than the larger of those two spreads. Keep the minimum as a diagnostic figure, not as the deciding one. If the difference does not clear that threshold, the result is inconclusive, and it is written down that way next to the numbers.
+5. Keep the raw output of both sides beside the comparison and name the exact command, so a later session can repeat it instead of trusting a summary.
+
 A separate opt-in `HOGMAP_BENCH_EXTRA=1` with `--synthetic-million` measures complete/incomplete terminals and a 3.8M-entry memory fixture, without filesystem scanning. Allow adequate memory before using it. With 1001 omitted directory outcomes, the terminal took 7.317 ms and the following rebuild 19.283 ms; the complete case took 0.183/17.896 ms. At 1M, index plus layout/filter capacities were 280107648 bytes. At 3.8M they were 1120194368 bytes, with peak process working set 1111777280 bytes: **above 500 MiB**, whose orientative target was for 1M, not a whole-volume guarantee. Each of 64 identity shards grew 16 times; the slowest growing insertion was 5.425 ms, an upper bound including the whole insertion, not a pure rehash timer.
 
 The private identity ledger is sharded, batches resume through a deadline-checked cursor, and layout storage grows amortized. These preserve existing accounting and ordering tests; they do not bound total scan memory. Native visual, screen-reader and DPI acceptance remain separate.
