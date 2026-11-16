@@ -619,6 +619,17 @@ impl Index {
         !self.authoritative_sizes.is_empty()
     }
 
+    /// Whether this identity carries a verified correction.
+    ///
+    /// A layout that charges corrections to the first entry of an identity only has to track
+    /// first-entry order for the identities this answers true for: for every other identity the
+    /// correction is absent, so the first entry and each later alias both contribute their listed
+    /// size and the order makes no difference.
+    pub(crate) fn has_correction(&self, identity: FileIdentity) -> bool {
+        self.authoritative_sizes
+            .contains_key(&StoredIdentity::from(identity))
+    }
+
     pub(crate) fn all_entries_complete(&self) -> bool {
         self.incomplete_entries == 0
     }

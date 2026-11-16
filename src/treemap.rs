@@ -726,14 +726,17 @@ fn subtree_totals(
     if corrected {
         // Corrections belong to the first known insertion-order charge, even when excluded.
         // A reverse identity set would move them to the last alias and change its geometry.
+        // Only a corrected identity needs that order: without a correction the first entry and
+        // every later alias contribute their listed size alike, so tracking them would change
+        // nothing and cost one set insert per file.
         let mut seen_identities: HashSet<FileIdentity> = HashSet::new();
         for (id, entry) in index.entries() {
             let known_sum = if entry.kind == Kind::File {
                 metric.of(entry.sizes).map_or(0, |listed| {
-                    if entry
-                        .identity
-                        .is_none_or(|identity| seen_identities.insert(identity))
-                    {
+                    let corrected_first = entry.identity.is_some_and(|identity| {
+                        index.has_correction(identity) && seen_identities.insert(identity)
+                    });
+                    if corrected_first {
                         index
                             .effective_size(&entry, metric)
                             .expect("known listed size")
