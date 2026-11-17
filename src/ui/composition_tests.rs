@@ -1780,11 +1780,10 @@ fn whole_volume_cells_share_the_tree_scale_without_d_or_file_actions() {
         let mut drawn_width = rect.width;
         for node in cells {
             let name = node.label().or(node.value()).unwrap();
-            assert!(name.contains("Not a file; no file actions"));
-            assert!(name.contains("Not a complete disk partition"));
-            assert!(name.contains("Estimated difference (not drawn): before 400 B, after 350 B"));
-            assert!(name.contains("Uses unique allocated bytes: 500 B"));
-            assert!(name.contains("Repeated hard-link names (apparent − unique): 200 B"));
+            assert!(name.to_ascii_lowercase().contains("not a file"));
+            // The long accounting explanation moved to the status detail; the cell tooltip only
+            // names the cell and what it is not.
+            assert!(!name.contains("Estimated difference"));
             assert!(!node.supports_action(egui::accesskit::Action::Click));
             assert!(node.supports_action(egui::accesskit::Action::Focus));
             let bounds = node.bounds().unwrap();

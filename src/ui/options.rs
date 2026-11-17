@@ -14,7 +14,11 @@ pub(super) struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
+            // Grouping cannot be removed: one million separate cells measured about a second per
+            // frame. The threshold is adjustable in Options for anyone who wants more detail.
             minimum_area: 400.0,
+            // The band is what keeps a folder clickable: without it its children cover the
+            // whole cell. The reference also names folders along the top of their block.
             header_height: 20.0,
             group_small: true,
             // Three levels keep a folder readable at a glance; deeper content stays reachable by

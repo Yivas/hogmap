@@ -191,7 +191,7 @@ impl VolumeCell {
         } else {
             let label = format!("Not yet scanned · estimate\n{}", text::size(bytes, false));
             let tooltip = format!(
-                "{label} ({bytes} B)\nProvisional residual, not measured inaccessible space.\nNot a file; no file actions.\n{detail}"
+                "{label} ({bytes} B)\nProvisional residual, not measured inaccessible space.\nNot a file."
             );
             (label, tooltip)
         };

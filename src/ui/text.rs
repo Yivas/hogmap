@@ -728,14 +728,9 @@ pub fn label(name: &str, size: &str) -> String {
     format!("{name}\n{size}")
 }
 pub fn tooltip(name: &str, size: &str, state: &str, metric: SizeMetric, directory: bool) -> String {
-    let mut text = format!(
-        "{name}\nApparent size: {size} {}\nEach listed name counts; not physical attribution. Unique totals are in the status detail.\nState: {state}",
-        metric_bytes(metric)
-    );
+    let mut text = format!("{name}\n{size} {}\n{state}", metric_bytes(metric));
     if directory {
-        // Entry is the only way to see what a bounded map leaves out, so the gesture has to be
-        // stated where the user already is: the tooltip of the folder itself.
-        text.push_str("\nDouble-click to open this folder");
+        text.push_str("\nDouble-click to open");
     }
     text
 }
@@ -889,17 +884,11 @@ pub fn volume_cell_detail(
     detail: &str,
 ) -> String {
     let meaning = match part {
-        hogmap::composition::VolumePart::Free => {
-            "Global available filesystem bytes, not limited by per-user quotas."
-        }
-        hogmap::composition::VolumePart::Reserve => {
-            "Measured Windows storage reserve. Included in Total Reserved; not subtracted twice."
-        }
+        hogmap::composition::VolumePart::Free => "Global available bytes, not a file.",
+        hogmap::composition::VolumePart::Reserve => "Measured storage reserve, not a file.",
     };
-    format!(
-        "{} ({bytes} B)\n{meaning} Capture timing and eligibility are stated below.\nNot a file; no file actions.\n{detail}",
-        volume_cell(part, bytes)
-    )
+    let _ = detail;
+    format!("{} ({bytes} B)\n{meaning}", volume_cell(part, bytes))
 }
 
 pub fn observation_detail(observations: &scan_win::ScanOriginObservations) -> String {

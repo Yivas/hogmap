@@ -41,6 +41,8 @@ use logic::{HighlightFilter, History, Location, Members};
 use theme::{MapStyle, Theme};
 
 const LAYOUT_INTERVAL: Duration = Duration::from_millis(250);
+// A shorter delay cannot distinguish settled geometry from the gap between scan rebuilds.
+const HOVER_QUIET_INTERVAL: Duration = LAYOUT_INTERVAL;
 const STATUS_INTERVAL: Duration = Duration::from_millis(250);
 pub(crate) const FRAME_INTERVAL: Duration = Duration::from_millis(67);
 const DRAIN_BUDGET: Duration = Duration::from_millis(6);
@@ -281,6 +283,7 @@ pub struct HogMap {
     metric: SizeMetric,
     cache: Option<Cache>,
     volume_map: Option<VolumeMap>,
+    last_presented_view: Option<ViewKey>,
     status_cache: Option<StatusCache>,
     layout_failure: Option<LayoutFailure>,
     pub(crate) last_layout: Option<Instant>,
@@ -404,6 +407,7 @@ impl HogMap {
             metric: SizeMetric::Logical,
             cache: None,
             volume_map: None,
+            last_presented_view: None,
             status_cache: None,
             layout_failure: None,
             last_layout: None,
@@ -2262,6 +2266,34 @@ impl HogMap {
             });
     }
 
+    /// Stable widget id for one placed cell, so focus follows the entry rather than its slot.
+    /// The scan generation is part of it: entry positions restart with every index, so without
+    /// it a cell of a newly opened snapshot would inherit the focus of a different file.
+    fn cell_id(ui: &egui::Ui, cell: &treemap::Placed, generation: u64) -> egui::Id {
+        match cell.node {
+            NodeRef::Entry(id) => ui.id().with(("cell-entry", generation, id.position())),
+            // An aggregate keeps its parent but not its members: a rebuild can add or drop one
+            // under the same parent, and the signature is what tells those apart.
+            NodeRef::Aggregate { parent } => ui.id().with((
+                "cell-aggregate",
+                generation,
+                parent.position(),
+                cell.member_signature,
+            )),
+            // A group's ordinal belongs to one layout: another set of members can take the same
+            // ordinal on the next rebuild, and a bare ordinal would hand it the keyboard focus.
+            // The signature covers exactly the members, so a group whose members change gets a
+            // new id and loses the focus instead of passing it to a different set.
+            NodeRef::Group { parent, ordinal } => ui.id().with((
+                "cell-group",
+                generation,
+                parent.position(),
+                ordinal,
+                cell.member_signature,
+            )),
+        }
+    }
+
     fn map(&mut self, ui: &mut egui::Ui) {
         // The filter decides which items the geometry keeps, so a filter change can regroup the
         // map and the ordinal that identified a selected group may name another one.
@@ -2605,11 +2637,15 @@ impl HogMap {
         let mut zoom = None;
         let mut context_target = None;
         let mut focused = None;
+        let generation = self.reducer.generation().value();
         for (position, cell) in cache.layout.placed.iter().enumerate() {
             let interactive = paint::rect(cell.header.unwrap_or(cell.rect));
+            // The id names the cell, not the slot it occupies: a rebuild moves cells between
+            // positions, and a positional id would hand the keyboard focus, and its white ring,
+            // to whatever landed there.
             let control = ui.interact(
                 interactive,
-                ui.id().with(("cell", position)),
+                Self::cell_id(ui, cell, generation),
                 egui::Sense::click(),
             );
             if control.hovered() {
@@ -2683,6 +2719,23 @@ impl HogMap {
             }
             ui.ctx().request_repaint();
         }
+        let geometry_still =
+            rebuild_started.is_none() && self.last_presented_view.as_ref() == Some(&cache.key);
+        let quiet_remaining = self.last_layout.map_or(HOVER_QUIET_INTERVAL, |last| {
+            HOVER_QUIET_INTERVAL.saturating_sub(last.elapsed())
+        });
+        let hover_allowed = self.receiver.is_none() && geometry_still && quiet_remaining.is_zero();
+        if self.receiver.is_none() && pointed.is_some() && !hover_allowed {
+            // One final idle frame restores hover; active scans already schedule their own frames.
+            ui.ctx()
+                .request_repaint_after(if rebuild_started.is_some() {
+                    HOVER_QUIET_INTERVAL
+                } else {
+                    quiet_remaining
+                });
+        }
+        let pointed = pointed.filter(|_| hover_allowed);
+        self.last_presented_view = Some(cache.key.clone());
         // Tooltips above may add glyphs. Tessellate only after they settle the font atlas;
         // floating dialogs drawn later use the uncached painter to keep their first frame safe.
         if self.chooser.open
@@ -2982,6 +3035,134 @@ mod tests {
     }
 
     #[test]
+    fn a_group_that_changes_members_does_not_inherit_the_keyboard_focus() {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let index = Index::new("root".into()).unwrap();
+            let parent = index.root();
+            let cell = |signature: u64| treemap::Placed {
+                node: NodeRef::Group { parent, ordinal: 2 },
+                rect: treemap::Rect::new(0.0, 0.0, 40.0, 40.0),
+                header: None,
+                content: treemap::Rect::new(0.0, 0.0, 40.0, 40.0),
+                known_sum: 2048,
+                has_unknown: false,
+                member_signature: signature,
+                members: Vec::new(),
+                group_name: Some(".txt".to_owned()),
+                states: [2, 0, 0],
+            };
+            let first = HogMap::cell_id(ui, &cell(7), 1);
+            assert_eq!(
+                first,
+                HogMap::cell_id(ui, &cell(7), 1),
+                "the same members keep the focus"
+            );
+            assert_ne!(
+                first,
+                HogMap::cell_id(ui, &cell(9), 1),
+                "another member set must not inherit the focus, even with the same name, total                  and coverage"
+            );
+            assert_ne!(
+                first,
+                HogMap::cell_id(ui, &cell(7), 2),
+                "another scan generation is another tree, so the focus does not carry over"
+            );
+        });
+    }
+
+    #[test]
+    fn an_aggregate_that_gains_a_member_does_not_inherit_the_keyboard_focus() {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let index = Index::new("root".into()).unwrap();
+            let parent = index.root();
+            let cell = |signature: u64| treemap::Placed {
+                node: NodeRef::Aggregate { parent },
+                rect: treemap::Rect::new(0.0, 0.0, 40.0, 40.0),
+                header: None,
+                content: treemap::Rect::new(0.0, 0.0, 40.0, 40.0),
+                known_sum: 2048,
+                has_unknown: false,
+                member_signature: signature,
+                members: Vec::new(),
+                group_name: None,
+                states: [2, 0, 0],
+            };
+            let first = HogMap::cell_id(ui, &cell(7), 1);
+            assert_eq!(first, HogMap::cell_id(ui, &cell(7), 1));
+            assert_ne!(
+                first,
+                HogMap::cell_id(ui, &cell(9), 1),
+                "an aggregate with other members is not the one that had the focus"
+            );
+        });
+    }
+
+    #[test]
+    fn hover_waits_for_stable_geometry_and_stays_off_between_scan_rebuilds() {
+        let context = egui::Context::default();
+        theme::apply(&context, Theme::Dark);
+        let mut app = finished_sample(&context);
+        draw_map(&context, &mut app);
+        let point = app
+            .cache
+            .as_ref()
+            .unwrap()
+            .layout
+            .placed
+            .last()
+            .unwrap()
+            .rect;
+        let point = egui::pos2(point.x + point.width / 2.0, point.y + point.height / 2.0);
+        let frame = |app: &mut HogMap, width| {
+            let output = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(width, 600.0),
+                    )),
+                    events: if context.pointer_latest_pos() == Some(point) {
+                        Vec::new()
+                    } else {
+                        vec![egui::Event::PointerMoved(point)]
+                    },
+                    ..Default::default()
+                },
+                |ui| app.map(ui),
+            );
+            output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Rect(rect) if rect.stroke.color == Theme::Dark.palette().hover))
+        };
+        frame(&mut app, 800.0);
+        app.last_layout = Some(Instant::now() - HOVER_QUIET_INTERVAL);
+        assert!(frame(&mut app, 800.0), "a settled map retains hover");
+        let (_sender, receiver) = event_channel(1);
+        app.receiver = Some(receiver);
+        app.version += 1;
+        app.last_layout = None;
+        assert!(!frame(&mut app, 800.0), "no hover on a growth frame");
+        assert!(
+            !frame(&mut app, 800.0),
+            "a valid mesh between scan ticks is not settled geometry"
+        );
+        app.receiver = None;
+        assert!(!frame(&mut app, 820.0), "no hover on a resize frame");
+        assert!(
+            !frame(&mut app, 840.0),
+            "no hover during consecutive resizes"
+        );
+        assert!(!frame(&mut app, 840.0), "no flash between resize events");
+        app.last_layout = Some(Instant::now() - HOVER_QUIET_INTERVAL);
+        assert!(frame(&mut app, 840.0), "hover returns on stable geometry");
+        app.receiver = Some(event_channel(1).1);
+        app.about = true;
+        assert!(
+            !frame(&mut app, 840.0),
+            "the uncached painter follows the same hover policy"
+        );
+    }
+
+    #[test]
     fn a_nested_folder_label_starts_at_the_dataset_root_in_both_metrics() {
         let context = egui::Context::default();
         let mut app = finished_sample(&context);
@@ -3045,7 +3226,7 @@ mod tests {
             cache.key.rect,
             LayoutParams {
                 min_pixel_area: app.options.minimum_area,
-                header_height: 20.0,
+                header_height: app.options.header_height,
                 max_depth: app.options.depth_levels,
             },
             SizeMetric::Allocated,
@@ -3102,7 +3283,7 @@ mod tests {
             cache.key.rect,
             LayoutParams {
                 min_pixel_area: 1.0,
-                header_height: 20.0,
+                header_height: app.options.header_height,
                 max_depth: app.options.depth_levels,
             },
             SizeMetric::Allocated,

@@ -88,8 +88,11 @@ pub struct Placed {
     pub content: Rect,
     pub known_sum: u64,
     pub has_unknown: bool,
-    /// Entries grouped by an [`NodeRef::Aggregate`]; empty otherwise.
+    /// Entries grouped by an [`NodeRef::Aggregate`] or a [`NodeRef::Group`]; empty otherwise.
     pub members: Vec<EntryId>,
+    /// FNV-1a over the member positions, so a group's widget identity follows its members and
+    /// not just their summary. Computed once here; the UI hashes one number per cell per frame.
+    pub member_signature: u64,
     pub group_name: Option<String>,
     /// Entries this cell stands for, counted by coverage class: complete, partial, unknown. A
     /// plain entry contributes one; an aggregate or group contributes its members. The layout
@@ -398,6 +401,7 @@ fn layout_selection(
                         content: cell_rect,
                         known_sum: aggregate_weight,
                         has_unknown,
+                        member_signature: member_signature(&aggregate_members),
                         members: std::mem::take(&mut aggregate_members),
                         group_name: None,
                         states: aggregate_states,
@@ -532,6 +536,7 @@ pub fn layout_grouped(
             content: rect,
             known_sum,
             has_unknown,
+            member_signature: member_signature(&members),
             members,
             group_name: Some(name),
             states,
@@ -834,10 +839,21 @@ fn place(
         content,
         known_sum: totals.known_sum,
         has_unknown: totals.unknown > 0,
+        member_signature: 0,
         members: Vec::new(),
         group_name: None,
         states,
     }
+}
+
+/// FNV-1a over member positions: order-sensitive, so a reordered set is a different group.
+fn member_signature(members: &[EntryId]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for member in members {
+        hash ^= member.position() as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
 }
 
 fn split_header(rect: Rect, header_height: f32) -> (Option<Rect>, Rect) {
@@ -943,6 +959,9 @@ fn squarify(cells: &[Cell], area: RectF64) -> Vec<Rect> {
             (row_weight * scale).min(remaining.area())
         };
 
+        // The row was chosen by the squarified criterion, which assumes its cells share the band
+        // thickness and split the other axis. Placing each cell across the whole band instead
+        // produced the thin strips this algorithm exists to avoid.
         if remaining.width <= remaining.height {
             let width = remaining.width;
             let row_height = if width > 0.0 {
@@ -950,14 +969,14 @@ fn squarify(cells: &[Cell], area: RectF64) -> Vec<Rect> {
             } else {
                 0.0
             };
-            let mut y = remaining.y;
+            let mut x = remaining.x;
             for (index, cell) in row.iter().enumerate() {
-                let height = if width > 0.0 {
+                let cell_width = if row_height > 0.0 {
                     if index + 1 == row.len() {
-                        (remaining.y + row_height - y).max(0.0)
+                        (remaining.x + width - x).max(0.0)
                     } else {
-                        (cell.weight as f64 * scale / width)
-                            .min(remaining.y + row_height - y)
+                        (cell.weight as f64 * scale / row_height)
+                            .min(remaining.x + width - x)
                             .max(0.0)
                     }
                 } else {
@@ -965,14 +984,14 @@ fn squarify(cells: &[Cell], area: RectF64) -> Vec<Rect> {
                 };
                 result.push(
                     RectF64 {
-                        x: remaining.x,
-                        y,
-                        width,
-                        height,
+                        x,
+                        y: remaining.y,
+                        width: cell_width,
+                        height: row_height,
                     }
                     .to_rect(),
                 );
-                y += height;
+                x += cell_width;
             }
             remaining = RectF64 {
                 x: remaining.x,
@@ -987,14 +1006,14 @@ fn squarify(cells: &[Cell], area: RectF64) -> Vec<Rect> {
             } else {
                 0.0
             };
-            let mut x = remaining.x;
+            let mut y = remaining.y;
             for (index, cell) in row.iter().enumerate() {
-                let width = if height > 0.0 {
+                let cell_height = if row_width > 0.0 {
                     if index + 1 == row.len() {
-                        (remaining.x + row_width - x).max(0.0)
+                        (remaining.y + height - y).max(0.0)
                     } else {
-                        (cell.weight as f64 * scale / height)
-                            .min(remaining.x + row_width - x)
+                        (cell.weight as f64 * scale / row_width)
+                            .min(remaining.y + height - y)
                             .max(0.0)
                     }
                 } else {
@@ -1002,14 +1021,14 @@ fn squarify(cells: &[Cell], area: RectF64) -> Vec<Rect> {
                 };
                 result.push(
                     RectF64 {
-                        x,
-                        y: remaining.y,
-                        width,
-                        height,
+                        x: remaining.x,
+                        y,
+                        width: row_width,
+                        height: cell_height,
                     }
                     .to_rect(),
                 );
-                x += width;
+                y += cell_height;
             }
             remaining = RectF64 {
                 x: remaining.x + row_width,
@@ -1039,4 +1058,30 @@ fn worst_ratio(row: &[Cell], scale: f64, short_side: f64) -> f64 {
         .fold(f64::INFINITY, f64::min);
     (short_side * short_side * max_area / (row_area * row_area))
         .max(row_area * row_area / (short_side * short_side * min_area))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_group_signature_follows_its_members_not_their_summary() {
+        let a = EntryId::at(0).unwrap();
+        let b = EntryId::at(1).unwrap();
+        assert_ne!(
+            member_signature(&[a, b]),
+            member_signature(&[b, a]),
+            "another order is another set"
+        );
+        assert_ne!(
+            member_signature(&[a, b]),
+            member_signature(&[a]),
+            "a subset is another set"
+        );
+        assert_ne!(
+            member_signature(&[a]),
+            member_signature(&[b]),
+            "two single-member groups differ"
+        );
+    }
 }

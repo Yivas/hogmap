@@ -70,7 +70,13 @@ pub fn prepare(
 ) -> Vec<Cell> {
     // The layout places parents before their descendants, so a parent's depth is always known.
     let mut depths: HashMap<EntryId, usize> = HashMap::new();
-    let mut fitter = LabelFitter::new(ui);
+    // Small cells get a smaller face before they lose their name: the reference fits a name and
+    // a size into cells this size, and a bare number says less than a small label does.
+    let mut fitters = [
+        LabelFitter::new(ui, 11.0),
+        LabelFitter::new(ui, 9.0),
+        LabelFitter::new(ui, 7.5),
+    ];
     layout
         .placed
         .iter()
@@ -160,10 +166,61 @@ pub fn prepare(
             if let Some(badge) = tag_area(cell, tags) {
                 label_rect.max.x = label_rect.max.x.min(badge.left() - 2.0);
             }
+            // Every whole attempt runs across all font sizes before any truncated one: a name
+            // that fits complete at 7.5 px beats the same name cut at 11 px, which is what a
+            // single pass per size used to produce. Only when nothing fits whole does the name
+            // get shortened. A size is never shortened: where the name and the size compete, the
+            // name wins, because the number is also in the tooltip and the status bar.
+            let header = text::header(&name, &size);
             let label = if cell.header.is_some() {
-                fitter.fit(ui, &text::header(&name, &size), label_rect, false)
+                // A folder is identified by its name, so the name survives the size: a narrow
+                // band shows the name alone, and only a band too narrow for the name falls back
+                // to the number. A cut size is never shown.
+                fitters
+                    .iter_mut()
+                    .find_map(|fitter| fitter.fit_whole(ui, &header, label_rect, false))
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit_whole(ui, &name, label_rect, false))
+                    })
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit(ui, &name, label_rect, false))
+                    })
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit_whole(ui, &size, label_rect, false))
+                    })
             } else {
-                fitter.fit(ui, &text::label(&name, &size), label_rect, true)
+                let two_lines = text::label(&name, &size);
+                fitters
+                    .iter_mut()
+                    .find_map(|fitter| fitter.fit_whole(ui, &two_lines, label_rect, true))
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit_whole(ui, &header, label_rect, true))
+                    })
+                    .or_else(|| {
+                        // A whole name beats a bare number: the size is also in the tooltip and
+                        // the status bar, while the name appears nowhere else.
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit_whole(ui, &name, label_rect, true))
+                    })
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit(ui, &two_lines, label_rect, true))
+                    })
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit_whole(ui, &size, label_rect, true))
+                    })
             };
             Cell {
                 tooltip,
@@ -183,11 +240,12 @@ pub(super) fn fit(
     rect: egui::Rect,
     centered: bool,
 ) -> Option<(Arc<egui::Galley>, Pos2)> {
-    LabelFitter::new(ui).fit(ui, label, rect, centered)
+    LabelFitter::new(ui, 11.0).fit(ui, label, rect, centered)
 }
 
 struct LabelFitter {
     font: FontId,
+    size: f32,
     line_height: f32,
     ellipsis: f32,
     number_ellipsis: f32,
@@ -196,8 +254,8 @@ struct LabelFitter {
     widths: Vec<f32>,
 }
 impl LabelFitter {
-    fn new(ui: &egui::Ui) -> Self {
-        let font = FontId::proportional(11.0);
+    fn new(ui: &egui::Ui, size: f32) -> Self {
+        let font = FontId::proportional(size);
         let painter = ui.painter();
         Self {
             line_height: painter
@@ -206,7 +264,7 @@ impl LabelFitter {
                 .y
                 .max(
                     painter
-                        .layout_no_wrap("M".into(), FontId::monospace(11.0), Color32::BLACK)
+                        .layout_no_wrap("M".into(), FontId::monospace(size), Color32::BLACK)
                         .size()
                         .y,
                 ),
@@ -217,12 +275,13 @@ impl LabelFitter {
             number_ellipsis: painter
                 .layout_no_wrap(
                     text::ELLIPSIS.into(),
-                    FontId::monospace(11.0),
+                    FontId::monospace(size),
                     Color32::BLACK,
                 )
                 .size()
                 .x,
             font,
+            size,
             glyphs: HashMap::new(),
             chars: Vec::new(),
             widths: Vec::new(),
@@ -235,6 +294,28 @@ impl LabelFitter {
         rect: egui::Rect,
         centered: bool,
     ) -> Option<(Arc<egui::Galley>, Pos2)> {
+        self.fit_inner(ui, label, rect, centered, true)
+    }
+
+    /// Only returns a label that fits whole, for the shapes where a cut would remove the number.
+    fn fit_whole(
+        &mut self,
+        ui: &egui::Ui,
+        label: &str,
+        rect: egui::Rect,
+        centered: bool,
+    ) -> Option<(Arc<egui::Galley>, Pos2)> {
+        self.fit_inner(ui, label, rect, centered, false)
+    }
+
+    fn fit_inner(
+        &mut self,
+        ui: &egui::Ui,
+        label: &str,
+        rect: egui::Rect,
+        centered: bool,
+        allow_truncation: bool,
+    ) -> Option<(Arc<egui::Galley>, Pos2)> {
         if rect.height() < self.line_height * label.lines().count() as f32 {
             return None;
         }
@@ -243,7 +324,7 @@ impl LabelFitter {
         for (line_number, line) in label.lines().enumerate() {
             let numeric = line_number > 0;
             let font = if numeric {
-                FontId::monospace(11.0)
+                FontId::monospace(self.size)
             } else {
                 self.font.clone()
             };
@@ -275,7 +356,10 @@ impl LabelFitter {
                 }
             });
             let (count, truncated) = logic::fitting_prefix(&self.widths, rect.width(), ellipsis)?;
-            if count < MIN_LABEL_CHARS {
+            // The name may be cut short; the size may not. A cell that says "Docume…" and the
+            // number is useful, one that says "Docume…" alone is not.
+            let size_line = numeric;
+            if count < MIN_LABEL_CHARS || (truncated && (!allow_truncation || size_line)) {
                 return None;
             }
             let mut fitted = String::with_capacity(line.len());
@@ -598,24 +682,35 @@ fn outline(painter: &egui::Painter, area: egui::Rect, width: f32, inset: f32, co
     }
 }
 
-/// Keyboard focus is a two-tone dashed ring outside the control: no state mark or outline uses
-/// that pattern or position, and the backing keeps the dashes visible on any neighbouring fill.
+/// Keyboard focus is a two-tone dashed ring on the control's own edge: no state mark or outline
+/// uses that pattern, and the backing keeps the dashes visible on any fill.
 pub fn focus_ring(painter: &egui::Painter, area: egui::Rect, palette: &Palette) {
-    painter.rect_stroke(
+    // Drawn inside the cell: a stroke outside it paints pixels the widget's rectangle does not
+    // cover, so after a resize the old ones are not marked dirty and fade away on their own.
+    // The width shrinks with the control so a one-point cell still holds its ring, and the clip
+    // keeps the guarantee even where a centred dash stroke would round past the edge.
+    let painter = painter.with_clip_rect(area);
+    let mut shapes = Vec::new();
+    focus_ring_shapes(area, palette, &mut shapes);
+    painter.extend(shapes);
+}
+
+/// The ring's geometry, kept apart so a test can measure it without a painter.
+fn focus_ring_shapes(area: egui::Rect, palette: &Palette, shapes: &mut Vec<Shape>) {
+    let width = 2.0_f32.min(area.width()).min(area.height());
+    shapes.push(Shape::rect_stroke(
         area,
         0,
-        Stroke::new(2.0, palette.focus_backing),
-        StrokeKind::Outside,
-    );
-    let mut dashes = Vec::new();
+        Stroke::new(width, palette.focus_backing),
+        StrokeKind::Inside,
+    ));
     dashed_outline(
-        area.expand(1.0),
-        Stroke::new(2.0, palette.focus),
+        area.shrink(width / 2.0),
+        Stroke::new(width, palette.focus),
         4.0,
         3.0,
-        &mut dashes,
+        shapes,
     );
-    painter.extend(dashes);
 }
 
 /// One-pixel seams on the right and bottom edges only, so siblings share a single seam; the left
@@ -691,6 +786,210 @@ fn dashed_outline(area: egui::Rect, stroke: Stroke, dash: f32, gap: f32, shapes:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_focus_ring_stays_inside_the_control_at_every_size() {
+        let palette = crate::ui::theme::Theme::Dark.palette();
+        for (width, height) in [
+            (1.0, 20.0),
+            (20.0, 1.0),
+            (1.0, 1.0),
+            (2.0, 20.0),
+            (40.0, 40.0),
+        ] {
+            let area = egui::Rect::from_min_size(egui::pos2(10.0, 10.0), egui::vec2(width, height));
+            let mut shapes = Vec::new();
+            focus_ring_shapes(area, palette, &mut shapes);
+            assert!(!shapes.is_empty(), "{width}x{height}: no ring");
+            for shape in &shapes {
+                let painted = match shape {
+                    Shape::Rect(rect) => rect.rect,
+                    Shape::LineSegment { points, stroke } => {
+                        egui::Rect::from_two_pos(points[0], points[1]).expand(stroke.width / 2.0)
+                    }
+                    other => panic!("{width}x{height}: unexpected shape {other:?}"),
+                };
+                assert!(
+                    area.expand(0.01).contains_rect(painted),
+                    "{width}x{height}: {painted:?} escapes {area:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn folder_headers_keep_the_name_when_the_size_cannot_fit() {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let mut index = Index::new("SystemApplicationData".into()).unwrap();
+            let root = index.root();
+            index.set_state(root, State::Complete).unwrap();
+            index
+                .insert(
+                    root,
+                    "file.bin".into(),
+                    Kind::File,
+                    hogmap::index::Sizes {
+                        logical: Some(4096),
+                        allocated: Some(4096),
+                    },
+                    None,
+                    State::Complete,
+                )
+                .unwrap();
+            let layout = hogmap::treemap::layout(
+                &index,
+                root,
+                Rect::new(0.0, 0.0, 65.0, 100.0),
+                hogmap::treemap::LayoutParams {
+                    min_pixel_area: 1.0,
+                    header_height: 20.0,
+                    max_depth: 1,
+                },
+            )
+            .unwrap();
+            let cells = prepare(
+                ui,
+                &index,
+                &layout,
+                None,
+                SizeMetric::Logical,
+                &ClassTable::default(),
+                MapStyle::FlatColors,
+            );
+            let (label, _) = cells[0]
+                .label
+                .as_ref()
+                .expect("the name fits in the header");
+            // A folder is identified by its name: in a band too narrow for both, the name stays
+            // and the size goes, because the number is still in the tooltip and the status bar
+            // while the name appears nowhere else.
+            assert!(
+                label.job.text.starts_with("System"),
+                "header lost its name: {:?}",
+                label.job.text
+            );
+            assert!(
+                !label.job.text.contains("KiB"),
+                "a cut band must drop the size, not show it: {:?}",
+                label.job.text
+            );
+        });
+    }
+
+    #[test]
+    fn folder_names_use_the_smallest_face_before_losing_characters() {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let name = "SystemApplicationData";
+            let mut index = Index::new(name.into()).unwrap();
+            let root = index.root();
+            index.set_state(root, State::Complete).unwrap();
+            index
+                .insert(
+                    root,
+                    "file.bin".into(),
+                    Kind::File,
+                    hogmap::index::Sizes {
+                        logical: Some(4096),
+                        allocated: Some(4096),
+                    },
+                    None,
+                    State::Complete,
+                )
+                .unwrap();
+            let full = text::header(name, "4.0 KiB");
+            let width = ui
+                .painter()
+                .layout_no_wrap(full.clone(), FontId::proportional(7.5), Color32::BLACK)
+                .size()
+                .x
+                + 9.0;
+            let layout = hogmap::treemap::layout(
+                &index,
+                root,
+                Rect::new(0.0, 0.0, width, 100.0),
+                hogmap::treemap::LayoutParams {
+                    min_pixel_area: 1.0,
+                    header_height: 20.0,
+                    max_depth: 1,
+                },
+            )
+            .unwrap();
+            let cells = prepare(
+                ui,
+                &index,
+                &layout,
+                None,
+                SizeMetric::Logical,
+                &ClassTable::default(),
+                MapStyle::FlatColors,
+            );
+            let (label, _) = cells[0]
+                .label
+                .as_ref()
+                .expect("the complete header fits at 7.5 points");
+            assert_eq!(label.job.text, full);
+            assert_eq!(label.job.sections[0].format.font_id.size, 7.5);
+        });
+    }
+
+    #[test]
+    fn a_narrow_folder_band_keeps_its_name_instead_of_only_the_size() {
+        let context = egui::Context::default();
+        let _ = context.run_ui(egui::RawInput::default(), |ui| {
+            let name = "SystemApplicationData";
+            let mut index = Index::new(name.into()).unwrap();
+            let root = index.root();
+            index.set_state(root, State::Complete).unwrap();
+            index
+                .insert(
+                    root,
+                    "file.bin".into(),
+                    Kind::File,
+                    hogmap::index::Sizes {
+                        logical: Some(4096),
+                        allocated: Some(4096),
+                    },
+                    None,
+                    State::Complete,
+                )
+                .unwrap();
+            // Wide enough for the name at the smallest face, too narrow for the name plus the
+            // size at that same face, so the size is what has to go.
+            let width = ui
+                .painter()
+                .layout_no_wrap(name.into(), FontId::proportional(7.5), Color32::BLACK)
+                .size()
+                .x
+                + 10.0;
+            let layout = hogmap::treemap::layout(
+                &index,
+                root,
+                Rect::new(0.0, 0.0, width, 100.0),
+                hogmap::treemap::LayoutParams {
+                    min_pixel_area: 1.0,
+                    header_height: 20.0,
+                    max_depth: 1,
+                },
+            )
+            .unwrap();
+            let cells = prepare(
+                ui,
+                &index,
+                &layout,
+                None,
+                SizeMetric::Logical,
+                &ClassTable::default(),
+                MapStyle::FlatColors,
+            );
+            let (label, _) = cells[0]
+                .label
+                .as_ref()
+                .expect("the name fits once the size is dropped");
+            assert_eq!(label.job.text, name, "the folder keeps its name");
+        });
+    }
 
     #[test]
     fn labels_fit_bounds_headers_and_the_three_character_minimum() {

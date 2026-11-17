@@ -441,6 +441,42 @@ fn layout_is_deterministic() {
 }
 
 #[test]
+fn an_aggregate_signature_follows_its_members_across_rebuilds() {
+    let build = |small_files: usize| {
+        let mut index = Index::new("Volume".into()).unwrap();
+        let root = index.root();
+        insert_file(&mut index, root, "big.bin", Some(1_000_000));
+        for number in 0..small_files {
+            insert_file(
+                &mut index,
+                root,
+                &format!("small_{number:03}.bin"),
+                Some(100),
+            );
+        }
+        index.set_state(root, State::Complete).unwrap();
+        let result = layout(
+            &index,
+            root,
+            Rect::new(0.0, 0.0, 1000.0, 1000.0),
+            params(5000.0, 0.0),
+        )
+        .unwrap();
+        find(&result, NodeRef::Aggregate { parent: root }).member_signature
+    };
+    assert_eq!(
+        build(100),
+        build(100),
+        "the same members rebuilt give the same signature, so the focus survives growth"
+    );
+    assert_ne!(
+        build(100),
+        build(101),
+        "an aggregate that gained a member is not the one that had the focus"
+    );
+}
+
+#[test]
 fn layout_aggregates_small_siblings_and_preserves_totals() {
     let mut index = Index::new("Volume".into()).unwrap();
     let root = index.root();
@@ -904,4 +940,51 @@ fn an_unknown_size_in_the_selected_metric_has_no_area_but_the_other_metric_place
         "an unknown allocated size gets no area and is not zero"
     );
     assert_eq!(index.get(file).unwrap().sizes.allocated, None);
+}
+
+/// The squarified criterion chooses a row because its cells share the band thickness. Placing
+/// them across the whole band instead produced the thin strips the algorithm exists to avoid, so
+/// this pins the shape: four equal siblings in a square area must come out as four squares.
+#[test]
+fn equal_siblings_are_placed_as_squares_not_strips() {
+    let mut index = Index::new("Fixture".into()).unwrap();
+    let root = index.root();
+    index.set_state(root, State::Complete).unwrap();
+    for number in 0..4 {
+        index
+            .insert(
+                root,
+                format!("file-{number}.bin").into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(100),
+                    allocated: Some(100),
+                },
+                None,
+                State::Complete,
+            )
+            .unwrap();
+    }
+    let layout = layout(
+        &index,
+        root,
+        Rect::new(0.0, 0.0, 100.0, 100.0),
+        params(1.0, 0.0),
+    )
+    .unwrap();
+    let cells: Vec<_> = layout
+        .placed
+        .iter()
+        .filter(|cell| cell.node != NodeRef::Entry(root))
+        .collect();
+    assert_eq!(cells.len(), 4);
+    for cell in cells {
+        let aspect = (cell.rect.width / cell.rect.height).max(cell.rect.height / cell.rect.width);
+        assert!(
+            (aspect - 1.0).abs() < 0.1,
+            "a cell of {:.1}x{:.1} is a strip, not a square",
+            cell.rect.width,
+            cell.rect.height
+        );
+    }
 }
