@@ -2639,7 +2639,13 @@ impl HogMap {
         let mut focused = None;
         let generation = self.reducer.generation().value();
         for (position, cell) in cache.layout.placed.iter().enumerate() {
-            let interactive = paint::rect(cell.header.unwrap_or(cell.rect));
+            // An open folder answers on its band, since its children cover the interior. A closed
+            // one shows its name in the middle, so the whole cell answers.
+            let interactive = if cell.expanded {
+                paint::rect(cell.header.unwrap_or(cell.rect))
+            } else {
+                paint::rect(cell.rect)
+            };
             // The id names the cell, not the slot it occupies: a rebuild moves cells between
             // positions, and a positional id would hand the keyboard focus, and its white ring,
             // to whatever landed there.
@@ -3051,6 +3057,7 @@ mod tests {
                 members: Vec::new(),
                 group_name: Some(".txt".to_owned()),
                 states: [2, 0, 0],
+                expanded: false,
             };
             let first = HogMap::cell_id(ui, &cell(7), 1);
             assert_eq!(
@@ -3088,6 +3095,7 @@ mod tests {
                 members: Vec::new(),
                 group_name: None,
                 states: [2, 0, 0],
+                expanded: false,
             };
             let first = HogMap::cell_id(ui, &cell(7), 1);
             assert_eq!(first, HogMap::cell_id(ui, &cell(7), 1));

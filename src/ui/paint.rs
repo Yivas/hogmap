@@ -13,9 +13,6 @@ use super::{logic, text};
 /// would not be legible there and would only add paint cost. Hover and selection outlines move
 /// outside such cells instead of covering them.
 const MARK_MIN_SIDE: f32 = 8.0;
-/// Aggregates narrower than this keep only their lilac fill: on thin slivers the dotted frame
-/// reads as noise, and the fill already tells them apart.
-const AGGREGATE_FRAME_MIN_SIDE: f32 = 24.0;
 const HATCH_SPACING: f32 = 6.0;
 /// Fewer visible characters than this read as punctuation rather than a name.
 const MIN_LABEL_CHARS: usize = 3;
@@ -41,13 +38,13 @@ pub enum Surface {
 pub struct Cell {
     pub tooltip: String,
     pub label: Option<(Arc<egui::Galley>, Pos2)>,
+    /// Name and size centred in a directory whose children are not drawn, so its interior
+    /// carries the same reading as a file instead of staying blank under the header.
+    pub center: Option<(Arc<egui::Galley>, Pos2)>,
     pub surface: Surface,
     pub tags: u8,
     /// Directory borders are drawn after every cell, above the children that tile them.
     pub directory: bool,
-    /// The total is incomplete (`has_unknown`): some sizes are unknown or some content is
-    /// partial or unreadable. A dotted rule replaces the solid line under the header.
-    pub unknown: bool,
 }
 
 pub fn rect(rect: Rect) -> egui::Rect {
@@ -71,8 +68,13 @@ pub fn prepare(
     // The layout places parents before their descendants, so a parent's depth is always known.
     let mut depths: HashMap<EntryId, usize> = HashMap::new();
     // Small cells get a smaller face before they lose their name: the reference fits a name and
-    // a size into cells this size, and a bare number says less than a small label does.
-    let mut fitters = [
+    // a size into cells this size, and a bare number says less than a small label does. Large
+    // cells get a larger one, so a big block reads from across the screen instead of carrying the
+    // same small print as a sliver. Header bands keep the three small faces: they are one line
+    // tall, and a larger face would only make the band wider than its siblings.
+    let mut all_fitters = [
+        LabelFitter::new(ui, 16.0),
+        LabelFitter::new(ui, 13.0),
         LabelFitter::new(ui, 11.0),
         LabelFitter::new(ui, 9.0),
         LabelFitter::new(ui, 7.5),
@@ -107,11 +109,12 @@ pub fn prepare(
                     Kind::File,
                     0,
                 ),
-                NodeRef::Aggregate { .. } => (
+                // The parent's depth, so the aggregate takes its parent's interior fill.
+                NodeRef::Aggregate { parent } => (
                     text::aggregate_name(cell.members.len()),
                     State::Complete,
                     Kind::File,
-                    0,
+                    depths.get(&parent).copied().unwrap_or(0),
                 ),
             };
             let size = text::size(cell.known_sum, cell.has_unknown);
@@ -144,7 +147,13 @@ pub fn prepare(
                 Surface::Incomplete {
                     inaccessible: state == State::Inaccessible,
                 }
-            } else if matches!(cell.node, NodeRef::Aggregate { .. } | NodeRef::Group { .. }) {
+            } else if matches!(cell.node, NodeRef::Aggregate { .. }) {
+                // Items too small to draw read as the folder's own background, as in the
+                // reference: no fill of their own and no "small items" label. They stay one
+                // cell so the map never has to draw a million slivers, and the tooltip and
+                // double-click still reach them.
+                Surface::Directory { depth }
+            } else if matches!(cell.node, NodeRef::Group { .. }) {
                 Surface::Aggregate
             } else if kind == Kind::Directory {
                 Surface::Directory { depth }
@@ -172,7 +181,10 @@ pub fn prepare(
             // get shortened. A size is never shortened: where the name and the size compete, the
             // name wins, because the number is also in the tooltip and the status bar.
             let header = text::header(&name, &size);
-            let label = if cell.header.is_some() {
+            let label = if matches!(cell.node, NodeRef::Aggregate { .. }) {
+                None
+            } else if cell.header.is_some() {
+                let fitters = &mut all_fitters[HEADER_FACES];
                 // A folder is identified by its name, so the name survives the size: a narrow
                 // band shows the name alone, and only a band too narrow for the name falls back
                 // to the number. A cut size is never shown.
@@ -195,6 +207,7 @@ pub fn prepare(
                             .find_map(|fitter| fitter.fit_whole(ui, &size, label_rect, false))
                     })
             } else {
+                let fitters = &mut all_fitters;
                 let two_lines = text::label(&name, &size);
                 fitters
                     .iter_mut()
@@ -222,17 +235,47 @@ pub fn prepare(
                             .find_map(|fitter| fitter.fit_whole(ui, &size, label_rect, true))
                     })
             };
+            // A folder drawn without its children gets its name and size centred in the empty
+            // interior, as a file would. Never the drawn root (position 0): its band always names
+            // it, a grouped view fills its interior with groups, and an empty map shows its own
+            // message there.
+            let center = if position != 0 && cell.header.is_some() && !cell.expanded {
+                let interior = rect(cell.content).shrink(3.0);
+                let two_lines = text::label(&name, &size);
+                let fitters = &mut all_fitters;
+                fitters
+                    .iter_mut()
+                    .find_map(|fitter| fitter.fit_whole(ui, &two_lines, interior, true))
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit_whole(ui, &header, interior, true))
+                    })
+                    .or_else(|| {
+                        fitters
+                            .iter_mut()
+                            .find_map(|fitter| fitter.fit(ui, &two_lines, interior, true))
+                    })
+            } else {
+                None
+            };
+            // The reference names a closed folder once, in its middle; the band repeats it only
+            // when the middle is too small for the label.
+            let label = if center.is_some() { None } else { label };
             Cell {
                 tooltip,
                 label,
+                center,
                 surface,
                 tags,
                 directory: kind == Kind::Directory,
-                unknown: cell.has_unknown,
             }
         })
         .collect()
 }
+
+/// The faces a one-line header band may use: the three small ones of [`prepare`]'s list.
+const HEADER_FACES: std::ops::RangeFrom<usize> = 2..;
 
 pub(super) fn fit(
     ui: &egui::Ui,
@@ -245,11 +288,9 @@ pub(super) fn fit(
 
 struct LabelFitter {
     font: FontId,
-    size: f32,
     line_height: f32,
     ellipsis: f32,
-    number_ellipsis: f32,
-    glyphs: HashMap<(bool, char), f32>,
+    glyphs: HashMap<char, f32>,
     chars: Vec<char>,
     widths: Vec<f32>,
 }
@@ -261,27 +302,12 @@ impl LabelFitter {
             line_height: painter
                 .layout_no_wrap("M".into(), font.clone(), Color32::BLACK)
                 .size()
-                .y
-                .max(
-                    painter
-                        .layout_no_wrap("M".into(), FontId::monospace(size), Color32::BLACK)
-                        .size()
-                        .y,
-                ),
+                .y,
             ellipsis: painter
                 .layout_no_wrap(text::ELLIPSIS.into(), font.clone(), Color32::BLACK)
                 .size()
                 .x,
-            number_ellipsis: painter
-                .layout_no_wrap(
-                    text::ELLIPSIS.into(),
-                    FontId::monospace(size),
-                    Color32::BLACK,
-                )
-                .size()
-                .x,
             font,
-            size,
             glyphs: HashMap::new(),
             chars: Vec::new(),
             widths: Vec::new(),
@@ -323,16 +349,9 @@ impl LabelFitter {
         job.wrap.max_width = f32::INFINITY;
         for (line_number, line) in label.lines().enumerate() {
             let numeric = line_number > 0;
-            let font = if numeric {
-                FontId::monospace(self.size)
-            } else {
-                self.font.clone()
-            };
-            let ellipsis = if numeric {
-                self.number_ellipsis
-            } else {
-                self.ellipsis
-            };
+            // The number shares the name's face: in a second face it read as a separate label.
+            let font = self.font.clone();
+            let ellipsis = self.ellipsis;
             self.chars.clear();
             self.widths.clear();
             self.chars.extend(line.chars());
@@ -341,7 +360,7 @@ impl LabelFitter {
             // character: ask layout once and cache its actual result, including replacement glyphs.
             ui.fonts_mut(|fonts| {
                 for character in &self.chars {
-                    let width = *self.glyphs.entry((numeric, *character)).or_insert_with(|| {
+                    let width = *self.glyphs.entry(*character).or_insert_with(|| {
                         let width = fonts.glyph_width(&font, *character);
                         if width == 0.0 {
                             fonts
@@ -467,18 +486,6 @@ pub fn draw(
         {
             seams(&painter, area, seam);
         }
-        if cell.surface == Surface::Aggregate
-            && at_least(area, AGGREGATE_FRAME_MIN_SIDE)
-            && let Some(mark) = tone.mark
-        {
-            dashed_outline(
-                area.shrink(2.5),
-                Stroke::new(1.0, mark),
-                1.0,
-                2.0,
-                &mut dashes,
-            );
-        }
         if cell.surface
             == (Surface::Incomplete {
                 inaccessible: false,
@@ -519,7 +526,7 @@ pub fn draw(
                 );
             }
         }
-        if let Some((galley, position)) = &cell.label {
+        for (galley, position) in cell.label.iter().chain(cell.center.iter()) {
             if inaccessible {
                 // Keep the label on its measured fill instead of on the hatching.
                 let plate = egui::Rect::from_min_size(*position, galley.size()).expand(1.0);
@@ -539,16 +546,7 @@ pub fn draw(
                 StrokeKind::Inside,
             );
             if let Some(header) = placed.header {
-                let mark = painted_tone(palette, cell.surface, matches, placed).mark;
-                header_rule(
-                    &painter,
-                    area,
-                    rect(header),
-                    palette.directory_border,
-                    mark,
-                    cell.unknown,
-                    &mut dashes,
-                );
+                header_rule(&painter, rect(header), palette.directory_border);
             }
         }
     }
@@ -722,39 +720,13 @@ fn seams(painter: &egui::Painter, area: egui::Rect, color: Color32) {
     painter.rect_filled(bottom, 0, color);
 }
 
-/// A complete total closes its header with a solid rule. An incomplete one gets a dotted rule,
-/// which is a state mark: it follows the painted tone and the minimum markable size like the
-/// rest.
-fn header_rule(
-    painter: &egui::Painter,
-    area: egui::Rect,
-    header: egui::Rect,
-    directory_border: Color32,
-    mark: Option<Color32>,
-    unknown: bool,
-    dashes: &mut Vec<Shape>,
-) {
-    if unknown {
-        if markable(area)
-            && let Some(mark) = mark
-        {
-            let y = header.bottom() - 0.5;
-            Shape::dashed_line_many(
-                &[
-                    egui::pos2(header.left() + 1.0, y),
-                    egui::pos2(header.right() - 1.0, y),
-                ],
-                Stroke::new(1.0, mark),
-                1.0,
-                2.0,
-                dashes,
-            );
-        }
-    } else {
-        let rule =
-            egui::Rect::from_min_max(egui::pos2(header.left(), header.bottom() - 1.0), header.max);
-        painter.rect_filled(rule, 0, directory_border);
-    }
+/// Every header closes with the same solid rule. An incomplete total used to get a light dotted
+/// rule instead, and during a scan almost every folder passes through that state, so the dots
+/// flickered on and off across the whole map. The header text already says "+ unknown".
+fn header_rule(painter: &egui::Painter, header: egui::Rect, directory_border: Color32) {
+    let rule =
+        egui::Rect::from_min_max(egui::pos2(header.left(), header.bottom() - 1.0), header.max);
+    painter.rect_filled(rule, 0, directory_border);
 }
 
 fn hatch(painter: &egui::Painter, area: egui::Rect, color: Color32) {
@@ -1070,15 +1042,28 @@ mod tests {
             for ((placed, cell), height) in layout.placed.iter().zip(&cells).zip([20.0, 16.0, 15.0]) {
                 let header = placed.header.unwrap();
                 assert_eq!(header.height, height);
-                let (galley, _) = cell.label.as_ref().expect("every reserved header fits its label");
-                assert!(galley.size().y + 2.0 <= header.height);
-                assert!(galley.size().x + 8.0 <= header.width);
+                if placed.expanded {
+                    let (galley, _) = cell.label.as_ref().expect("every open folder's header fits its label");
+                    assert!(galley.size().y + 2.0 <= header.height);
+                    assert!(galley.size().x + 8.0 <= header.width);
+                    assert!(cell.center.is_none(), "an open folder has no centred label");
+                } else {
+                    // The folder at the drawn depth is closed: named once, in its middle.
+                    let (galley, position) = cell.center.as_ref().expect("a closed folder is named in its middle");
+                    assert!(cell.label.is_none(), "and not again in its band");
+                    let interior = rect(placed.content);
+                    assert!(interior.contains_rect(egui::Rect::from_min_size(*position, galley.size())));
+                    assert_eq!(galley.job.text, "Second header\n4.0 KiB");
+                }
             }
             let (size_label, _) = fit(ui, "Example.bin\n4.0 KiB", egui::Rect::from_min_size(Pos2::ZERO, egui::vec2(128.0, 40.0)), true).unwrap();
             assert_eq!(size_label.job.text, "Example.bin\n4.0 KiB");
-            assert_eq!(size_label.job.sections[0].format.font_id, FontId::proportional(11.0));
-            assert_eq!(size_label.job.sections[1].format.font_id, FontId::monospace(11.0));
-            println!("unit67_labels header_heights=20,16,15 header_labels=3 numeric_font_monospace=1 minimum_chars=3");
+            // Name and number share one face, so the job may merge them into a single section.
+            assert!(!size_label.job.sections.is_empty());
+            for section in &size_label.job.sections {
+                assert_eq!(section.format.font_id, FontId::proportional(11.0));
+            }
+            println!("unit67_labels header_heights=20,16,15 header_labels=3 numeric_font_proportional=1 minimum_chars=3");
         });
     }
 }

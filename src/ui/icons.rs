@@ -180,11 +180,19 @@ pub fn draw(painter: &egui::Painter, icon: Icon, center: Pos2, size: f32, color:
         );
     };
     match icon {
+        // A folder under a magnifying glass: choose something and look inside it.
         Icon::NewScan => {
-            box_at(2.0, 4.0, 16.0, 18.0);
-            line(&[(2.0, 8.0), (16.0, 8.0)]);
-            line(&[(17.0, 11.0), (17.0, 21.0)]);
-            line(&[(12.0, 16.0), (22.0, 16.0)]);
+            line(&[
+                (10.0, 17.0),
+                (2.0, 17.0),
+                (2.0, 4.0),
+                (7.0, 4.0),
+                (9.0, 6.0),
+                (17.0, 6.0),
+                (17.0, 9.0),
+            ]);
+            painter.circle_stroke(p(14.5, 13.5), 4.0 * size / 22.0, stroke);
+            line(&[(17.5, 16.5), (21.0, 20.0)]);
         }
         Icon::Back | Icon::Forward | Icon::Up => {
             let transform = |x: f32, y: f32| match icon {
@@ -217,19 +225,33 @@ pub fn draw(painter: &egui::Painter, icon: Icon, center: Pos2, size: f32, color:
                 (18.0, 9.0),
             ]);
         }
+        // A smooth clockwise arc with a filled head: the same place, read again.
         Icon::Rescan => {
-            line(&[
-                (19.0, 9.0),
-                (17.0, 5.0),
-                (12.0, 3.0),
-                (7.0, 4.0),
-                (3.0, 8.0),
-                (3.0, 14.0),
-                (7.0, 18.0),
-                (13.0, 19.0),
-                (18.0, 16.0),
-            ]);
-            line(&[(19.0, 2.0), (19.0, 9.0), (12.0, 9.0)]);
+            let radius = 7.5;
+            let arc = |degrees: f32| {
+                let angle = degrees.to_radians();
+                (11.0 + radius * angle.cos(), 11.0 + radius * angle.sin())
+            };
+            let points: Vec<(f32, f32)> = (0..=30)
+                .map(|step| arc(-50.0 + step as f32 * 9.0))
+                .collect();
+            line(&points);
+            // The head points along the arc's direction at its end.
+            let (tip_x, tip_y) = arc(-50.0 + 270.0 + 8.0);
+            let (base_x, base_y) = arc(-50.0 + 270.0);
+            let (dx, dy) = (tip_x - base_x, tip_y - base_y);
+            let length = (dx * dx + dy * dy).sqrt();
+            let (ux, uy) = (dx / length, dy / length);
+            let half = 3.2;
+            painter.add(Shape::convex_polygon(
+                vec![
+                    p(tip_x + ux * 1.5, tip_y + uy * 1.5),
+                    p(base_x - uy * half, base_y + ux * half),
+                    p(base_x + uy * half, base_y - ux * half),
+                ],
+                color,
+                Stroke::NONE,
+            ));
         }
         Icon::Stop => {
             painter.rect_filled(

@@ -565,6 +565,44 @@ fn an_aggregate_reports_an_unknown_size_in_any_of_its_members() {
 }
 
 #[test]
+fn a_directory_is_expanded_only_when_its_children_are_drawn() {
+    let mut index = Index::new("Volume".into()).unwrap();
+    let root = index.root();
+    let shown = insert_dir(&mut index, root, "shown");
+    let deep = insert_dir(&mut index, shown, "deep");
+    insert_file(&mut index, deep, "inside.bin", Some(400_000));
+    let file = insert_file(&mut index, root, "file.bin", Some(400_000));
+    index.set_state(root, State::Complete).unwrap();
+    let result = layout(
+        &index,
+        root,
+        Rect::new(0.0, 0.0, 1000.0, 1000.0),
+        LayoutParams {
+            min_pixel_area: 1.0,
+            header_height: 16.0,
+            max_depth: 2,
+        },
+    )
+    .unwrap();
+    assert!(
+        find(&result, NodeRef::Entry(root)).expanded,
+        "the open folder draws its children"
+    );
+    assert!(
+        find(&result, NodeRef::Entry(shown)).expanded,
+        "a folder within the drawn depth"
+    );
+    assert!(
+        !find(&result, NodeRef::Entry(deep)).expanded,
+        "a folder at the drawn depth is not opened"
+    );
+    assert!(
+        !find(&result, NodeRef::Entry(file)).expanded,
+        "a file is never expanded"
+    );
+}
+
+#[test]
 fn layout_aggregates_small_siblings_and_preserves_totals() {
     let mut index = Index::new("Volume".into()).unwrap();
     let root = index.root();

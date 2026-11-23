@@ -99,6 +99,10 @@ pub struct Placed {
     /// already visits exactly those entries, so recording them here is exact by construction and
     /// saves the coverage strip from walking an aggregate again.
     pub states: [u32; 3],
+    /// A directory whose children are drawn inside it. A directory that is not expanded (too
+    /// small, past the drawn depth, or with nothing of positive size inside) shows an empty
+    /// interior, so the UI centres its name and size there instead.
+    pub expanded: bool,
 }
 
 /// The class the coverage strip shows for one entry.
@@ -302,9 +306,9 @@ fn layout_selection(
 
     let mut queue = VecDeque::new();
     if root_entry.kind == Kind::Directory && params.max_depth > 0 {
-        queue.push_back((root, root_placed.content, 1_usize));
+        queue.push_back((root, root_placed.content, 1_usize, 0_usize));
     }
-    while let Some((parent, content, depth)) = queue.pop_front() {
+    while let Some((parent, content, depth, placed_at)) = queue.pop_front() {
         let slot = parent.position();
         if !data.sorted[slot] {
             data.children[slot].sort_by(|a, b| {
@@ -325,6 +329,9 @@ fn layout_selection(
         if positive == 0 {
             continue;
         }
+        // At least one child of positive size is placed below: a retained cell or the
+        // aggregate that stands for the rest.
+        result.placed[placed_at].expanded = true;
         let child_ids = &child_ids[..positive];
         let total = if parent == root {
             root_totals.known_sum
@@ -390,7 +397,7 @@ fn layout_selection(
                         && depth < params.max_depth
                         && placed.content.area() >= params.min_pixel_area
                     {
-                        queue.push_back((id, placed.content, depth + 1));
+                        queue.push_back((id, placed.content, depth + 1, result.placed.len()));
                     }
                     result.placed.push(placed);
                 }
@@ -406,6 +413,7 @@ fn layout_selection(
                         members: std::mem::take(&mut aggregate_members),
                         group_name: None,
                         states: aggregate_states,
+                        expanded: false,
                     });
                 }
             }
@@ -543,6 +551,7 @@ pub fn layout_grouped(
             members,
             group_name: Some(name),
             states,
+            expanded: false,
         });
     }
     Ok(result)
@@ -846,6 +855,7 @@ fn place(
         members: Vec::new(),
         group_name: None,
         states,
+        expanded: false,
     }
 }
 
