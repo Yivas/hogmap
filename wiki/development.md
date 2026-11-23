@@ -190,6 +190,23 @@ A separate opt-in `HOGMAP_BENCH_EXTRA=1` with `--synthetic-million` measures com
 
 The private identity ledger is sharded, batches resume through a deadline-checked cursor, and layout storage grows amortized. These preserve existing accounting and ordering tests; they do not bound total scan memory. Native visual, screen-reader and DPI acceptance remain separate.
 
+### A change the measurement could not resolve, 2026-11-17
+
+The layout used to walk an aggregate's members three times: once to count their coverage classes while building the member list, once to look for unknown sizes and once to hash them into the member signature. The last two now happen in that first pass, and the retained children are summed and turned into cells in one pass instead of two. The fixed responses the layout tests pin still match, the signature is checked against values computed outside the code, and a new test fixes an aggregate's unknown-size flag. No test compares this version against the previous one, so the claim that nothing changed rests on those pinned responses and on inspection. The unknown-size check used to stop at the first match and now runs over every member, which costs a little against the two walks it replaces.
+
+The measurement cannot say whether that shows up. Ten interleaved runs per side on the same fixture and the High performance plan, every run kept instead of dropping the first as the procedure below suggests (the last paragraph of this section gives the verdict without it), with `HOGMAP_BENCH_UI=1 HOGMAP_BENCH_LIVE_FRAME=1` and `--synthetic-million --workers 1 --unthrottled-drain`:
+
+| Measurement, median | Before | After | Difference | Larger spread | Verdict |
+|---|---:|---:|---:|---:|---|
+| Layout per rebuild |13.607ms|13.488ms|0.119ms|4.145ms|Inconclusive|
+| Rebuild drain+frame |46.748ms|44.709ms|2.039ms|11.649ms|Inconclusive|
+
+The layout ranged from 12.278 to 16.924 ms and the rebuild frame from 39.289 to 50.938 ms across runs of the same binaries, so both differences sit well inside the noise. The change is kept because it removes work and changes nothing else, not because a speed-up was demonstrated. The ten pairs include the first one, which the procedure above would have dropped as warm-up; dropping it leaves both layout medians at 13.481 and the frame at 47.329 against 44.599, still inside the noise, so the verdict does not depend on that choice.
+
+The raw log of that comparison records the power plan and each run's figures, but not the command line or the environment variables; the invocation above is what was used, and a later session repeating it should write those down next to the output.
+
+Two figures in this page should not be compared across sessions. The rebuild frame was recorded at 35.801 ms median on 2026-11-16 and at 46.748 ms here; the fixture and the command were the same, but neither log identifies the binary it ran, so the gap is a reason to interleave a comparison rather than a measured difference between two sessions.
+
 ## Know the boundaries
 
 - `src/index.rs` owns the flat metadata snapshot, entry IDs and per-metric listed/identity-accounting facts and the checked `MetricSummary::apparent_bytes()` area total. `known + delta = unique + shared` remains true; unique/shared are accounting facts, not geometry weights; corrected unique allocated bytes are the basis of the estimated difference.

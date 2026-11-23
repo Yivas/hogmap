@@ -339,29 +339,33 @@ fn layout_selection(
         // The aggregate stands for exactly these entries, so their classes are recorded here
         // while they are already in hand.
         let mut aggregate_states = [0_u32; 3];
+        let mut aggregate_unknown = false;
+        let mut aggregate_signature = MemberSignature::new();
         let mut aggregate_members = Vec::with_capacity(child_ids.len() - keep);
         for id in &child_ids[keep..] {
             aggregate_states[index.coverage_class_of(*id) as usize] += 1;
+            aggregate_unknown |= totals.get(id.position()).unknown > 0;
+            aggregate_signature.push(*id);
             aggregate_members.push(*id);
         }
         // Parent totals already include all children. Visit only the retained prefix for its
         // complement, rather than summing a potentially million-entry small-item aggregate.
-        let retained_weight = child_ids[..keep]
-            .iter()
-            .try_fold(0_u64, |sum, id| {
-                sum.checked_add(totals.get(id.position()).known_sum)
-            })
-            .ok_or(LayoutError::SizeOverflow)?;
+        // The cells are built in the same pass: both need the retained children's weights.
+        let mut retained_weight = 0_u64;
+        let mut cells: Vec<Cell> = Vec::with_capacity(keep + 1);
+        for id in &child_ids[..keep] {
+            let weight = totals.get(id.position()).known_sum;
+            retained_weight = retained_weight
+                .checked_add(weight)
+                .ok_or(LayoutError::SizeOverflow)?;
+            cells.push(Cell {
+                node: Some(*id),
+                weight,
+            });
+        }
         let aggregate_weight = total
             .checked_sub(retained_weight)
             .ok_or(LayoutError::SizeOverflow)?;
-        let mut cells: Vec<Cell> = child_ids[..keep]
-            .iter()
-            .map(|id| Cell {
-                node: Some(*id),
-                weight: totals.get(id.position()).known_sum,
-            })
-            .collect();
         if !aggregate_members.is_empty() {
             cells.push(Cell {
                 node: None,
@@ -391,17 +395,14 @@ fn layout_selection(
                     result.placed.push(placed);
                 }
                 None => {
-                    let has_unknown = aggregate_members
-                        .iter()
-                        .any(|id| totals.get(id.position()).unknown > 0);
                     result.placed.push(Placed {
                         node: NodeRef::Aggregate { parent },
                         rect: cell_rect,
                         header: None,
                         content: cell_rect,
                         known_sum: aggregate_weight,
-                        has_unknown,
-                        member_signature: member_signature(&aggregate_members),
+                        has_unknown: aggregate_unknown,
+                        member_signature: aggregate_signature.finish(),
                         members: std::mem::take(&mut aggregate_members),
                         group_name: None,
                         states: aggregate_states,
@@ -505,6 +506,7 @@ pub fn layout_grouped(
         let mut sum = 0_u64;
         let mut unknown = false;
         let mut states = [0_u32; 3];
+        let mut signature = MemberSignature::new();
         for id in &members {
             let value = totals.get(id.position());
             sum = sum
@@ -512,18 +514,19 @@ pub fn layout_grouped(
                 .ok_or(LayoutError::SizeOverflow)?;
             unknown |= value.unknown > 0;
             states[index.coverage_class_of(*id) as usize] += 1;
+            signature.push(*id);
         }
-        entries.push((name, members, sum, unknown, states));
+        entries.push((name, members, sum, unknown, states, signature.finish()));
     }
     let weights: Vec<_> = entries
         .iter()
-        .map(|(_, _, weight, _, _)| Cell {
+        .map(|(_, _, weight, _, _, _)| Cell {
             node: None,
             weight: *weight,
         })
         .collect();
     let rectangles = squarify(&weights, RectF64::from_rect(result.content));
-    for (ordinal, ((name, members, known_sum, has_unknown, states), rect)) in
+    for (ordinal, ((name, members, known_sum, has_unknown, states, signature), rect)) in
         entries.into_iter().zip(rectangles).enumerate()
     {
         result.placed.push(Placed {
@@ -536,7 +539,7 @@ pub fn layout_grouped(
             content: rect,
             known_sum,
             has_unknown,
-            member_signature: member_signature(&members),
+            member_signature: signature,
             members,
             group_name: Some(name),
             states,
@@ -846,14 +849,25 @@ fn place(
     }
 }
 
-/// FNV-1a over member positions: order-sensitive, so a reordered set is a different group.
-fn member_signature(members: &[EntryId]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for member in members {
-        hash ^= member.position() as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+/// FNV-1a over member positions, kept as running state so a group or an aggregate can be signed
+/// while it is being built. The layout already walks an aggregate's members to count their coverage
+/// classes, and the signature needs the same members in the same order, so hashing them was a second
+/// full walk.
+struct MemberSignature(u64);
+
+impl MemberSignature {
+    const fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
     }
-    hash
+
+    fn push(&mut self, member: EntryId) {
+        self.0 ^= member.position() as u64;
+        self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    const fn finish(&self) -> u64 {
+        self.0
+    }
 }
 
 fn split_header(rect: Rect, header_height: f32) -> (Option<Rect>, Rect) {
@@ -1064,24 +1078,55 @@ fn worst_ratio(row: &[Cell], scale: f64, short_side: f64) -> f64 {
 mod tests {
     use super::*;
 
+    fn signature_of(members: &[EntryId]) -> u64 {
+        let mut signature = MemberSignature::new();
+        for member in members {
+            signature.push(*member);
+        }
+        signature.finish()
+    }
+
     #[test]
     fn a_group_signature_follows_its_members_not_their_summary() {
         let a = EntryId::at(0).unwrap();
         let b = EntryId::at(1).unwrap();
         assert_ne!(
-            member_signature(&[a, b]),
-            member_signature(&[b, a]),
+            signature_of(&[a, b]),
+            signature_of(&[b, a]),
             "another order is another set"
         );
         assert_ne!(
-            member_signature(&[a, b]),
-            member_signature(&[a]),
+            signature_of(&[a, b]),
+            signature_of(&[a]),
             "a subset is another set"
         );
         assert_ne!(
-            member_signature(&[a]),
-            member_signature(&[b]),
+            signature_of(&[a]),
+            signature_of(&[b]),
             "two single-member groups differ"
         );
+    }
+
+    #[test]
+    fn the_member_signature_is_fnv1a_over_positions() {
+        // Expected values from the published FNV-1a definition, computed outside this code, so a
+        // shared mistake in the running state cannot confirm itself. One position is above 255 and
+        // another is the largest one an entry can have, so folding a position into a narrower type
+        // would show up here.
+        let cases: &[(&[u32], u64)] = &[
+            (&[0], 0xaf63_bd4c_8601_b7df),
+            (&[1], 0xaf63_bc4c_8601_b62c),
+            (&[300], 0xaf62_a14c_85ff_d54b),
+            (&[0, 1], 0x0832_8707_b4eb_6e3a),
+            (&[1, 0], 0x082f_2207_b4e8_8cc4),
+            (&[u32::MAX - 1], 0x6b1d_733e_79fe_4821),
+        ];
+        for (positions, expected) in cases {
+            let members: Vec<EntryId> = positions
+                .iter()
+                .map(|position| EntryId::at(*position as usize).unwrap())
+                .collect();
+            assert_eq!(signature_of(&members), *expected, "positions {positions:?}");
+        }
     }
 }

@@ -266,6 +266,17 @@ fn basic() -> Basic {
     }
 }
 
+/// FNV-1a over member positions, written here from the published definition so the layout's
+/// running state is contrasted against something that does not share its code.
+fn expected_signature(members: &[EntryId]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for member in members {
+        hash ^= member.position() as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 fn find(layout: &Layout, node: NodeRef) -> &Placed {
     layout
         .placed
@@ -473,6 +484,83 @@ fn an_aggregate_signature_follows_its_members_across_rebuilds() {
         build(100),
         build(101),
         "an aggregate that gained a member is not the one that had the focus"
+    );
+}
+
+#[test]
+fn an_aggregate_reports_an_unknown_size_in_any_of_its_members() {
+    // The partial member sits in the middle, and one case makes the parent unknown while every
+    // member of the aggregate is complete: a predicate that only looked at the first member, or one
+    // that read the parent's total instead of the members', fails here.
+    let build = |partial_small: Option<usize>, partial_big: bool| {
+        let mut index = Index::new("Volume".into()).unwrap();
+        let root = index.root();
+        index
+            .insert(
+                root,
+                "big.bin".into(),
+                Kind::File,
+                Sizes {
+                    logical: Some(1_000_000),
+                    allocated: Some(1_000_000),
+                },
+                None,
+                if partial_big {
+                    State::Partial
+                } else {
+                    State::Complete
+                },
+            )
+            .unwrap();
+        for number in 0..8 {
+            // A partial member still has a known size, so it stays inside the aggregate while
+            // making the aggregate's own figure unknown.
+            let state = if partial_small == Some(number) {
+                State::Partial
+            } else {
+                State::Complete
+            };
+            index
+                .insert(
+                    root,
+                    format!("small_{number:02}.bin").into(),
+                    Kind::File,
+                    Sizes {
+                        logical: Some(100),
+                        allocated: Some(100),
+                    },
+                    None,
+                    state,
+                )
+                .unwrap();
+        }
+        index.set_state(root, State::Complete).unwrap();
+        let result = layout(
+            &index,
+            root,
+            Rect::new(0.0, 0.0, 1000.0, 1000.0),
+            params(5000.0, 0.0),
+        )
+        .unwrap();
+        let aggregate = find(&result, NodeRef::Aggregate { parent: root });
+        assert_eq!(
+            aggregate.member_signature,
+            expected_signature(&aggregate.members),
+            "the layout signs exactly the members it lists, in their order"
+        );
+        aggregate.has_unknown
+    };
+    assert!(
+        !build(None, false),
+        "an aggregate of complete members reports no unknown size"
+    );
+    assert!(
+        build(Some(3), false),
+        "a partial member in the middle makes the aggregate's figure unknown"
+    );
+    assert!(
+        !build(None, true),
+        "an unknown outside the aggregate does not make the aggregate unknown"
     );
 }
 
